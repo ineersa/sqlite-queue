@@ -10,7 +10,13 @@
         "revolt/event-loop": "^1.0"
     },
     "require-dev": {
+        "ext-pcntl": "*",
+        "ext-pdo_sqlite": "*",
+        "ext-posix": "*",
+        "doctrine/dbal": "^4.3",
         "phpunit/phpunit": "^13.2",
+        "symfony/doctrine-messenger": "^8.0",
+        "symfony/event-dispatcher": "^8.0",
         "symfony/messenger": "^8.0"
     },
     "suggest": {
@@ -39,6 +45,8 @@
         "composer:validate": "@composer validate --no-check-publish",
         "test": "phpunit",
         "test:driver": "phpunit --testsuite driver",
+        "test:bench": "phpunit --testsuite benchmark",
+        "bench": "@php bench/run.php",
         "qa": [
             "@composer:validate",
             "@test"

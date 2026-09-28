@@ -2,7 +2,7 @@
 
 A reusable PHP queue broker backed by SQLite, with a Symfony Messenger transport adapter.
 
-This checkout holds the package setup and the async-driver verification. The queue engine,
+This checkout holds the package setup, async-driver verification, and a standalone Doctrine SQLite benchmark baseline. The queue engine,
 broker, client, and Messenger adapter do not exist yet. See
 [docs/contracts.md](docs/contracts.md) for the settled package contracts and
 [docs/driver-verification.md](docs/driver-verification.md) for the measured driver behavior
@@ -16,13 +16,14 @@ the later tasks depend on.
 - `ext-sqlite3`, with SQLite 3.31.0 or newer. The SQLite library here is 3.45.1.
 - `ext-posix` for one optional driver test that kills the persistence worker. The test skips
   when the extension is missing.
+- Development installation also requires `ext-pdo_sqlite`, `ext-posix`, and `ext-pcntl` for the benchmark. The benchmark requires Linux `/proc`.
 
 `fabpot/amphp-sqlite3` requires PHP 8.4, and the supported range starts at 8.5. Symfony
 Messenger is needed only for the transport adapter, and only Symfony 8.x is supported.
 
 ## Install
 
-The package is not published. Use a path repository while it stays local:
+The package is not published. Install dependencies in this checkout:
 
 ```bash
 composer install
@@ -32,13 +33,14 @@ composer install
 
 ```bash
 composer install
-composer qa          # validates composer.json, then runs the driver test suite
-composer test        # the driver test suite, direct phpunit call
-composer test:driver # same suite, explicit testsuite name
+composer qa          # validates composer.json, then runs correctness tests
+composer test        # all correctness tests
+composer test:driver # async-driver suite
+composer test:bench  # deterministic benchmark checks
 ```
 
 `composer qa` runs `composer validate --no-check-publish` and then PHPUnit with
-`phpunit.xml.dist`. Each test opens its own file database under `var/tests/` and runs its
+`phpunit.xml.dist`. Each driver test opens its own file database under `var/tests/` and runs its
 async work on a fresh event loop. On Linux, `/proc` lets the suite prove on teardown that no
 persistence worker process is left behind. On a platform where `/proc` is unreadable, the
 driver suite skips before it creates any fixture instead of passing without that evidence.
@@ -53,7 +55,8 @@ driver suite skips before it creates any fixture instead of passing without that
 | Foreground `sqlite-queue broker` and PHP client | Not started, Task 04 |
 | Delayed wakeups | Not started, Task 05 |
 | Symfony Messenger adapter | Not started, Task 06 |
-| Benchmark baseline and A/B comparison | Not started, Task 02 and Task 08 |
+| Benchmark baseline | Runner implemented, Task 02 |
+| A/B comparison | Not started, Task 08. No candidate exists. |
 
 ## Dependencies
 
@@ -70,6 +73,9 @@ Development:
 | --- | --- | --- |
 | `phpunit/phpunit` | `^13.2` | Test runner. |
 | `symfony/messenger` | `^8.0` | Symfony compatibility probe, and the adapter in a later task. |
+| `symfony/doctrine-messenger` | `^8.0` | Standard SQLite benchmark transport. |
+| `symfony/event-dispatcher` | `^8.0` | Worker lifecycle events in the benchmark. |
+| `doctrine/dbal` | `^4.3` | Benchmark SQLite connections. |
 
 Doctrine DBAL, the Symfony Messenger SQLite transport, and its benchmark dependencies stay
 out of the runtime requirements.
@@ -80,6 +86,8 @@ out of the runtime requirements.
 src/            package namespace Ineersa\SqliteQueue\ (empty until the queue engine lands)
 tests/Driver/   async-driver verification tests
 tests/Support/  isolated test database and process-tree helpers
+tests/Bench/    deterministic benchmark accounting and process checks
+bench/          standalone Doctrine SQLite baseline runner
 docs/           package contracts and driver verification evidence
 ```
 
@@ -89,6 +97,8 @@ docs/           package contracts and driver verification evidence
   delivery contracts, protocol shape.
 - [docs/driver-verification.md](docs/driver-verification.md): measured async-driver behavior
   and the commands that reproduce it.
+- [bench/README.md](bench/README.md): run the standalone baseline with `php bench/run.php`.
+- [docs/benchmark-method.md](docs/benchmark-method.md): fixed workloads, timing definitions, and comparison limits.
 
 ## License
 
