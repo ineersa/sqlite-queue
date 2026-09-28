@@ -9,24 +9,9 @@ use Amp\CompositeCancellation;
 use Amp\Socket\ConnectContext;
 use Amp\Socket\Socket;
 use Amp\TimeoutCancellation;
-use Ineersa\SqliteQueue\Protocol\AcknowledgeRequest;
-use Ineersa\SqliteQueue\Protocol\EmptyReceiveResponse;
 use Ineersa\SqliteQueue\Protocol\ErrorCode;
-use Ineersa\SqliteQueue\Protocol\FailedResponse;
 use Ineersa\SqliteQueue\Protocol\Frame;
-use Ineersa\SqliteQueue\Protocol\HelloRequest;
-use Ineersa\SqliteQueue\Protocol\HelloResponse;
 use Ineersa\SqliteQueue\Protocol\Operation;
-use Ineersa\SqliteQueue\Protocol\ReceivedResponse;
-use Ineersa\SqliteQueue\Protocol\ReceiveRequest;
-use Ineersa\SqliteQueue\Protocol\RejectRequest;
-use Ineersa\SqliteQueue\Protocol\Request;
-use Ineersa\SqliteQueue\Protocol\RequestCodec;
-use Ineersa\SqliteQueue\Protocol\Response;
-use Ineersa\SqliteQueue\Protocol\ResponseCodec;
-use Ineersa\SqliteQueue\Protocol\SendRequest;
-use Ineersa\SqliteQueue\Protocol\SentResponse;
-use Ineersa\SqliteQueue\Protocol\SettledResponse;
 
 use function Amp\Socket\connect;
 
@@ -67,10 +52,12 @@ final class Client
         }
         $client = new self($socket, $timeout);
         try {
-            $response = $client->exchange(new HelloRequest(0), $cancellation);
-            if (!$response instanceof HelloResponse) {
+            $reply = $client->exchange(Operation::Hello, cancellation: $cancellation);
+            $result = $reply->control['result'];
+            if (!\is_array($result) || ($result['max_payload'] ?? null) !== Frame::MAX_PAYLOAD) {
                 $client->invalidReply();
             }
+            $client->assertNoPayload($reply);
         } catch (\Throwable $error) {
             $client->close();
             throw $error;
@@ -81,24 +68,34 @@ final class Client
 
     public function send(string $queue, string $body, string $headers = '', int $delay = 0, ?Cancellation $cancellation = null): int
     {
-        $response = $this->exchange(new SendRequest($this->nextId, $queue, $delay, $body, $headers), $cancellation);
-        if (!$response instanceof SentResponse) {
-            $this->invalidReply();
-        }
+        $reply = $this->exchange(Operation::Send, ['queue' => $queue, 'delay' => $delay], $body, $headers, $cancellation);
+        $id = $this->positiveId($reply->control['result']);
+        $this->assertNoPayload($reply);
 
-        return $response->messageId;
+        return $id;
     }
 
     public function receive(string $queue, ?Cancellation $cancellation = null): ?Delivery
     {
-        $response = $this->exchange(new ReceiveRequest($this->nextId, $queue), $cancellation);
-        if ($response instanceof EmptyReceiveResponse) {
+        $reply = $this->exchange(Operation::Receive, ['queue' => $queue], cancellation: $cancellation);
+        $result = $reply->control['result'];
+        if (null === $result) {
+            $this->assertNoPayload($reply);
+
             return null;
         }
-        if ($response instanceof ReceivedResponse) {
-            return $response->delivery;
+        if (!\is_array($result)) {
+            $this->invalidReply();
         }
-        $this->invalidReply();
+        $id = $this->positiveId($result['id'] ?? null);
+        if (($result['queue'] ?? null) !== $queue) {
+            $this->invalidReply();
+        }
+        $receipt = $this->readString($result['receipt'] ?? null);
+        $availableAt = $this->readInteger($result['available_at'] ?? null);
+        $reservedUntil = $this->readInteger($result['reserved_until'] ?? null);
+
+        return new Delivery($id, $queue, $reply->body, $reply->headers, $receipt, $availableAt, $reservedUntil);
     }
 
     public function acknowledge(string $receipt, ?Cancellation $cancellation = null): void
@@ -119,16 +116,19 @@ final class Client
 
     private function settle(Operation $operation, string $receipt, ?Cancellation $cancellation): void
     {
-        $request = Operation::Acknowledge === $operation
-            ? new AcknowledgeRequest($this->nextId, $receipt)
-            : new RejectRequest($this->nextId, $receipt);
-        $response = $this->exchange($request, $cancellation);
-        if (!$response instanceof SettledResponse) {
+        $reply = $this->exchange($operation, ['receipt' => $receipt], cancellation: $cancellation);
+        if (null !== $reply->control['result']) {
             $this->invalidReply();
         }
+        $this->assertNoPayload($reply);
     }
 
-    private function exchange(Request $request, ?Cancellation $cancellation = null): Response
+    /**
+     * The operation stays typed until serialization; only Frame builds the wire array.
+     *
+     * @param array<string, mixed> $params
+     */
+    private function exchange(Operation $operation, array $params = [], string $body = '', string $headers = '', ?Cancellation $cancellation = null): Frame
     {
         if ($this->closed) {
             throw new TransportException('Client is closed; create a new connection explicitly.');
@@ -136,15 +136,13 @@ final class Client
         if ($this->busy) {
             throw new \LogicException('Only one outstanding request is permitted per client.');
         }
-        // Local encoding never consumes the sequence: an oversize payload fails before it is sent.
+        $id = $this->nextId;
+        // Local encoding never consumes the sequence. An oversize payload throws ProtocolException
+        // with the connection usable; unencodable control throws JsonException, which closes the
+        // client because the request can never be framed.
         try {
-            $bytes = RequestCodec::encode($request)->encode();
-        } catch (\Throwable $error) {
-            // A local protocol violation never reached the broker, so only a broken local
-            // encoder closes the client; anything else propagates with the connection usable.
-            if ($error instanceof ProtocolException) {
-                throw $error;
-            }
+            $bytes = (new Frame(['v' => Frame::VERSION, 'id' => $id, 'op' => $operation->value] + $params, $body, $headers))->encode();
+        } catch (\JsonException $error) {
             $this->close();
             throw new TransportException('Broker confirmation unavailable; outcome may be unknown. Client is closed.', previous: $error);
         }
@@ -154,39 +152,96 @@ final class Client
         $this->busy = true;
         try {
             Frame::write($this->socket, $bytes, $cancellation);
-            $frame = Frame::read($this->socket, $cancellation);
-            if (null === $frame) {
-                throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid or uncorrelated broker response.');
-            }
-            $response = ResponseCodec::decode($frame, $request);
+            $reply = $this->correlatedReply(Frame::read($this->socket, $cancellation), $id);
         } catch (\Throwable $error) {
             $this->close();
             throw new TransportException('Broker confirmation unavailable; outcome may be unknown. Client is closed.', previous: $error);
         } finally {
             $this->busy = false;
         }
-        if ($response instanceof FailedResponse) {
-            throw $this->failure($response->code);
+        if (true === $reply->control['ok']) {
+            return $reply;
+        }
+        if ('' !== $reply->body || '' !== $reply->headers || \array_key_exists('result', $reply->control)) {
+            $this->invalidReply();
         }
 
-        return $response;
+        throw $this->failure($reply->control['error']['code'] ?? null);
     }
 
-    private function failure(ErrorCode $code): \Throwable
+    /** Each guard below reports the same uncorrelated reply; the call site stays readable. */
+    private function correlatedReply(?Frame $reply, int $id): Frame
     {
+        if (null === $reply) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid or uncorrelated broker response.');
+        }
+        if (($reply->control['v'] ?? null) !== Frame::VERSION) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid or uncorrelated broker response.');
+        }
+        if (($reply->control['id'] ?? null) !== $id) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid or uncorrelated broker response.');
+        }
+        if (!\is_bool($reply->control['ok'] ?? null)) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid or uncorrelated broker response.');
+        }
+        if (true === $reply->control['ok'] && !\array_key_exists('result', $reply->control)) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid or uncorrelated broker response.');
+        }
+
+        return $reply;
+    }
+
+    private function assertNoPayload(Frame $reply): void
+    {
+        if ('' !== $reply->body || '' !== $reply->headers) {
+            $this->invalidReply();
+        }
+    }
+
+    private function readInteger(mixed $value): int
+    {
+        if (!\is_int($value)) {
+            $this->invalidReply();
+        }
+
+        return $value;
+    }
+
+    private function readString(mixed $value): string
+    {
+        if (!\is_string($value)) {
+            $this->invalidReply();
+        }
+
+        return $value;
+    }
+
+    private function positiveId(mixed $value): int
+    {
+        $id = $this->readInteger($value);
+        if ($id < 1) {
+            $this->invalidReply();
+        }
+
+        return $id;
+    }
+
+    private function failure(mixed $code): \Throwable
+    {
+        $known = \is_string($code) ? ErrorCode::tryFrom($code) : null;
         // Recoverable replies keep the connection usable; anything else closes it.
-        if (ErrorCode::StaleReceipt === $code) {
+        if (ErrorCode::StaleReceipt === $known) {
             return new InvalidReceipt('Broker rejected a stale or foreign receipt.');
         }
-        if (ErrorCode::InvalidQueueName === $code) {
+        if (ErrorCode::InvalidQueueName === $known) {
             return new \InvalidArgumentException('Broker rejected the queue name.');
         }
         $this->close();
-        if (ErrorCode::BrokerShuttingDown === $code || ErrorCode::InternalStorageFailure === $code) {
+        if (ErrorCode::BrokerShuttingDown === $known || ErrorCode::InternalStorageFailure === $known || null === $known) {
             return new TransportException('Broker failed the request; outcome may be unknown. Client is closed.');
         }
 
-        return new ProtocolException($code, 'Broker rejected the request.');
+        return new ProtocolException($known, 'Broker rejected the request.');
     }
 
     private function invalidReply(): never

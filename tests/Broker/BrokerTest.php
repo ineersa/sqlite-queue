@@ -175,10 +175,22 @@ final class BrokerTest extends TestCase
     public static function malformedTraffic(): iterable
     {
         yield 'version 2 request' => ['version 2 request', 'unsupported_protocol_version'];
+        yield 'missing version' => ['missing version', 'unsupported_protocol_version'];
         yield 'out of sequence request id' => ['out of sequence request id', 'invalid_request'];
+        yield 'non-integer request id' => ['non-integer request id', 'invalid_request'];
         yield 'oversized length prefix' => ['oversized length prefix', 'frame_too_large'];
         yield 'unknown operation' => ['unknown operation', 'invalid_request'];
+        yield 'missing operation' => ['missing operation', 'invalid_request'];
+        yield 'non-string operation' => ['non-string operation', 'invalid_request'];
         yield 'unsupported control field' => ['unsupported control field', 'invalid_request'];
+        yield 'extra field on send' => ['extra field on send', 'invalid_request'];
+        yield 'receive with body' => ['receive with body', 'invalid_request'];
+        yield 'acknowledge with headers' => ['acknowledge with headers', 'invalid_request'];
+        yield 'missing delay' => ['missing delay', 'invalid_request'];
+        yield 'negative delay' => ['negative delay', 'invalid_request'];
+        yield 'string delay' => ['string delay', 'invalid_request'];
+        yield 'missing receipt' => ['missing receipt', 'invalid_request'];
+        yield 'non-string receipt' => ['non-string receipt', 'invalid_request'];
     }
 
     #[DataProvider('malformedTraffic')]
@@ -195,10 +207,22 @@ final class BrokerTest extends TestCase
 
             $bytes = match ($traffic) {
                 'version 2 request' => (new Frame(['v' => 2, 'id' => 1, 'op' => 'receive', 'queue' => 'jobs']))->encode(),
+                'missing version' => (new Frame(['id' => 1, 'op' => 'receive', 'queue' => 'jobs']))->encode(),
                 'out of sequence request id' => (new Frame(['v' => Frame::VERSION, 'id' => 2, 'op' => 'receive', 'queue' => 'jobs']))->encode(),
+                'non-integer request id' => (new Frame(['v' => Frame::VERSION, 'id' => '1', 'op' => 'receive', 'queue' => 'jobs']))->encode(),
                 'oversized length prefix' => pack('N', Frame::MAX_FRAME + 1),
                 'unknown operation' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'frobnicate']))->encode(),
+                'missing operation' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'queue' => 'jobs']))->encode(),
+                'non-string operation' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 5, 'queue' => 'jobs']))->encode(),
                 'unsupported control field' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'receive', 'queue' => 'jobs', 'wait_ms' => 10]))->encode(),
+                'extra field on send' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'send', 'queue' => 'jobs', 'delay' => 0, 'receipt' => 'x']))->encode(),
+                'receive with body' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'receive', 'queue' => 'jobs'], 'body'))->encode(),
+                'acknowledge with headers' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'acknowledge', 'receipt' => 'r'], '', 'h'))->encode(),
+                'missing delay' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'send', 'queue' => 'jobs']))->encode(),
+                'negative delay' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'send', 'queue' => 'jobs', 'delay' => -1]))->encode(),
+                'string delay' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'send', 'queue' => 'jobs', 'delay' => '5']))->encode(),
+                'missing receipt' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'acknowledge']))->encode(),
+                'non-string receipt' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'reject', 'receipt' => 7]))->encode(),
             };
             Frame::write($peer, $bytes, new TimeoutCancellation(5));
 
@@ -232,7 +256,12 @@ final class BrokerTest extends TestCase
                 $this->fail('An invalid queue name must be rejected.');
             } catch (\InvalidArgumentException) {
             }
-            // Both rejections advanced the sequence: the session still works.
+            try {
+                $client->receive('-jobs');
+                $this->fail('An invalid queue name must be rejected.');
+            } catch (\InvalidArgumentException) {
+            }
+            // All rejections advanced the sequence: the session still works.
             $id = $client->send('jobs', 'good queue');
             $delivery = $client->receive('jobs');
             $this->assertNotNull($delivery);
@@ -240,6 +269,51 @@ final class BrokerTest extends TestCase
             $this->assertSame('good queue', $delivery->body);
             $client->acknowledge($delivery->receipt);
             $this->assertNull($client->receive('jobs'));
+        });
+    }
+
+    /** @return iterable<string, array{string, int}> */
+    public static function handshakeTraffic(): iterable
+    {
+        yield 'send before handshake' => ['send before handshake', 0];
+        yield 'receive before handshake' => ['receive before handshake', 0];
+        yield 'hello with body' => ['hello with body', 0];
+        yield 'hello after handshake' => ['hello after handshake', 1];
+    }
+
+    #[DataProvider('handshakeTraffic')]
+    public function testHandshakeOrderingFailsExplicitlyAndEndsOnlyThatSession(string $traffic, int $expectedId): void
+    {
+        $this->runAsync(function () use ($traffic, $expectedId): void {
+            $this->startBroker();
+            $healthy = $this->connectClient();
+            $id = $healthy->send('jobs', 'before malformed peer');
+
+            $peer = $this->rawPeer();
+            if ('hello after handshake' === $traffic) {
+                Frame::write($peer, (new Frame(['v' => Frame::VERSION, 'id' => 0, 'op' => 'hello']))->encode(), new TimeoutCancellation(5));
+                $this->assertNotNull(Frame::read($peer, new TimeoutCancellation(5)), 'The raw peer must complete its handshake.');
+            }
+            $bytes = match ($traffic) {
+                'send before handshake' => (new Frame(['v' => Frame::VERSION, 'id' => 0, 'op' => 'send', 'queue' => 'jobs', 'delay' => 0]))->encode(),
+                'receive before handshake' => (new Frame(['v' => Frame::VERSION, 'id' => 0, 'op' => 'receive', 'queue' => 'jobs']))->encode(),
+                'hello with body' => (new Frame(['v' => Frame::VERSION, 'id' => 0, 'op' => 'hello'], 'body'))->encode(),
+                'hello after handshake' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'hello']))->encode(),
+            };
+            Frame::write($peer, $bytes, new TimeoutCancellation(5));
+
+            $reply = Frame::read($peer, new TimeoutCancellation(5));
+            $this->assertNotNull($reply, 'The broker must report a bounded protocol error.');
+            $this->assertSame($expectedId, $reply->control['id'] ?? null);
+            $this->assertFalse($reply->control['ok'] ?? true);
+            $this->assertSame('invalid_request', $reply->control['error']['code'] ?? null);
+            $this->assertNull(Frame::read($peer, new TimeoutCancellation(5)), 'The broker must end the malformed session.');
+
+            $delivery = $healthy->receive('jobs');
+            $this->assertNotNull($delivery);
+            $this->assertSame($id, $delivery->id);
+            $this->assertSame('before malformed peer', $delivery->body);
+            $healthy->acknowledge($delivery->receipt);
         });
     }
 

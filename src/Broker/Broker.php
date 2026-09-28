@@ -11,23 +11,9 @@ use Amp\Socket\Socket;
 use Amp\TimeoutCancellation;
 use Fabpot\Amp\Sqlite\SqliteConnection;
 use Ineersa\SqliteQueue\InvalidReceipt;
-use Ineersa\SqliteQueue\Protocol\AcknowledgeRequest;
-use Ineersa\SqliteQueue\Protocol\EmptyReceiveResponse;
 use Ineersa\SqliteQueue\Protocol\ErrorCode;
-use Ineersa\SqliteQueue\Protocol\FailedResponse;
 use Ineersa\SqliteQueue\Protocol\Frame;
-use Ineersa\SqliteQueue\Protocol\HelloRequest;
-use Ineersa\SqliteQueue\Protocol\HelloResponse;
-use Ineersa\SqliteQueue\Protocol\ReceivedResponse;
-use Ineersa\SqliteQueue\Protocol\ReceiveRequest;
-use Ineersa\SqliteQueue\Protocol\RejectRequest;
-use Ineersa\SqliteQueue\Protocol\Request;
-use Ineersa\SqliteQueue\Protocol\RequestCodec;
-use Ineersa\SqliteQueue\Protocol\Response;
-use Ineersa\SqliteQueue\Protocol\ResponseCodec;
-use Ineersa\SqliteQueue\Protocol\SendRequest;
-use Ineersa\SqliteQueue\Protocol\SentResponse;
-use Ineersa\SqliteQueue\Protocol\SettledResponse;
+use Ineersa\SqliteQueue\Protocol\Operation;
 use Ineersa\SqliteQueue\ProtocolException;
 use Ineersa\SqliteQueue\Queue;
 use Revolt\EventLoop;
@@ -184,13 +170,13 @@ final class Broker
         $expected = 0;
         try {
             while (!$this->stopping) {
-                $frame = Frame::read($socket, new TimeoutCancellation(0 === $expected ? self::IDLE_READ_TIMEOUT : self::OPERATION_TIMEOUT));
-                if (null === $frame) {
+                $request = Frame::read($socket, new TimeoutCancellation(0 === $expected ? self::IDLE_READ_TIMEOUT : self::OPERATION_TIMEOUT));
+                if (null === $request) {
                     return;
                 }
                 $this->assertRunning();
                 try {
-                    $request = RequestCodec::decode($frame, $expected);
+                    $operation = $this->validateRequest($request, $expected);
                 } catch (ProtocolException $error) {
                     // Answer decode errors where they are caught: the reply below ends this
                     // session unless the queue name alone was bad.
@@ -202,17 +188,22 @@ final class Broker
                     ++$expected;
                     continue;
                 }
-                if ($request instanceof HelloRequest) {
-                    $response = new HelloResponse($expected, Frame::MAX_PAYLOAD);
+                if (0 === $expected) {
+                    $response = new Frame(['v' => Frame::VERSION, 'id' => 0, 'ok' => true, 'result' => ['max_payload' => Frame::MAX_PAYLOAD]]);
                 } else {
                     try {
-                        $response = $this->dispatch($request, $session);
+                        $response = $this->dispatch($request, $operation, $session, $expected);
                     } catch (InvalidReceipt) {
-                        $response = new FailedResponse($expected, ErrorCode::StaleReceipt);
+                        $response = self::error($expected, ErrorCode::StaleReceipt);
                     } catch (ProtocolException $error) {
-                        $this->writeError($socket, $expected, $error->errorCode);
+                        if (ErrorCode::InvalidQueueName === $error->errorCode) {
+                            // A bad queue name stays recoverable: the session survives and the sequence advances.
+                            $response = self::error($expected, $error->errorCode);
+                        } else {
+                            $this->writeError($socket, $expected, $error->errorCode);
 
-                        return;
+                            return;
+                        }
                     } catch (\InvalidArgumentException) {
                         $this->writeError($socket, $expected, ErrorCode::InvalidRequest);
 
@@ -226,7 +217,7 @@ final class Broker
                         return;
                     }
                 }
-                Frame::write($socket, ResponseCodec::encode($response)->encode(), new TimeoutCancellation(self::WRITE_TIMEOUT));
+                Frame::write($socket, $response->encode(), new TimeoutCancellation(self::WRITE_TIMEOUT));
                 ++$expected;
             }
 
@@ -244,35 +235,123 @@ final class Broker
         }
     }
 
-    private function dispatch(Request $request, string $session): Response
+    /** Validation runs before dispatch so every rejection reports its own error code. */
+    private function validateRequest(Frame $request, int $expected): Operation
     {
-        if ($request instanceof SendRequest) {
-            return new SentResponse($request->id, $this->queue->send($request->queue, $request->body, $request->headers, $request->delay));
+        $control = $request->control;
+        if (($control['v'] ?? null) !== Frame::VERSION) {
+            throw new ProtocolException(ErrorCode::UnsupportedProtocolVersion, 'Unsupported protocol version.');
         }
-        if ($request instanceof ReceiveRequest) {
-            $delivery = $this->queue->receive($request->queue, $session);
-            if (null !== $delivery) {
-                return new ReceivedResponse($request->id, $delivery);
-            }
-
-            return new EmptyReceiveResponse($request->id);
+        $name = $control['op'] ?? null;
+        $operation = \is_string($name) ? Operation::tryFrom($name) : null;
+        if (($control['id'] ?? null) !== $expected || null === $operation) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid request sequence or operation.');
         }
-        if ($request instanceof AcknowledgeRequest) {
-            $this->queue->acknowledge($request->receipt, $session);
-
-            return new SettledResponse($request->id);
+        $fields = match ($operation) {
+            Operation::Hello => [],
+            Operation::Send => ['queue', 'delay'],
+            Operation::Receive => ['queue'],
+            Operation::Acknowledge, Operation::Reject => ['receipt'],
+        };
+        if ([] !== array_diff(array_keys($control), ['v', 'id', 'op', 'body_length', 'headers_length', ...$fields])) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Unsupported control field.');
         }
-        if ($request instanceof RejectRequest) {
-            $this->queue->reject($request->receipt, $session);
+        if (0 === $expected && (Operation::Hello !== $operation || '' !== $request->body || '' !== $request->headers)) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Handshake required.');
+        }
+        if (0 !== $expected && Operation::Hello === $operation) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Handshake required.');
+        }
 
-            return new SettledResponse($request->id);
+        return $operation;
+    }
+
+    private function dispatch(Frame $request, Operation $operation, string $session, int $id): Frame
+    {
+        if (Operation::Send === $operation) {
+            return $this->store($request, $id);
+        }
+        if (Operation::Receive === $operation) {
+            return $this->claim($request, $session, $id);
+        }
+        if (Operation::Acknowledge === $operation || Operation::Reject === $operation) {
+            return $this->settle($request, $operation, $session, $id);
         }
         throw new ProtocolException(ErrorCode::InvalidRequest, 'Unsupported operation.');
     }
 
+    private function store(Frame $request, int $id): Frame
+    {
+        $name = $this->queueName($request->control['queue'] ?? null);
+        $delay = $request->control['delay'] ?? null;
+        if (!\is_int($delay)) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid delay.');
+        }
+        if ($delay < 0) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid delay.');
+        }
+
+        return self::ok($id, $this->queue->send($name, $request->body, $request->headers, $delay));
+    }
+
+    private function claim(Frame $request, string $session, int $id): Frame
+    {
+        $this->assertNoPayload($request);
+        $name = $this->queueName($request->control['queue'] ?? null);
+        $delivery = $this->queue->receive($name, $session);
+        if (null === $delivery) {
+            return self::ok($id, null);
+        }
+
+        return new Frame(['v' => Frame::VERSION, 'id' => $id, 'ok' => true, 'result' => [
+            'id' => $delivery->id, 'queue' => $delivery->queue, 'receipt' => $delivery->receipt,
+            'available_at' => $delivery->availableAt, 'reserved_until' => $delivery->reservedUntil,
+        ]], $delivery->body, $delivery->headers);
+    }
+
+    private function settle(Frame $request, Operation $operation, string $session, int $id): Frame
+    {
+        $this->assertNoPayload($request);
+        $receipt = $request->control['receipt'] ?? null;
+        if (!\is_string($receipt)) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Missing receipt.');
+        }
+        if (Operation::Acknowledge === $operation) {
+            $this->queue->acknowledge($receipt, $session);
+        } else {
+            $this->queue->reject($receipt, $session);
+        }
+
+        return self::ok($id, null);
+    }
+
+    private function queueName(mixed $name): string
+    {
+        if (!\is_string($name)) {
+            throw new ProtocolException(ErrorCode::InvalidQueueName, 'Invalid queue name.');
+        }
+        if (1 !== preg_match(Queue::NAME_PATTERN, $name)) {
+            throw new ProtocolException(ErrorCode::InvalidQueueName, 'Invalid queue name.');
+        }
+
+        return $name;
+    }
+
+    private function assertNoPayload(Frame $request): void
+    {
+        if ('' !== $request->body || '' !== $request->headers) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Unexpected application payload.');
+        }
+    }
+
+    private static function ok(int $id, ?int $result): Frame
+    {
+        return new Frame(['v' => Frame::VERSION, 'id' => $id, 'ok' => true, 'result' => $result]);
+    }
+
     private static function error(int $id, ErrorCode $code): Frame
     {
-        return ResponseCodec::encode(new FailedResponse($id, $code));
+        return new Frame(['v' => Frame::VERSION, 'id' => $id, 'ok' => false, 'error' => ['code' => $code->value]]);
     }
 
     /** Best-effort error reply: a malformed or disconnected peer may be unable to receive it. */
