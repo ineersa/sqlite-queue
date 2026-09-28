@@ -257,6 +257,113 @@ final class QueueTest extends DriverTestCase
         $this->assertSame($beforeBegins + 1, $begins);
     }
 
+    public function testDisconnectDuringReceiveKeepsCommittedReservationUntilOriginalExpiry(): void
+    {
+        $entered = new DeferredFuture();
+        $release = new DeferredFuture();
+        $armed = false;
+        $queue = $this->open(50, $this->pauseAt('commit', $entered, $release, $armed));
+        $queue->send('jobs', 'reserved');
+        $session = $queue->openSession();
+        $expiry = $this->now + 50;
+        $armed = true;
+        $receive = async(static fn () => $queue->receive('jobs', $session));
+        try {
+            $entered->getFuture()->await(new TimeoutCancellation(5));
+            $this->assertFalse($receive->isComplete());
+            $this->assertNull($this->scalar('SELECT reservation_token FROM queue_messages'));
+            $this->now += 10;
+            $queue->closeSession($session);
+        } finally {
+            $release->complete();
+            $this->invalid(static fn () => $receive->await(new TimeoutCancellation(5)));
+        }
+        $this->assertSame($expiry, $this->scalar('SELECT reserved_until FROM queue_messages'));
+        $this->assertNotNull($this->scalar('SELECT reservation_token FROM queue_messages'));
+        $replacement = $queue->openSession();
+        $this->now = $expiry - 1;
+        $this->assertNull($queue->receive('jobs', $replacement));
+        $this->now = $expiry;
+        $this->assertSame('reserved', $queue->receive('jobs', $replacement)->body);
+    }
+
+    public static function settlements(): iterable
+    {
+        yield 'ack' => ['acknowledge'];
+        yield 'reject' => ['reject'];
+    }
+
+    #[DataProvider('settlements')]
+    public function testDisconnectAfterDeleteRollsBackSettlement(string $operation): void
+    {
+        $entered = new DeferredFuture();
+        $release = new DeferredFuture();
+        $armed = false;
+        $queue = $this->open(50, $this->pauseAt('delete', $entered, $release, $armed));
+        $session = $queue->openSession();
+        $receipt = $this->prepareOperation($queue, $session, $operation);
+        $token = $this->scalar('SELECT reservation_token FROM queue_messages');
+        $expiry = $this->scalar('SELECT reserved_until FROM queue_messages');
+        $armed = true;
+        $settle = async(fn () => $this->mutate($queue, $session, $receipt, $operation));
+        try {
+            $entered->getFuture()->await(new TimeoutCancellation(5));
+            $this->assertFalse($settle->isComplete());
+            $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
+            $queue->closeSession($session);
+        } finally {
+            $release->complete();
+            $this->invalid(static fn () => $settle->await(new TimeoutCancellation(5)));
+        }
+        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
+        $this->assertSame($token, $this->scalar('SELECT reservation_token FROM queue_messages'));
+        $this->assertSame($expiry, $this->scalar('SELECT reserved_until FROM queue_messages'));
+        $replacement = $queue->openSession();
+        $this->assertNull($queue->receive('jobs', $replacement));
+        $this->now = $expiry;
+        $this->assertSame('payload', $queue->receive('jobs', $replacement)->body);
+    }
+
+    public function testCloseWaitsForInFlightSendAndPreservesItsCommit(): void
+    {
+        $entered = new DeferredFuture();
+        $release = new DeferredFuture();
+        $armed = false;
+        $connection = $this->pauseAt('commit', $entered, $release, $armed);
+        $queue = $this->open(connection: $connection);
+        $armed = true;
+        $send = async(static fn () => $queue->send('jobs', 'durable before close'));
+        $close = null;
+        try {
+            $entered->getFuture()->await(new TimeoutCancellation(5));
+            $this->assertFalse($send->isComplete());
+            $started = new DeferredFuture();
+            $close = async(static function () use ($queue, $started): void {
+                $started->complete();
+                $queue->close();
+            });
+            $started->getFuture()->await(new TimeoutCancellation(5));
+            $this->assertFalse($close->isComplete());
+            $this->assertFalse($connection->isClosed());
+            $this->assertSame(0, $this->scalar('SELECT count(*) FROM queue_messages'));
+        } finally {
+            $release->complete();
+            $id = $send->await(new TimeoutCancellation(5));
+            $close?->await(new TimeoutCancellation(5));
+        }
+        $this->assertTrue($connection->isClosed());
+        try {
+            $queue->send('jobs', 'after close');
+            $this->fail('Closed engine accepted a send.');
+        } catch (\RuntimeException $error) {
+            $this->assertStringContainsString('closed', $error->getMessage());
+        }
+        $reopened = $this->open();
+        $delivery = $reopened->receive('jobs', $reopened->openSession());
+        $this->assertSame($id, $delivery->id);
+        $this->assertSame('durable before close', $delivery->body);
+    }
+
     public function testZeroRowClaimRollsBack(): void
     {
         $queue = $this->open();
@@ -448,6 +555,42 @@ final class QueueTest extends DriverTestCase
             'acknowledge' => $queue->acknowledge($receipt, $session),
             'reject' => $queue->reject($receipt, $session),
         };
+    }
+
+    /** Pause once at a real transaction boundary, without adding production hooks. */
+    private function pauseAt(string $boundary, DeferredFuture $entered, DeferredFuture $release, bool &$armed): SqliteConnection
+    {
+        $real = $this->connection();
+        $pause = static function () use ($entered, $release, &$armed): void {
+            if ($armed) {
+                $armed = false;
+                $entered->complete();
+                $release->getFuture()->await(new TimeoutCancellation(5));
+            }
+        };
+
+        return $this->forward(SqliteConnection::class, $real, [
+            'beginTransaction' => function () use ($real, $pause, $boundary) {
+                $transaction = $real->beginTransaction();
+
+                return $this->forward(SqliteTransaction::class, $transaction, [
+                    'commit' => static function () use ($transaction, $pause, $boundary): void {
+                        if ('commit' === $boundary) {
+                            $pause();
+                        }
+                        $transaction->commit();
+                    },
+                    'execute' => static function (string $sql, array $parameters = []) use ($transaction, $pause, $boundary) {
+                        $result = $transaction->execute($sql, $parameters);
+                        if ('delete' === $boundary && str_starts_with($sql, 'DELETE ')) {
+                            $pause();
+                        }
+
+                        return $result;
+                    },
+                ]);
+            },
+        ]);
     }
 
     /** Test-only forwarding decorators keep all persistence in the real driver. */
