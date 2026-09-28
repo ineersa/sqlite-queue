@@ -55,7 +55,7 @@ driver suite skips before it creates any fixture instead of passing without that
 | Foreground `sqlite-queue broker` and PHP client | Not started, Task 04 |
 | Delayed wakeups | Not started, Task 05 |
 | Symfony Messenger adapter | Not started, Task 06 |
-| Benchmark baseline | Runner implemented, Task 02 |
+| Benchmark baseline | Task 02 complete, including recorded lock failures and comparison limits |
 | A/B comparison | Not started, Task 08. No candidate exists. |
 
 ## Dependencies
@@ -99,6 +99,7 @@ docs/           package contracts and driver verification evidence
   and the commands that reproduce it.
 - [bench/README.md](bench/README.md): run the standalone baseline with `php bench/run.php`.
 - [docs/benchmark-method.md](docs/benchmark-method.md): fixed workloads, timing definitions, and comparison limits.
+- [docs/benchmark-baseline.md](docs/benchmark-baseline.md): the first capture and retained raw evidence.
 
 ## License
 

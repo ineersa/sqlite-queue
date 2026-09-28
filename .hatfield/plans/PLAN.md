@@ -14,9 +14,11 @@ them. Dependency compatibility and executable bootstrap were routed in the same 
 
 Task 01 is complete. The supported dependency matrix, the delivery and receipt contracts, the
 storage and claim contract, and the protocol shape are recorded in
-[`docs/contracts.md`](../docs/contracts.md), with the measured driver behavior in
-[`docs/driver-verification.md`](../docs/driver-verification.md). Section 6 keeps the settled
+[`docs/contracts.md`](../../docs/contracts.md), with the measured driver behavior in
+[`docs/driver-verification.md`](../../docs/driver-verification.md). Section 6 keeps the settled
 decisions and names the evidence still owed by later tasks.
+
+Task 02 is complete. The standalone Doctrine SQLite runner captured all 24 scheduled baseline repetitions, including 14 incomplete repetitions caused by lock failures. The [method](../../docs/benchmark-method.md) and [capture](../../docs/benchmark-baseline.md) retain failures, raw evidence, and comparison limits. No candidate has been measured. Task 08 still owes matched A/B runs and sufficient tail samples.
 
 ### Implementation task index
 
@@ -25,7 +27,7 @@ Read this plan before the assigned task. The task files divide the work; they do
 | Task | Scope | Dependencies |
 | --- | --- | --- |
 | [01: setup and contracts](TASK-01-SETUP-AND-CONTRACTS.md) | Done. Dependency matrix, QA foundation, async-driver verification, required policy decisions | None |
-| [02: benchmark baseline](TASK-02-BENCHMARK-BASELINE.md) | Package-local runner and standard Messenger SQLite measurements | 01 |
+| [02: benchmark baseline](TASK-02-BENCHMARK-BASELINE.md) | Done. Package-local runner and recorded standard Messenger SQLite baseline, including failures | 01 |
 | [03: async SQLite queue](TASK-03-ASYNC-SQLITE-QUEUE.md) | Durable engine, atomic claims, receipts, persisted delayed availability | 01 |
 | [04: broker and client](TASK-04-BROKER-AND-CLIENT.md) | Bounded sockets, foreground service, ownership and lifecycle | 03 |
 | [05: delayed wakeups](TASK-05-DELAYED-WAKEUPS.md) | Race-safe notifications, deadline scheduling, restart and cancellation | 04 |
