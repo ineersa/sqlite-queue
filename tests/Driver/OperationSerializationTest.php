@@ -6,6 +6,7 @@ namespace Ineersa\SqliteQueue\Tests\Driver;
 
 use Fabpot\Amp\Sqlite\SqliteConfig;
 use Fabpot\Amp\Sqlite\SqliteConnector;
+
 use function Amp\async;
 use function Amp\delay;
 
@@ -32,13 +33,13 @@ final class OperationSerializationTest extends DriverTestCase
                 $transaction = $connection->beginTransaction();
                 $transaction->execute('INSERT INTO item (label) VALUES (?)', ['pending']);
 
-                $startedAt = \microtime(true);
-                $concurrent = async(function () use ($connection, $startedAt): array {
+                $startedAt = microtime(true);
+                $concurrent = async(static function () use ($connection, $startedAt): array {
                     $result = $connection->query('SELECT count(*) c FROM item');
                     $row = $result->fetchRow();
                     $result->close();
 
-                    return [\microtime(true) - $startedAt, $row['c']];
+                    return [microtime(true) - $startedAt, $row['c']];
                 });
 
                 delay(0.1);
@@ -56,7 +57,7 @@ final class OperationSerializationTest extends DriverTestCase
                 self::assertGreaterThanOrEqual(0.1, $elapsed);
                 self::assertSame(1, $count, 'The concurrent operation observed an uncommitted row.');
             } finally {
-                if ($concurrent !== null) {
+                if (null !== $concurrent) {
                     $concurrent->ignore();
                 }
 

@@ -7,6 +7,7 @@ namespace Ineersa\SqliteQueue\Tests\Driver;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
 use PHPUnit\Framework\TestCase;
+
 use function Amp\async;
 
 /**
@@ -28,7 +29,7 @@ abstract class DriverTestCase extends TestCase
         parent::setUp();
 
         if (!ProcessTree::available()) {
-            self::markTestSkipped(
+            $this->markTestSkipped(
                 'The driver suite proves process cleanup by reading /proc, which is unavailable here.',
             );
         }
@@ -41,7 +42,7 @@ abstract class DriverTestCase extends TestCase
         try {
             if (ProcessTree::available()) {
                 $survivors = $this->waitForOwnedProcesses([], 5.0);
-                self::assertSame([], $survivors, 'A persistence worker process survived the test.');
+                $this->assertSame([], $survivors, 'A persistence worker process survived the test.');
             }
         } finally {
             $this->database?->remove();
@@ -58,20 +59,21 @@ abstract class DriverTestCase extends TestCase
     /**
      * Waits until the processes owned by this test match $expected, then returns what is left.
      *
-     * @param list<int> $expected PIDs that may stay alive, if any.
+     * @param list<int> $expected PIDs that may stay alive, if any
+     *
      * @return list<int>
      */
     final protected function waitForOwnedProcesses(array $expected, float $timeout): array
     {
-        $deadline = \microtime(true) + $timeout;
+        $deadline = microtime(true) + $timeout;
         $owned = $this->ownedProcessIds();
 
-        while (\microtime(true) < $deadline) {
+        while (microtime(true) < $deadline) {
             $owned = $this->ownedProcessIds();
             if ($owned === $expected) {
                 return $owned;
             }
-            \usleep(20_000);
+            usleep(20_000);
         }
 
         return $owned;
@@ -86,8 +88,8 @@ abstract class DriverTestCase extends TestCase
             return [];
         }
 
-        $owned = ProcessTree::ownedBy(\getmypid());
+        $owned = ProcessTree::ownedBy(getmypid());
 
-        return \array_values(\array_unique([...$owned['launchers'], ...$owned['workers']]));
+        return array_values(array_unique([...$owned['launchers'], ...$owned['workers']]));
     }
 }

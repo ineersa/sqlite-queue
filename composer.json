@@ -10,8 +10,21 @@
         "revolt/event-loop": "^1.0"
     },
     "require-dev": {
+        "ext-pcntl": "*",
+        "ext-pdo_sqlite": "*",
+        "ext-posix": "*",
+        "doctrine/dbal": "^4.3",
+        "friendsofphp/php-cs-fixer": "^3.95",
+        "jolicode/castor": "^1.0",
+        "phpstan/phpstan": "^2.1",
+        "phpstan/phpstan-phpunit": "^2.0",
+        "phpstan/phpstan-strict-rules": "^2.0",
         "phpunit/phpunit": "^13.2",
-        "symfony/messenger": "^8.0"
+        "symfony/console": "^8.0",
+        "symfony/doctrine-messenger": "^8.0",
+        "symfony/event-dispatcher": "^8.0",
+        "symfony/messenger": "^8.0",
+        "symfony/process": "^8.0"
     },
     "suggest": {
         "symfony/messenger": "Required to use the Symfony Messenger transport adapter."
@@ -23,6 +36,7 @@
     },
     "autoload-dev": {
         "psr-4": {
+            "Ineersa\\SqliteQueue\\Bench\\": "bench/src/",
             "Ineersa\\SqliteQueue\\Tests\\": "tests/"
         }
     },
@@ -34,14 +48,5 @@
     ],
     "config": {
         "sort-packages": true
-    },
-    "scripts": {
-        "composer:validate": "@composer validate --no-check-publish",
-        "test": "phpunit",
-        "test:driver": "phpunit --testsuite driver",
-        "qa": [
-            "@composer:validate",
-            "@test"
-        ]
     }
 }

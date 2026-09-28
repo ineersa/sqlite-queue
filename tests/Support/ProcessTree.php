@@ -20,7 +20,7 @@ final class ProcessTree
 
     public static function available(): bool
     {
-        return \is_dir('/proc/self');
+        return is_dir('/proc/self');
     }
 
     /**
@@ -30,21 +30,22 @@ final class ProcessTree
     {
         $processes = [];
 
-        foreach (\glob('/proc/[0-9]*') ?: [] as $directory) {
-            $pid = (int) \basename($directory);
-            $command = @\file_get_contents($directory . '/cmdline');
-            if ($command === false) {
+        $directories = glob('/proc/[0-9]*');
+        foreach (false === $directories ? [] : $directories as $directory) {
+            $pid = (int) basename($directory);
+            $command = @file_get_contents($directory.'/cmdline');
+            if (false === $command) {
                 continue;
             }
 
-            $command = \trim(\str_replace("\0", ' ', $command));
-            if ($command === '') {
+            $command = trim(str_replace("\0", ' ', $command));
+            if ('' === $command) {
                 continue;
             }
 
             $ppid = null;
-            $status = @\file_get_contents($directory . '/status');
-            if (\is_string($status) && \preg_match('/^PPid:\s+(\d+)/m', $status, $match) === 1) {
+            $status = @file_get_contents($directory.'/status');
+            if (\is_string($status) && 1 === preg_match('/^PPid:\s+(\d+)/m', $status, $match)) {
                 $ppid = (int) $match[1];
             }
 
@@ -63,7 +64,7 @@ final class ProcessTree
 
         while (isset($snapshot[$pid]) && $guard++ < 128) {
             $ppid = $snapshot[$pid]['ppid'];
-            if ($ppid === null || $ppid === 0 || $ppid === 1) {
+            if (null === $ppid || 0 === $ppid || 1 === $ppid) {
                 return false;
             }
             if ($ppid === $ancestor) {
@@ -79,6 +80,7 @@ final class ProcessTree
      * PIDs of the shell wrappers that amphp/parallel starts for a connection.
      *
      * @param array<int, array{ppid: ?int, cmd: string}> $snapshot
+     *
      * @return list<int>
      */
     public static function workerLaunchers(array $snapshot): array
@@ -86,7 +88,7 @@ final class ProcessTree
         $pids = [];
 
         foreach ($snapshot as $pid => $process) {
-            if (\str_contains($process['cmd'], self::WORKER_SCRIPT)) {
+            if (str_contains($process['cmd'], self::WORKER_SCRIPT)) {
                 $pids[] = $pid;
             }
         }
@@ -98,6 +100,7 @@ final class ProcessTree
      * PIDs of the persistence worker processes owned by $ancestor.
      *
      * @param array<int, array{ppid: ?int, cmd: string}> $snapshot
+     *
      * @return list<int>
      */
     public static function persistenceWorkers(int $ancestor, array $snapshot): array
@@ -105,7 +108,7 @@ final class ProcessTree
         $pids = [];
 
         foreach ($snapshot as $pid => $process) {
-            if ($process['cmd'] !== self::WORKER_TITLE) {
+            if (self::WORKER_TITLE !== $process['cmd']) {
                 continue;
             }
             if (self::isDescendantOf($pid, $ancestor, $snapshot)) {
@@ -125,7 +128,7 @@ final class ProcessTree
     {
         $snapshot = self::snapshot();
 
-        $launchers = \array_values(\array_filter(
+        $launchers = array_values(array_filter(
             self::workerLaunchers($snapshot),
             static fn (int $pid): bool => self::isDescendantOf($pid, $ancestor, $snapshot),
         ));

@@ -28,6 +28,7 @@ final class ClaimTransactionTest extends DriverTestCase
             $this->createMessageTable($connection);
 
             try {
+                // Deliberately misuse query() to verify the driver's runtime rejection.
                 $connection->query('SELECT id FROM message WHERE queue = ?', ['default']);
                 self::fail('query() accepted bound parameters.');
             } catch (SqliteQueryError $exception) {
@@ -131,8 +132,8 @@ final class ClaimTransactionTest extends DriverTestCase
     }
 
     /**
-     * @param null|callable(SqliteTransaction, int): void $afterSelect Test-only seam that runs
-     *        between the select and the conditional update, inside the same transaction.
+     * @param callable(SqliteTransaction, int): void|null $afterSelect test-only seam that runs
+     *                                                                 between the select and the conditional update, inside the same transaction
      *
      * @return array{id: int, body: string, token: string, changed: int}|null
      */
@@ -154,17 +155,17 @@ final class ClaimTransactionTest extends DriverTestCase
             $row = $result->fetchRow();
             $result->close();
 
-            if ($row === null) {
+            if (null === $row) {
                 $transaction->rollback();
 
                 return null;
             }
 
-            if ($afterSelect !== null) {
+            if (null !== $afterSelect) {
                 $afterSelect($transaction, (int) $row['id']);
             }
 
-            $token = \bin2hex(\random_bytes(8));
+            $token = bin2hex(random_bytes(8));
             $update = $transaction->execute(
                 'UPDATE message SET reservation_token = ?, reserved_at = ?
                  WHERE id = ? AND reservation_token IS NULL',
@@ -172,7 +173,7 @@ final class ClaimTransactionTest extends DriverTestCase
             );
             $changed = $update->getRowCount();
 
-            if ($changed !== 1) {
+            if (1 !== $changed) {
                 $transaction->rollback();
 
                 return null;

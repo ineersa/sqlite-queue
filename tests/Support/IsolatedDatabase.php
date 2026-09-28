@@ -16,22 +16,22 @@ final class IsolatedDatabase
 
     public function __construct()
     {
-        $base = \dirname(__DIR__, 2) . '/var/tests';
+        $base = \dirname(__DIR__, 2).'/var/tests';
 
-        if (!\is_dir($base) && !\mkdir($base, 0o700, true) && !\is_dir($base)) {
+        if (!is_dir($base) && !mkdir($base, 0o700, true) && !is_dir($base)) {
             throw new \RuntimeException(\sprintf('Cannot create the test directory "%s".', $base));
         }
 
-        $this->directory = $base . '/' . \bin2hex(\random_bytes(8));
+        $this->directory = $base.'/'.bin2hex(random_bytes(8));
 
-        if (!\mkdir($this->directory, 0o700)) {
+        if (!mkdir($this->directory, 0o700)) {
             throw new \RuntimeException(\sprintf('Cannot create the test directory "%s".', $this->directory));
         }
     }
 
     public function path(string $name = 'queue.sqlite'): string
     {
-        return $this->directory . '/' . $name;
+        return $this->directory.'/'.$name;
     }
 
     public function directory(): string
@@ -41,14 +41,15 @@ final class IsolatedDatabase
 
     public function remove(): void
     {
-        foreach (\glob($this->directory . '/*') ?: [] as $file) {
-            if (\is_file($file)) {
-                @\unlink($file);
+        $files = glob($this->directory.'/*');
+        foreach (false === $files ? [] : $files as $file) {
+            if (is_file($file)) {
+                @unlink($file);
             }
         }
 
-        if (\is_dir($this->directory)) {
-            @\rmdir($this->directory);
+        if (is_dir($this->directory)) {
+            @rmdir($this->directory);
         }
     }
 }

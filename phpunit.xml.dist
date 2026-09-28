@@ -9,7 +9,13 @@
          beStrictAboutOutputDuringTests="true">
     <testsuites>
         <testsuite name="driver">
-            <directory>tests</directory>
+            <directory>tests/Driver</directory>
+        </testsuite>
+        <testsuite name="benchmark">
+            <directory>tests/Bench</directory>
+        </testsuite>
+        <testsuite name="tooling">
+            <directory>tests/Tooling</directory>
         </testsuite>
     </testsuites>
     <source>
