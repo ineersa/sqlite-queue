@@ -171,9 +171,9 @@ reply never proves absence of the mutation.
 - Readiness follows successful ownership, schema initialization, database connection, and
   socket readiness, not process creation.
 
-Protocol error categories are invalid request, unsupported protocol version, invalid queue
-name, stale or foreign receipt, unknown delivery, broker shutting down, and internal storage
-failure. Task 04 fixes the exact error codes and names.
+Task 04 implements the immediate-operation subset. The [v1 protocol reference](broker-protocol.md)
+defines exact framing, limits, and error codes. Bounded notification waiting remains Task 05 work.
+Unknown deliveries and stale or foreign receipts share the `stale_receipt` code.
 
 ## Reference sources
 
@@ -192,6 +192,5 @@ sets `synchronous`, so neither establishes the cost of the FULL setting used her
 
 ## Decisions left open
 
-- Concrete frame, connection, and buffer limits: Task 04.
 - Messenger mapping details, including decode failure and worker idle integration: Task 06.
 - Measured cost of synchronous FULL against the baseline durability: Task 02 and Task 08.

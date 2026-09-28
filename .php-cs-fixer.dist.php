@@ -35,5 +35,5 @@ return (new PhpCsFixer\Config())
     ->setRiskyAllowed(true)
     ->setFinder(PhpCsFixer\Finder::create()
         ->in([__DIR__.'/src', __DIR__.'/bench/src', __DIR__.'/tests', __DIR__.'/.castor'])
-        ->append([__DIR__.'/bin/benchmark', __DIR__.'/castor.php', __FILE__])
+        ->append([__DIR__.'/bin/benchmark', __DIR__.'/bin/sqlite-queue', __DIR__.'/castor.php', __FILE__])
     );

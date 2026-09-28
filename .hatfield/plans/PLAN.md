@@ -20,7 +20,9 @@ decisions and names the evidence still owed by later tasks.
 
 Task 02 is complete. The standalone Doctrine SQLite runner captured all 24 scheduled baseline repetitions, including 14 incomplete repetitions caused by lock failures. The [method](../../docs/benchmark-method.md) and [capture](../../docs/benchmark-baseline.md) retain failures, raw evidence, and comparison limits. No candidate has been measured. Task 08 still owes matched A/B runs and sufficient tail samples.
 
-Task 03 is complete. The [queue engine](../../docs/queue-engine.md) implements durable send, atomic receive, fenced settlement, visibility expiry, and persisted millisecond availability. File-backed tests cover concurrency, commit barriers, rollback, database-full failure, and persistence-worker death. Task 04 consumes this storage API; sockets and notifications are not implemented yet.
+Task 03 is complete. The [queue engine](../../docs/queue-engine.md) implements durable send, atomic receive, fenced settlement, visibility expiry, and persisted millisecond availability. File-backed tests cover concurrency, commit barriers, rollback, database-full failure, and persistence-worker death.
+
+Task 04 is complete. The [foreground broker and PHP client](../../docs/broker.md) expose the engine over bounded Unix sockets. Tests cover malformed traffic, connection limits, slow readers, cancellation, ownership conflicts, restart, and persistence-child failure. The [protocol reference](../../docs/broker-protocol.md) defines limits and recovery. Notification waiting remains Task 05 work; no broker performance result is claimed.
 
 ### Implementation task index
 
@@ -31,7 +33,7 @@ Read this plan before the assigned task. The task files divide the work; they do
 | [01: setup and contracts](TASK-01-SETUP-AND-CONTRACTS.md) | Done. Dependency matrix, QA foundation, async-driver verification, required policy decisions | None |
 | [02: benchmark baseline](TASK-02-BENCHMARK-BASELINE.md) | Done. Package-local runner and recorded standard Messenger SQLite baseline, including failures | 01 |
 | [03: async SQLite queue](TASK-03-ASYNC-SQLITE-QUEUE.md) | Done. Durable engine, atomic claims, receipts, persisted delayed availability | 01 |
-| [04: broker and client](TASK-04-BROKER-AND-CLIENT.md) | Bounded sockets, foreground service, ownership and lifecycle | 03 |
+| [04: broker and client](TASK-04-BROKER-AND-CLIENT.md) | Done. Bounded sockets, foreground service, ownership and lifecycle | 03 |
 | [05: delayed wakeups](TASK-05-DELAYED-WAKEUPS.md) | Race-safe notifications, deadline scheduling, restart and cancellation | 04 |
 | [06: Messenger adapter](TASK-06-MESSENGER-ADAPTER.md) | Real worker integration, serializers, DelayStamp, retry/idle mapping | 05 |
 | [07: failure and lifecycle proof](TASK-07-FAILURE-AND-LIFECYCLE-PROOF.md) | Remaining cross-component fault cases and independent safety review | 06 |
@@ -266,16 +268,16 @@ Symfony 9 and later, are unverified. Messenger stays a development dependency un
 adapter lands, then becomes an optional runtime requirement so the engine and client still run
 without Symfony.
 
-The reserved foreground command is `sqlite-queue broker`. Client operations are send, receive,
-acknowledge, reject, bounded wait, and close. Exact PHP signatures are deferred to Task 04 so
-no API is published while its behavior is still open. No multi-driver abstraction, version
-fallback, or speculative adapter layer is added.
+The foreground command is `sqlite-queue broker`. Task 04 implements client send, immediate
+receive, acknowledge, reject, and close, with the API documented in
+[broker usage](../../docs/broker.md). Bounded waiting remains Task 05 work. No multi-driver
+abstraction, version fallback, or speculative adapter layer is added.
 
 ## 7. Broker lifecycle and protocol requirements
 
 Start with a foreground local Unix-socket service. Persistent connections avoid repeated connection setup. Multiplexed requests are not an MVP requirement; one outstanding request per connection is a reasonable initial simplification, subject to cancellation and wakeup needs.
 
-The protocol must cover send, immediate receive, ACK, terminal reject, bounded waiting, and the initialization information needed to reject incompatible clients. These are conceptual operations, not approved exact method or wire names. Do not add queue-admin endpoints from the deferred feature list.
+The protocol must cover send, immediate receive, ACK, terminal reject, bounded waiting, and the initialization information needed to reject incompatible clients. Task 04 defines the [v1 wire format](../../docs/broker-protocol.md) for immediate operations; Task 05 adds bounded waiting. Do not add queue-admin endpoints from the deferred feature list.
 
 Before implementation, define a bounded frame format, request/reply correlation, and error representation. Existing Amp byte-stream and socket facilities should handle partial I/O and backpressure. Malformed, truncated, oversized, or unsupported frames must fail with bounded resource use.
 

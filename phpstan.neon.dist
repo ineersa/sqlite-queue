@@ -10,6 +10,7 @@ parameters:
         - src
         - bench/src
         - bin/benchmark
+        - bin/sqlite-queue
         - castor.php
         - .castor
         - .php-cs-fixer.dist.php

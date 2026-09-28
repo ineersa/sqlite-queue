@@ -8,6 +8,9 @@
          failOnWarning="true"
          beStrictAboutOutputDuringTests="true">
     <testsuites>
+        <testsuite name="broker">
+            <directory>tests/Broker</directory>
+        </testsuite>
         <testsuite name="queue">
             <directory>tests/Queue</directory>
         </testsuite>

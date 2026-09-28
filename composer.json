@@ -3,9 +3,13 @@
     "description": "Sqlite based queue broker",
     "license": "MIT",
     "type": "library",
+    "bin": ["bin/sqlite-queue"],
     "require": {
         "php": "^8.5",
         "ext-sqlite3": "*",
+        "amphp/amp": "^3.1",
+        "amphp/parallel": "^2.3",
+        "amphp/socket": "^2.4",
         "amphp/sync": "^2.3",
         "fabpot/amphp-sqlite3": "^1.0",
         "revolt/event-loop": "^1.0"
@@ -28,6 +32,9 @@
         "symfony/process": "^8.0"
     },
     "suggest": {
+        "ext-pcntl": "Required to run the foreground broker with signal handling.",
+        "ext-posix": "Required to run the foreground broker with private file ownership checks.",
+        "symfony/console": "Required for the sqlite-queue CLI command (^8.0); the engine, broker API, and client do not require Symfony.",
         "symfony/messenger": "Required to use the Symfony Messenger transport adapter."
     },
     "autoload": {
