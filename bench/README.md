@@ -5,7 +5,7 @@ Install development dependencies with `composer install`. Use PHP 8.5 on Linux w
 Run all six workloads from the checkout:
 
 ```sh
-	php bench/run.php
+	php bin/benchmark run
 ```
 
 Do not run other benchmarks or builds at the same time. The command creates a private, unique directory under `var/bench/` and prints its path. It uses fresh file-backed databases on that filesystem, never a database supplied through environment variables. It removes its database files after each repetition and retains evidence files.
@@ -17,10 +17,12 @@ Exit code 0 means every scheduled baseline repetition completed without accounti
 For a short execution check, use:
 
 ```sh
-	php bench/run.php --smoke
+	php bin/benchmark run --smoke
 ```
 
 Smoke uses four messages per publisher or prefill queue and one repetition. Do not use smoke results as performance evidence. To run one workload, add `--workload=idle`, or another name from [the method](../docs/benchmark-method.md).
+
+Use `php bin/benchmark run --help` for options. Composer maps `Ineersa\SqliteQueue\Bench\` to `bench/src/` through `autoload-dev`. The executable only loads Composer and registers Symfony Console commands. Hidden `worker` and `clock-probe` commands serve the coordinator; they are not separate scripts to run by hand.
 
 Run deterministic checks separately:
 

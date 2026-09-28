@@ -56,7 +56,9 @@ final class Stats
                         break;
 
                     case 'send':
-                        if (isset($sends[(string) $record['msg']])) { ++$duplicateSends; }
+                        if (isset($sends[(string) $record['msg']])) {
+                            ++$duplicateSends;
+                        }
                         $sends[(string) $record['msg']] = $record;
                         if (true !== ($record['ok'] ?? false)) {
                             $failures[] = ['kind' => 'send', 'msg' => $record['msg'], 'error' => $record['error'] ?? 'unknown'];
@@ -137,19 +139,33 @@ final class Stats
             if (($process['kinds']['foot'] ?? 0) !== 1 || ($process['kinds']['header'] ?? 0) < 1 || ($process['kinds']['clock_check'] ?? 0) !== 1) {
                 $incomplete[] = 'missing lifecycle or clock evidence';
             }
-            if ($process['exit_code'] === null) { $incomplete[] = 'missing process exit status'; }
+            if ($process['exit_code'] === null) {
+                $incomplete[] = 'missing process exit status';
+            }
         }
-        if ($duplicateSends) { $incomplete[] = 'duplicate send correlation IDs'; }
-        if ($failures) { $incomplete[] = 'recorded operation failures'; }
-        if (!empty($facts['survivors'])) { $incomplete[] = 'owned processes survived teardown'; }
-        foreach ($facts['coordinator_errors'] ?? [] as $error) { $incomplete[] = $error; }
+        if ($duplicateSends) {
+            $incomplete[] = 'duplicate send correlation IDs';
+        }
+        if ($failures) {
+            $incomplete[] = 'recorded operation failures';
+        }
+        if (!empty($facts['survivors'])) {
+            $incomplete[] = 'owned processes survived teardown';
+        }
+        foreach ($facts['coordinator_errors'] ?? [] as $error) {
+            $incomplete[] = $error;
+        }
         $clocksValid = ($facts['clock_probe']['verified'] ?? false) === true && count($clockChecks) === count($sources) && $sources !== []
             && array_all($clockChecks, static fn (array $c): bool => ($c['valid'] ?? false) === true
                 && $c['before_ready_ns'] <= $c['parent_go_ns'] && $c['parent_go_ns'] <= $c['after_go_ns']);
         if (!$clocksValid) {
             $incomplete[] = 'cross-process clock validation failed';
-            foreach (['publish_to_handler_ms', 'full_cycle_ms', 'confirmation_to_handler_ms'] as $key) { $metrics[$key] = self::percentiles([]); }
-            foreach (['small', 'large'] as $key) { $metrics['by_payload'][$key]['full_cycle_ms'] = self::percentiles([]); }
+            foreach (['publish_to_handler_ms', 'full_cycle_ms', 'confirmation_to_handler_ms'] as $key) {
+                $metrics[$key] = self::percentiles([]);
+            }
+            foreach (['small', 'large'] as $key) {
+                $metrics['by_payload'][$key]['full_cycle_ms'] = self::percentiles([]);
+            }
         }
 
         if (0 !== $corrupt) {
@@ -235,7 +251,9 @@ final class Stats
                         $probes[] = ['msg' => $msg, 'delay_ms' => $send['delay_ms'], 'requested_deadline_wall' => $send['requested_deadline_wall'], 'stored_deadline_wall' => $delivery['stored_deadline_wall'], 'quantization_ms' => $quantization, 'handler_wall' => $delivery['handler_wall']];
                     }
                 }
-                if (!$measured) { continue; }
+                if (!$measured) {
+                    continue;
+                }
                 $delivered[$msg] = true;
 
                 if (($delivery['outcome'] ?? '') === 'ack' && \is_numeric($delivery['ack_duration_ms'] ?? null)) {
@@ -329,7 +347,9 @@ final class Stats
                 $outcome = (string) ($record['outcome'] ?? '');
                 if ('ack' === $outcome) {
                     ++$ackCount;
-                    if (isset($sends[$msg])) { $ackedMessages[$msg] = true; }
+                    if (isset($sends[$msg])) {
+                        $ackedMessages[$msg] = true;
+                    }
                 } elseif ('reject' === $outcome) {
                     ++$rejectCount;
                 }
@@ -371,8 +391,12 @@ final class Stats
         if ($payloadMismatch > 0) {
             $incomplete[] = \sprintf('%d deliveries failed payload verification', $payloadMismatch);
         }
-        if ($pendingRows > 0) { $incomplete[] = 'persisted work remains'; }
-        if ($earlyDeliveries > 0) { $incomplete[] = 'delivery before stored eligibility'; }
+        if ($pendingRows > 0) {
+            $incomplete[] = 'persisted work remains';
+        }
+        if ($earlyDeliveries > 0) {
+            $incomplete[] = 'delivery before stored eligibility';
+        }
 
         return [
             'expected_sends' => $expectedSends,

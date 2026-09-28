@@ -5,7 +5,8 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Bench\Child;
 
 use Doctrine\DBAL\Connection;
-use Ineersa\SqliteQueue\Bench\{Baseline, BenchMessage, Config};
+use Ineersa\SqliteQueue\Bench\Baseline;
+use Ineersa\SqliteQueue\Bench\BenchMessage;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
 use Symfony\Component\Messenger\Transport\Receiver\ReceiverInterface;
@@ -13,14 +14,20 @@ use Symfony\Component\Messenger\Transport\Receiver\ReceiverInterface;
 /** Measures public transport calls without changing the Doctrine claim SQL. */
 final class Receiver implements ReceiverInterface
 {
-    public array $polls = ['polls' => 0, 'empty_polls' => 0, 'fetched' => 0, 'poll_ms' => 0.0];
-    public array $entries = [];
-    public bool $failed = false;
+    public private(set) array $polls = ['polls' => 0, 'empty_polls' => 0, 'fetched' => 0, 'poll_ms' => 0.0];
+    public private(set) bool $failed = false;
+    private array $entries = [];
     private array $transports = [];
     private int $next = 0;
 
-    public function __construct(private Connection $connection, array $queues, private Recorder $recorder, private string $directory, private int $index, private bool $roundtrip = false)
-    {
+    public function __construct(
+        private readonly Connection $connection,
+        array $queues,
+        private readonly Recorder $recorder,
+        private readonly string $directory,
+        private readonly int $index,
+        private readonly bool $roundtrip = false,
+    ) {
         foreach ($queues as $queue) {
             $this->transports[$queue] = Baseline::transport($connection, $queue);
         }
@@ -51,7 +58,11 @@ final class Receiver implements ReceiverInterface
 
     public function enter(BenchMessage $message): void
     {
-        $this->entries[$message->corrId] = ['t_handler_ns' => hrtime(true), 'handler_wall' => microtime(true), 'payload_ok' => $message->matchesRegeneratedPayload()];
+        $this->entries[$message->corrId] = [
+            't_handler_ns' => hrtime(true),
+            'handler_wall' => microtime(true),
+            'payload_ok' => $message->matchesRegeneratedPayload(),
+        ];
         if (!$this->entries[$message->corrId]['payload_ok']) {
             throw new \RuntimeException('Payload mismatch: ' . $message->corrId);
         }
@@ -74,7 +85,11 @@ final class Receiver implements ReceiverInterface
         if (!$message instanceof BenchMessage) {
             throw new \RuntimeException('Unexpected message type');
         }
-        $entry = $this->entries[$message->corrId] ?? ['t_handler_ns' => hrtime(true), 'handler_wall' => microtime(true), 'payload_ok' => false];
+        $entry = $this->entries[$message->corrId] ?? [
+            't_handler_ns' => hrtime(true),
+            'handler_wall' => microtime(true),
+            'payload_ok' => false,
+        ];
         // The receiver has committed by this point. No transaction is held during the handler.
         $rowId = $envelope->last(TransportMessageIdStamp::class)?->getId();
         $stored = $this->connection->fetchOne('SELECT available_at FROM messenger_messages WHERE id = ?', [$rowId]);
@@ -93,10 +108,16 @@ final class Receiver implements ReceiverInterface
                 file_put_contents($this->directory . '/acks/' . $message->corrId, 'ack');
             }
             $this->recorder->sample($entry + [
-                'kind' => 'deliver', 'msg' => $message->corrId, 'queue' => $message->queue, 'transport_id' => $rowId,
-                'outcome' => $error === null ? $outcome : 'error', 'error' => $error,
-                't_ack_invoke_ns' => $start, 't_ack_confirm_ns' => $error === null ? $end : null,
-                'ack_duration_ms' => ($end - $start) / 1e6, 'handling_ms' => ($end - $entry['t_handler_ns']) / 1e6,
+                'kind' => 'deliver',
+                'msg' => $message->corrId,
+                'queue' => $message->queue,
+                'transport_id' => $rowId,
+                'outcome' => $error === null ? $outcome : 'error',
+                'error' => $error,
+                't_ack_invoke_ns' => $start,
+                't_ack_confirm_ns' => $error === null ? $end : null,
+                'ack_duration_ms' => ($end - $start) / 1e6,
+                'handling_ms' => ($end - $entry['t_handler_ns']) / 1e6,
                 'stored_deadline_wall' => $deadline,
                 'lateness_ms' => $deadline === null ? null : ($entry['handler_wall'] - $deadline) * 1000,
                 'delivered_before_deadline' => $deadline !== null && $entry['handler_wall'] < $deadline,

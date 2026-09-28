@@ -4,8 +4,6 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Tests\Bench;
 
-require_once dirname(__DIR__, 2) . '/bench/bootstrap.php';
-
 use Ineersa\SqliteQueue\Bench\{Baseline, Config, Process, Report, SampleStore, Stats};
 use PHPUnit\Framework\TestCase;
 
@@ -22,7 +20,9 @@ final class BenchmarkTest extends TestCase
     protected function tearDown(): void
     {
         $files = new \RecursiveIteratorIterator(new \RecursiveDirectoryIterator($this->directory, \FilesystemIterator::SKIP_DOTS), \RecursiveIteratorIterator::CHILD_FIRST);
-        foreach ($files as $file) { $file->isDir() ? rmdir($file->getPathname()) : unlink($file->getPathname()); }
+        foreach ($files as $file) {
+            $file->isDir() ? rmdir($file->getPathname()) : unlink($file->getPathname());
+        }
         rmdir($this->directory);
     }
 
@@ -130,7 +130,9 @@ final class BenchmarkTest extends TestCase
 
     public function testProcessReadinessAndTimeoutReapOnlyOwnedProcess(): void
     {
-        if (PHP_OS_FAMILY !== 'Linux') { self::markTestSkipped('Linux process evidence'); }
+        if (PHP_OS_FAMILY !== 'Linux') {
+            self::markTestSkipped('Linux process evidence');
+        }
         $script = $this->directory . '/fixture.php';
         file_put_contents($script, '<?php file_put_contents($argv[1], json_encode(["event"=>"ready", "pid"=>getmypid()])); while (true) { usleep(10000); }');
         $process = Process::spawn('fixture', '0', [PHP_BINARY, $script, $this->directory . '/ready/fixture-0.ready'], ['PATH' => '/usr/bin:/bin'], $this->directory);
@@ -146,7 +148,10 @@ final class BenchmarkTest extends TestCase
             self::assertSame([], $process->survivors());
             self::assertNotSame(0, $process->exitCode());
         } finally {
-            if ($process->isRunning()) { $process->killTree(); $process->wait(1); }
+            if ($process->isRunning()) {
+                $process->killTree();
+                $process->wait(1);
+            }
         }
     }
 

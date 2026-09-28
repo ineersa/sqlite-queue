@@ -4,130 +4,264 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Bench;
 
+use Doctrine\DBAL\Connection;
+use Ineersa\SqliteQueue\Bench\Child\Role;
+
+/** Runs and tears down one isolated repetition. */
 final class Runner
 {
-    public static function repetition(string $directory, array $workload, string $name, bool $warmup, array $clockProbe): array
+    /** @var list<Process> */
+    private array $children = [];
+    /** @var list<Process> */
+    private array $producers = [];
+    /** @var list<Process> */
+    private array $consumers = [];
+    private ?Connection $connection = null;
+    private readonly Resources $resources;
+    private int $deadline;
+    private array $facts = [];
+
+    public function __construct(
+        private readonly string $directory,
+        private readonly array $workload,
+        private readonly Cancellation $cancellation,
+    ) {
+        $this->resources = new Resources(getmypid());
+    }
+
+    public function run(string $name, bool $warmup, array $clockProbe): array
     {
-        foreach (['', '/ready', '/go', '/logs', '/samples', '/acks'] as $sub) {
-            if (!mkdir($directory . $sub, 0700, true) && !is_dir($directory . $sub)) {
-                throw new \RuntimeException('Cannot create run directory');
-            }
-        }
-        $config = ['directory' => $directory, 'database' => $directory . '/queue.sqlite', 'workload' => $workload];
-        file_put_contents($directory . '/config.json', json_encode($config, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR));
-        $children = [];
-        $producers = [];
-        $consumers = [];
-        $resources = new Resources(getmypid());
-        $facts = ['warmup' => $warmup, 'inventory' => [], 'coordinator_errors' => [], 'clock_probe' => $clockProbe];
-        $connection = null;
-        $deadline = hrtime(true) + (int) (($workload['timeout_s'] + Config::STARTUP_TIMEOUT_S) * 1e9);
-        $tick = static function () use ($resources, $deadline): void {
-            $resources->sample();
-            if (!empty($GLOBALS['benchmark_interrupted'])) { throw new \RuntimeException('Benchmark interrupted'); }
-            if (hrtime(true) > $deadline) {
-                throw new \RuntimeException('Repetition exceeded hard deadline');
-            }
-            usleep(Config::PROGRESS_INTERVAL_US);
-        };
-        $spawn = static function (string $role, int $index) use ($directory, &$children): Process {
-            $process = Process::spawn($role, (string) $index,
-                [PHP_BINARY, '-d', 'date.timezone=UTC', Config::rootDir() . '/bench/child.php', $directory . '/config.json', $role, (string) $index],
-                ['PATH' => '/usr/bin:/bin', 'LANG' => 'C', 'TZ' => 'UTC'], $directory);
-            $children[] = $process;
-            $process->waitForReady(Config::STARTUP_TIMEOUT_S);
-            return $process;
-        };
-        $go = static function (Process $process) use ($directory): void {
-            file_put_contents($directory . '/go/' . $process->role() . '-' . $process->argument(), (string) hrtime(true));
-        };
+        $this->prepareDirectory();
+        $this->deadline = hrtime(true) + (int) (($this->workload['timeout_s'] + Config::STARTUP_TIMEOUT_S) * 1e9);
+        $this->facts = [
+            'warmup' => $warmup,
+            'inventory' => [],
+            'coordinator_errors' => [],
+            'clock_probe' => $clockProbe,
+        ];
+
         try {
-            $connection = Baseline::connect($config['database']);
-            Baseline::transport($connection, $workload['queues'][0])->setup();
-            $facts['setup_durability'] = Baseline::durability($connection);
-            for ($i = 0; $i < $workload['consumers']; ++$i) {
-                $consumers[] = $spawn('consumer', $i);
-            }
-            if (isset($workload['prefill'])) {
-                $producers[] = $spawn('prefill', 0);
-            } else {
-                foreach ($workload['publishers'] as $i => $_) {
-                    $producers[] = $spawn('publisher', $i);
-                }
-            }
-            $resources->sample();
-            if ($workload['name'] === 'backlog') {
-                foreach ($producers as $process) { $go($process); }
-                while (array_any($producers, static fn (Process $p): bool => $p->isRunning())) { $tick(); }
-            }
-            foreach ($consumers as $process) { $go($process); }
-            if ($workload['name'] !== 'backlog') {
-                // Observe a real empty receive before releasing any publisher.
-                for ($i = 0; $i < count($consumers); ++$i) {
-                    while (!is_file($directory . '/idle-' . $i)) {
-                        if (!$consumers[$i]->isRunning()) { throw new \RuntimeException('Consumer exited before idle readiness'); }
-                        $tick();
-                    }
-                }
-                $idleStart = microtime(true);
-                $idleEnd = hrtime(true) + (int) (($workload['idle_ms'] ?? 0) * 1e6);
-                while (hrtime(true) < $idleEnd) { $tick(); }
-                if (isset($workload['idle_ms'])) {
-                    $facts['idle_window'] = $resources->cpuBetween($idleStart, microtime(true));
-                }
-                foreach ($producers as $process) { $go($process); }
-            }
-            while (array_any($producers, static fn (Process $p): bool => $p->isRunning())) {
-                if (!array_any($consumers, static fn (Process $p): bool => $p->isRunning())) {
-                    throw new \RuntimeException('All consumers exited while publishing');
-                }
-                $tick();
-            }
-            // All sends finished; zero persisted rows means ACK/reject calls have completed.
-            while (array_sum(Baseline::inventory($connection)) !== 0) {
-                if (!array_any($consumers, static fn (Process $p): bool => $p->isRunning())) {
-                    throw new \RuntimeException('All consumers exited with work pending');
-                }
-                $tick();
-            }
-        } catch (\Throwable $e) {
-            $facts['coordinator_errors'][] = $e::class . ': ' . $e->getMessage();
+            $this->initializeDatabase();
+            $this->startChildren();
+            $this->releaseWorkload();
+            $this->awaitPublication();
+            $this->awaitDrain();
+        } catch (\Throwable $error) {
+            $this->recordError($error);
         } finally {
-            file_put_contents($directory . '/stop', 'stop');
-            foreach ($children as $process) {
-                $process->wait(3.0);
+            $this->shutdown();
+        }
+
+        return $this->report($name);
+    }
+
+    private function prepareDirectory(): void
+    {
+        foreach (['', '/ready', '/go', '/logs', '/samples', '/acks'] as $subdirectory) {
+            if (!mkdir($this->directory . $subdirectory, 0700, true)) {
+                throw new \RuntimeException('Cannot create repetition directory: ' . $this->directory . $subdirectory);
             }
-            $resources->sample();
-            if ($connection !== null) {
-                try {
-                    $facts['inventory'] = Baseline::inventory($connection);
-                    $facts['checkpoint'] = Baseline::checkpoint($connection);
-                } catch (\Throwable $e) {
-                    $facts['coordinator_errors'][] = $e->getMessage();
-                } finally {
-                    $connection->close();
+        }
+        $config = [
+            'directory' => $this->directory,
+            'database' => $this->directory . '/queue.sqlite',
+            'workload' => $this->workload,
+        ];
+        file_put_contents($this->directory . '/config.json', json_encode($config, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR));
+    }
+
+    private function initializeDatabase(): void
+    {
+        $this->connection = Baseline::connect($this->directory . '/queue.sqlite');
+        Baseline::transport($this->connection, $this->workload['queues'][0])->setup();
+        $this->facts['setup_durability'] = Baseline::durability($this->connection);
+    }
+
+    private function startChildren(): void
+    {
+        for ($index = 0; $index < $this->workload['consumers']; ++$index) {
+            $this->consumers[] = $this->spawn(Role::Consumer, $index);
+        }
+        if (isset($this->workload['prefill'])) {
+            $this->producers[] = $this->spawn(Role::Prefill, 0);
+        } else {
+            foreach (array_keys($this->workload['publishers']) as $index) {
+                $this->producers[] = $this->spawn(Role::Publisher, $index);
+            }
+        }
+        $this->resources->sample();
+    }
+
+    private function spawn(Role $role, int $index): Process
+    {
+        $this->cancellation->throwIfRequested();
+        $process = Process::spawn($role->value, (string) $index, [
+            PHP_BINARY,
+            '-d', 'date.timezone=UTC',
+            Config::rootDir() . '/bin/benchmark',
+            'worker',
+            $this->directory . '/config.json',
+            $role->value,
+            (string) $index,
+            '--no-ansi',
+            '--no-interaction',
+        ], [], $this->directory);
+        $this->children[] = $process;
+        $process->waitForReady(Config::STARTUP_TIMEOUT_S);
+
+        return $process;
+    }
+
+    private function releaseWorkload(): void
+    {
+        if ($this->workload['name'] === 'backlog') {
+            $this->release($this->producers);
+            while ($this->anyRunning($this->producers)) {
+                $this->tick();
+            }
+            $this->release($this->consumers);
+
+            return;
+        }
+
+        $this->release($this->consumers);
+        $this->awaitIdleConsumers();
+        $this->measureIdleWindow();
+        $this->release($this->producers);
+    }
+
+    /** @param list<Process> $processes */
+    private function release(array $processes): void
+    {
+        foreach ($processes as $process) {
+            $path = $this->directory . '/go/' . $process->role() . '-' . $process->argument();
+            file_put_contents($path, (string) hrtime(true));
+        }
+    }
+
+    private function awaitIdleConsumers(): void
+    {
+        foreach ($this->consumers as $index => $consumer) {
+            while (!is_file($this->directory . '/idle-' . $index)) {
+                if (!$consumer->isRunning()) {
+                    throw new \RuntimeException('Consumer exited before idle readiness.');
                 }
+                $this->tick();
             }
         }
-        $facts['resources'] = $resources->summary();
-        $facts['resources']['accounting'] = 'Child tree sampled RSS/process count; final per-child getrusage CPU/high-water RSS is in raw foot records. Coordinator reported separately.';
+    }
+
+    private function measureIdleWindow(): void
+    {
+        $startWall = microtime(true);
+        $end = hrtime(true) + (int) (($this->workload['idle_ms'] ?? 0) * 1e6);
+        while (hrtime(true) < $end) {
+            $this->tick();
+        }
+        if (isset($this->workload['idle_ms'])) {
+            $this->facts['idle_window'] = $this->resources->cpuBetween($startWall, microtime(true));
+        }
+    }
+
+    private function awaitPublication(): void
+    {
+        while ($this->anyRunning($this->producers)) {
+            if (!$this->anyRunning($this->consumers)) {
+                throw new \RuntimeException('All consumers exited while publishing.');
+            }
+            $this->tick();
+        }
+    }
+
+    private function awaitDrain(): void
+    {
+        // Only inspect inventory after publication. Do not add DB reads to the publishing window.
+        while (array_sum(Baseline::inventory($this->connection)) !== 0) {
+            if (!$this->anyRunning($this->consumers)) {
+                throw new \RuntimeException('All consumers exited with work pending.');
+            }
+            $this->tick();
+        }
+    }
+
+    private function tick(): void
+    {
+        $this->resources->sample();
+        $this->cancellation->throwIfRequested();
+        if (hrtime(true) > $this->deadline) {
+            throw new \RuntimeException('Repetition exceeded hard deadline.');
+        }
+        usleep(Config::PROGRESS_INTERVAL_US);
+    }
+
+    private function anyRunning(array $processes): bool
+    {
+        return array_any($processes, static fn (Process $process): bool => $process->isRunning());
+    }
+
+    private function shutdown(): void
+    {
+        file_put_contents($this->directory . '/stop', 'stop');
+        foreach ($this->children as $process) {
+            $process->wait(3.0);
+        }
+        $this->resources->sample();
+        if ($this->connection === null) {
+            return;
+        }
+
+        try {
+            $this->facts['inventory'] = Baseline::inventory($this->connection);
+            $this->facts['checkpoint'] = Baseline::checkpoint($this->connection);
+        } catch (\Throwable $error) {
+            $this->recordError($error);
+        } finally {
+            $this->connection->close();
+        }
+    }
+
+    private function report(string $name): array
+    {
+        $this->facts['resources'] = $this->resources->summary();
+        $this->facts['resources']['accounting'] = 'Sampled child-tree RSS/process count; final child getrusage is in foot records. Coordinator reported separately.';
         $snapshot = ProcessTree::snapshot();
-        $facts['survivors'] = array_values(array_filter($resources->observedPids(), static fn (int $pid): bool => isset($snapshot[$pid]) && $pid !== getmypid()));
-        $sources = [];
-        foreach ($children as $process) {
-            $sources[] = ['role' => $process->role(), 'argument' => $process->argument(),
-                'path' => $directory . '/samples/' . $process->role() . '-' . $process->argument() . '.jsonl',
-                'exit_code' => $process->exitCode(), 'timed_out' => $process->timedOut(), 'killed' => $process->killed(), 'stderr' => $process->errorTail()];
-        }
-        $result = Stats::analyze($workload, $name, $sources, $facts);
-        $result['facts'] = $facts;
-        $result['workload'] = $workload;
-        $result['directory'] = $directory;
-        file_put_contents($directory . '/result.json', json_encode($result, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR));
-        // Retain only this repetition's evidence. No user-supplied database paths are accepted.
+        $this->facts['survivors'] = array_values(array_filter(
+            $this->resources->observedPids(),
+            static fn (int $pid): bool => isset($snapshot[$pid]) && $pid !== getmypid(),
+        ));
+
+        $sources = array_map($this->source(...), $this->children);
+        $result = Stats::analyze($this->workload, $name, $sources, $this->facts);
+        $result['facts'] = $this->facts;
+        $result['workload'] = $this->workload;
+        $result['directory'] = $this->directory;
+        file_put_contents($this->directory . '/result.json', json_encode($result, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR));
+
         foreach (['queue.sqlite', 'queue.sqlite-wal', 'queue.sqlite-shm'] as $file) {
-            if (is_file($directory . '/' . $file)) { unlink($directory . '/' . $file); }
+            $path = $this->directory . '/' . $file;
+            if (is_file($path)) {
+                unlink($path);
+            }
         }
+
         return $result;
+    }
+
+    private function source(Process $process): array
+    {
+        return [
+            'role' => $process->role(),
+            'argument' => $process->argument(),
+            'path' => $this->directory . '/samples/' . $process->role() . '-' . $process->argument() . '.jsonl',
+            'exit_code' => $process->exitCode(),
+            'timed_out' => $process->timedOut(),
+            'killed' => $process->killed(),
+            'stderr' => $process->errorTail(),
+        ];
+    }
+
+    private function recordError(\Throwable $error): void
+    {
+        $this->facts['coordinator_errors'][] = $error::class . ': ' . $error->getMessage();
     }
 }

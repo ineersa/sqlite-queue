@@ -2,6 +2,8 @@
 
 This reference fixes the Task 02 measurement method before a broker candidate exists. The runner uses the standard Symfony Doctrine transport, `PhpSerializer`, a real Messenger `Worker`, and a payload-verification handler. There is no application kernel, fake candidate, or custom claim SQL.
 
+`bin/benchmark` registers Symfony Console commands through Composer's development PSR-4 mapping. `RunCommand` handles options and cancellation; `Benchmark` owns the capture schedule, and `Runner` owns one repetition. Worker commands delegate to publisher or consumer classes. Symfony Process starts and stops children with an explicitly isolated environment. The internal clock command exists to verify cross-process timestamp subtraction, not to measure queue throughput.
+
 ## Workloads and budgets
 
 Every workload has one retained warmup repetition and three measured repetitions. Each repetition uses a fresh database. Warmup covers the same workload, but its samples do not enter measured-run variation. Each measured repetition has its own startup; operation latency excludes startup. Reports retain startup metadata and process lifetime resource costs.

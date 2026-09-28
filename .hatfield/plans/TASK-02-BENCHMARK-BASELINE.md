@@ -50,3 +50,9 @@ Add deterministic checks for metric calculations, percentiles, report generation
 - The standalone runner requires Linux process accounting facilities. The package runtime requirements are unchanged.
 
 Task 08 still owes the real candidate, equivalent diagnostics/durability, paired runs, and sufficient tail samples. Doctrine's second-resolution delayed eligibility is not equivalent to the broker's required millisecond deadline behavior. The lock failures and small sample counts do not support a concurrent-tail performance claim.
+
+## PR review follow-up
+
+PR #2 review replaced the custom autoloader and procedural scripts with Composer PSR-4 autoloading and Symfony Console commands. `php bin/benchmark run` is the current entry point. Publisher and consumer classes own worker behavior; Symfony Process owns subprocess execution with an isolated environment. The original archive remains a historical capture of `13a43bc`.
+
+`composer qa` passes with 31 tests and 136 assertions, including Console help/options, worker argument validation, the clock responder, and inherited-environment isolation. `composer dump-autoload --strict-psr --optimize` passes. The refactored CLI's all-workload smoke run retained three complete and three incomplete repetitions from Doctrine lock failures. No smoke timing is promoted to performance evidence.

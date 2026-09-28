@@ -4,13 +4,15 @@ Task 02 captured all six workloads with one warmup and three measured repetition
 
 ## Revision and reproduction
 
-Command:
+Historical capture command at revision `13a43bc`:
 
 ```sh
 	php bench/run.php
 ```
 
 The capture used the benchmark source now committed at `13a43bc`. Git signing initially failed, so the metadata records parent revision `688353e` and a dirty worktree. Every benchmark PHP file hash in the capture matches `13a43bc`; the archive also records the Composer lock hash.
+
+PR review replaced the procedural scripts with Composer autoloading and a Symfony Console application. The current command is `php bin/benchmark run`. The archived capture remains evidence for `13a43bc`, not a measurement of the refactored CLI. Workload budgets and timing definitions are unchanged, but new measurements must record the new runner and dependency hashes. Do not relabel the old timings as results from the refactor.
 
 The original artifact directory is `var/bench/20260928-010402-4cda6aa2/`. The [retained archive](../bench/results/baseline-v1-20260928.tar.gz) contains all 24 repetition directories, raw JSONL samples, logs, configuration, `summary.json`, and `report.md`. It contains no queue database files.
 

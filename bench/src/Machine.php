@@ -211,25 +211,13 @@ final class Machine
      */
     private static function command(array $argv): ?string
     {
-        if (!\function_exists('proc_open')) {
+        $process = new \Symfony\Component\Process\Process($argv, env: Process::environment(), timeout: 5);
+        try {
+            $process->run();
+        } catch (\Symfony\Component\Process\Exception\ExceptionInterface) {
             return null;
         }
 
-        $pipes = [];
-        $handle = @\proc_open($argv, [1 => ['pipe', 'wb'], 2 => ['file', '/dev/null', 'wb']], $pipes, null, ['PATH' => '/usr/bin:/bin']);
-
-        if (!\is_resource($handle)) {
-            return null;
-        }
-
-        $output = \stream_get_contents($pipes[1]);
-        \fclose($pipes[1]);
-        $code = \proc_close($handle);
-
-        if (0 !== $code || !\is_string($output)) {
-            return null;
-        }
-
-        return $output;
+        return $process->isSuccessful() ? $process->getOutput() : null;
     }
 }

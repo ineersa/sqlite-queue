@@ -123,22 +123,4 @@ final class Recorder
 
         $this->store->close();
     }
-
-    /**
-     * @return array<string, int>
-     */
-    public function counts(): array
-    {
-        return $this->counts;
-    }
-
-    public function count(string $kind): int
-    {
-        return $this->counts[$kind] ?? 0;
-    }
-
-    public function path(): string
-    {
-        return $this->store->path();
-    }
 }

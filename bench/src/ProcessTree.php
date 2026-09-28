@@ -42,7 +42,7 @@ final class ProcessTree
     }
 
     /**
-     * @return array<int, array{ppid: ?int, state: string, cmd: string, cpu_seconds: float, rss_kb: int}>
+     * @return array<int, array{ppid: int, state: string, start_time_ticks: int, uid: int|false, cmd: string, cpu_seconds: float, rss_kb: int}>
      */
     public static function snapshot(): array
     {
@@ -73,6 +73,8 @@ final class ProcessTree
             $processes[$pid] = [
                 'ppid' => (int) $fields[1],
                 'state' => $fields[0],
+                'start_time_ticks' => (int) $fields[19],
+                'uid' => fileowner($directory),
                 'cmd' => \substr($command, 0, 300),
                 'cpu_seconds' => ((int) $fields[11] + (int) $fields[12]) / self::$ticksPerSecond,
                 'rss_kb' => \intdiv((int) $fields[21] * self::$pageSizeBytes, 1024),
@@ -85,7 +87,7 @@ final class ProcessTree
     /**
      * PIDs reachable from $root through parent links, excluding $root itself.
      *
-     * @param array<int, array{ppid: ?int, state: string, cmd: string, cpu_seconds: float, rss_kb: int}> $snapshot
+     * @param array<int, array{ppid: int, state: string, start_time_ticks: int, uid: int|false, cmd: string, cpu_seconds: float, rss_kb: int}> $snapshot
      * @return list<int>
      */
     public static function descendants(int $root, array $snapshot): array
@@ -130,7 +132,7 @@ final class ProcessTree
 
     /**
      * @param list<int> $pids
-     * @param array<int, array{ppid: ?int, state: string, cmd: string, cpu_seconds: float, rss_kb: int}> $snapshot
+     * @param array<int, array{ppid: int, state: string, start_time_ticks: int, uid: int|false, cmd: string, cpu_seconds: float, rss_kb: int}> $snapshot
      * @return array<int, array{pid: int, cmd: string}>
      */
     public static function describe(array $pids, array $snapshot): array

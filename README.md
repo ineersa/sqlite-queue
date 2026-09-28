@@ -76,6 +76,8 @@ Development:
 | `symfony/doctrine-messenger` | `^8.0` | Standard SQLite benchmark transport. |
 | `symfony/event-dispatcher` | `^8.0` | Worker lifecycle events in the benchmark. |
 | `doctrine/dbal` | `^4.3` | Benchmark SQLite connections. |
+| `symfony/console` | `^8.0` | Benchmark CLI commands and signal handling. |
+| `symfony/process` | `^8.0` | Owned benchmark subprocesses. |
 
 Doctrine DBAL, the Symfony Messenger SQLite transport, and its benchmark dependencies stay
 out of the runtime requirements.
@@ -88,6 +90,7 @@ tests/Driver/   async-driver verification tests
 tests/Support/  isolated test database and process-tree helpers
 tests/Bench/    deterministic benchmark accounting and process checks
 bench/          standalone Doctrine SQLite baseline runner
+bin/benchmark   Symfony Console entry point
 docs/           package contracts and driver verification evidence
 ```
 
@@ -97,7 +100,7 @@ docs/           package contracts and driver verification evidence
   delivery contracts, protocol shape.
 - [docs/driver-verification.md](docs/driver-verification.md): measured async-driver behavior
   and the commands that reproduce it.
-- [bench/README.md](bench/README.md): run the standalone baseline with `php bench/run.php`.
+- [bench/README.md](bench/README.md): run the standalone baseline with `php bin/benchmark run`.
 - [docs/benchmark-method.md](docs/benchmark-method.md): fixed workloads, timing definitions, and comparison limits.
 - [docs/benchmark-baseline.md](docs/benchmark-baseline.md): the first capture and retained raw evidence.
 

@@ -15,9 +15,11 @@
         "ext-posix": "*",
         "doctrine/dbal": "^4.3",
         "phpunit/phpunit": "^13.2",
+        "symfony/console": "^8.0",
         "symfony/doctrine-messenger": "^8.0",
         "symfony/event-dispatcher": "^8.0",
-        "symfony/messenger": "^8.0"
+        "symfony/messenger": "^8.0",
+        "symfony/process": "^8.0"
     },
     "suggest": {
         "symfony/messenger": "Required to use the Symfony Messenger transport adapter."
@@ -29,6 +31,7 @@
     },
     "autoload-dev": {
         "psr-4": {
+            "Ineersa\\SqliteQueue\\Bench\\": "bench/src/",
             "Ineersa\\SqliteQueue\\Tests\\": "tests/"
         }
     },
@@ -46,7 +49,7 @@
         "test": "phpunit",
         "test:driver": "phpunit --testsuite driver",
         "test:bench": "phpunit --testsuite benchmark",
-        "bench": "@php bench/run.php",
+        "bench": "@php bin/benchmark run",
         "qa": [
             "@composer:validate",
             "@test"
