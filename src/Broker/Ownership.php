@@ -4,28 +4,46 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Broker;
 
-/** Advisory locks remain open until the persistence process has stopped. */
+use Symfony\Component\Filesystem\Exception\IOException;
+use Symfony\Component\Filesystem\Filesystem;
+use Symfony\Component\Lock\Exception\LockAcquiringException;
+use Symfony\Component\Lock\LockFactory;
+use Symfony\Component\Lock\LockInterface;
+use Symfony\Component\Lock\Store\FlockStore;
+
+/**
+ * Exclusive database and endpoint ownership for one broker lifetime.
+ *
+ * Locks are non-blocking Symfony FlockStore locks held until close(). The permission
+ * boundary is the resource parent directory: BrokerPaths requires it to exist, belong
+ * to the effective user, and deny group and other access, so the sidecar files the
+ * store manages beneath it inherit that protection. Symfony owns their names, modes,
+ * and lifetime; this class only owns the lock keys, which derive from canonical paths
+ * so a second broker using a different endpoint for the same database still conflicts.
+ */
 final class Ownership
 {
     public readonly string $database;
     public readonly string $endpoint;
-    /** @var list<resource> */
+    /** @var list<LockInterface> */
     private array $locks = [];
-    /** @var array{dev: int, ino: int}|null */
-    private ?array $socketIdentity = null;
+    // Null is the genuine "no socket bound yet" state before recordSocket() and after
+    // close(): the broker is fully usable without it, and it only gates endpoint removal.
+    private ?SocketIdentity $socketIdentity = null;
+    private Filesystem $filesystem;
 
     public function __construct(string $database, string $endpoint)
     {
-        $this->database = self::path($database);
-        $this->endpoint = self::path($endpoint);
-        if (\strlen($this->endpoint) > 100 || $this->endpoint === $this->database || $this->endpoint.'.lock' === $this->database) {
-            throw new \InvalidArgumentException('Invalid or conflicting Unix socket path.');
-        }
+        $paths = BrokerPaths::parse($database, $endpoint);
+        $this->database = $paths->database;
+        $this->endpoint = $paths->endpoint;
+        $this->filesystem = new Filesystem();
         try {
-            $this->lock($this->database);
-            $this->lock($this->endpoint.'.lock');
+            $this->ensurePrivateFile($this->database);
+            $this->acquire($this->databaseKey(), \dirname($this->database));
+            $this->acquire($this->endpointKey(), \dirname($this->endpoint));
             clearstatcache(true, $this->endpoint);
-            if (file_exists($this->endpoint) || is_link($this->endpoint)) {
+            if ($this->filesystem->exists($this->endpoint) || is_link($this->endpoint)) {
                 throw new \RuntimeException('Endpoint already exists; it will not be removed without verified ownership.');
             }
         } catch (\Throwable $error) {
@@ -36,67 +54,98 @@ final class Ownership
 
     public function recordSocket(): void
     {
-        clearstatcache(true, $this->endpoint);
-        $stat = @lstat($this->endpoint);
-        if (false === $stat || 'socket' !== filetype($this->endpoint)) {
-            throw new \RuntimeException('Cannot verify bound socket ownership.');
-        }
-        $this->socketIdentity = ['dev' => $stat['dev'], 'ino' => $stat['ino']];
-        if (!@chmod($this->endpoint, 0600)) {
-            throw new \RuntimeException('Cannot make socket private.');
+        $this->socketIdentity = SocketIdentity::fromEndpoint($this->endpoint);
+        try {
+            $this->filesystem->chmod($this->endpoint, 0600);
+        } catch (IOException $error) {
+            throw new \RuntimeException('Cannot make socket private.', 0, $error);
         }
     }
 
     public function close(): void
     {
-        if (null !== $this->socketIdentity) {
-            clearstatcache(true, $this->endpoint);
-            $stat = @lstat($this->endpoint);
-            if (false !== $stat && $stat['dev'] === $this->socketIdentity['dev'] && $stat['ino'] === $this->socketIdentity['ino']) {
-                unlink($this->endpoint);
-            }
-            $this->socketIdentity = null;
-        }
+        // A failed socket removal must not skip lock release, so every step records its
+        // failure and this method releases everything before reporting the first one.
+        $failure = $this->removeOwnedSocket();
+        $this->socketIdentity = null;
         foreach (array_reverse($this->locks) as $lock) {
-            flock($lock, \LOCK_UN);
-            fclose($lock);
+            try {
+                $lock->release();
+            } catch (\Throwable $error) {
+                $failure ??= $error;
+            }
         }
         $this->locks = [];
+        if (null !== $failure) {
+            throw $failure;
+        }
     }
 
-    private function lock(string $path): void
+    private function acquire(string $key, string $lockDirectory): void
     {
-        if (is_link($path) || (file_exists($path) && !is_file($path))) {
+        $lock = (new LockFactory(new FlockStore($lockDirectory)))->createLock($key, null, false);
+        try {
+            $acquired = $lock->acquire(false);
+        } catch (LockAcquiringException $error) {
+            throw new \RuntimeException('Ownership unavailable for this database or endpoint.', 0, $error);
+        }
+        if (!$acquired) {
+            throw new \RuntimeException('Ownership unavailable for this database or endpoint.');
+        }
+        $this->locks[] = $lock;
+    }
+
+    private function ensurePrivateFile(string $path): void
+    {
+        clearstatcache(true, $path);
+        if (is_link($path)) {
             throw new \RuntimeException('Ownership path must be a regular file, not a symlink.');
         }
-        $mask = umask(0077);
-        try {
-            $handle = @fopen($path, 'c+b');
-        } finally {
-            umask($mask);
+        if (!$this->filesystem->exists($path)) {
+            $mask = umask(0077);
+            try {
+                $this->filesystem->touch($path);
+            } catch (IOException $error) {
+                throw new \RuntimeException('Cannot open ownership file.', 0, $error);
+            } finally {
+                umask($mask);
+            }
+            try {
+                $this->filesystem->chmod($path, 0600);
+            } catch (IOException $error) {
+                throw new \RuntimeException('Cannot open ownership file.', 0, $error);
+            }
+            clearstatcache(true, $path);
         }
-        if (false === $handle) {
-            throw new \RuntimeException('Cannot open ownership file.');
-        }
-        $stat = fstat($handle);
-        if (false === $stat || $stat['uid'] !== posix_geteuid() || 0 !== ($stat['mode'] & 0077) || 1 !== $stat['nlink'] || !flock($handle, \LOCK_EX | \LOCK_NB)) {
-            fclose($handle);
+        // Native stat has no Symfony equivalent; checking here keeps the hardlink, owner,
+        // and mode defenses on the database file that this broker will actually use.
+        $stat = stat($path);
+        if (false === $stat || !is_file($path) || $stat['uid'] !== posix_geteuid() || 0 !== ($stat['mode'] & 0077) || 1 !== $stat['nlink']) {
             throw new \RuntimeException('Ownership unavailable or file is not private and singly linked.');
         }
-        $this->locks[] = $handle;
     }
 
-    private static function path(string $path): string
+    private function removeOwnedSocket(): ?\Throwable
     {
-        if (str_contains($path, "\0") || !str_starts_with($path, '/') || \in_array(basename($path), ['', '.', '..'], true)) {
-            throw new \InvalidArgumentException('Broker paths must be absolute file paths.');
+        if (null === $this->socketIdentity || !$this->socketIdentity->matches($this->endpoint)) {
+            return null;
         }
-        $directory = realpath(\dirname($path));
-        $stat = false === $directory ? false : stat($directory);
-        if (false === $directory || false === $stat || !is_dir($directory) || $stat['uid'] !== posix_geteuid() || 0 !== ($stat['mode'] & 0077)) {
-            throw new \InvalidArgumentException('Broker directories must exist, belong to this user, and be private.');
+        try {
+            $this->filesystem->remove($this->endpoint);
+        } catch (\Throwable $error) {
+            return $error;
         }
 
-        return $directory.'/'.basename($path);
+        return null;
+    }
+
+    private function databaseKey(): string
+    {
+        return 'sqlite-queue-db:'.$this->database;
+    }
+
+    private function endpointKey(): string
+    {
+        return 'sqlite-queue-endpoint:'.$this->endpoint;
     }
 }

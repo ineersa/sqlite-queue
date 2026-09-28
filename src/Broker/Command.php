@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Broker;
 
+use Amp\DeferredCancellation;
 use Revolt\EventLoop;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command as BaseCommand;
@@ -12,7 +13,6 @@ use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\ConsoleOutputInterface;
 use Symfony\Component\Console\Output\OutputInterface;
 
-/** Foreground broker entry point. The Broker, Client, and Queue APIs do not require Symfony. */
 #[AsCommand(name: 'broker', description: 'Run the foreground SQLite queue broker on a private local Unix socket.')]
 final class Command extends BaseCommand
 {
@@ -37,13 +37,20 @@ final class Command extends BaseCommand
             if (!\function_exists('pcntl_signal') || !\function_exists('posix_geteuid')) {
                 throw new \RuntimeException('The broker requires the pcntl and posix extensions.');
             }
-            $broker = new Broker($database, $endpoint);
+            // The token covers startup too: a signal during listen() cancels the blocking
+            // connect, and run() stops the serving loop on the same token. The closure takes
+            // no arguments because signal watchers are invoked with (id, signal), which must
+            // not bind to DeferredCancellation::cancel(?Throwable).
+            $shutdown = new DeferredCancellation();
             foreach ([\SIGINT, \SIGTERM] as $signal) {
-                $watchers[] = EventLoop::onSignal($signal, $broker->stop(...));
+                $watchers[] = EventLoop::onSignal($signal, static function () use ($shutdown): void {
+                    $shutdown->cancel();
+                });
             }
+            $broker = (new BrokerFactory($database, $endpoint, cancellation: $shutdown->getCancellation()))->listen();
             $code = $broker->run(function (array $event) use ($output): void {
                 $this->write($event, $output);
-            });
+            }, $shutdown->getCancellation());
             $this->write(['event' => 'stopped', 'exit_code' => $code], $output);
 
             return $code;

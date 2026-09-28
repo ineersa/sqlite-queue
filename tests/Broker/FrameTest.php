@@ -108,7 +108,7 @@ final class FrameTest extends TestCase
             $this->exchange(pack('N', Frame::MAX_FRAME + 1).pack('N', 8));
             $this->fail('Oversized frame accepted.');
         } catch (ProtocolException $error) {
-            $this->assertSame('frame_too_large', $error->errorCode);
+            $this->assertSame('frame_too_large', $error->errorCode->value);
         }
     }
 
@@ -161,13 +161,13 @@ final class FrameTest extends TestCase
             (new Frame([], str_repeat('x', Frame::MAX_PAYLOAD + 1)))->encode();
             $this->fail('Oversized payload accepted.');
         } catch (ProtocolException $error) {
-            $this->assertSame('frame_too_large', $error->errorCode);
+            $this->assertSame('frame_too_large', $error->errorCode->value);
         }
         try {
             (new Frame(['padding' => str_repeat('y', Frame::MAX_CONTROL)]))->encode();
             $this->fail('Oversized control accepted.');
         } catch (ProtocolException $error) {
-            $this->assertSame('frame_too_large', $error->errorCode);
+            $this->assertSame('frame_too_large', $error->errorCode->value);
         }
     }
 

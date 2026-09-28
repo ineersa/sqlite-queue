@@ -6,6 +6,21 @@ Before submitting changes, run `vendor/bin/castor cs:fix`, then `vendor/bin/cast
 
 Keep console output brief and machine-readable. Write diagnostics to report files instead of dumping them into the conversation. Tasks live in `.castor/`, imported by `castor.php`.
 
+## Code standards
+
+Apply these rules throughout the repository, including implementation, tooling, and tests.
+
+- Require dependencies through typed constructors. A constructed object must have everything it needs to operate.
+- Do not use nullable properties, nullable parameters, or default arguments without a concrete domain or API justification. Document non-obvious exceptions where they are declared.
+- Do not represent incomplete initialization with nulls, uninitialized properties, placeholder values, or repeated existence checks. Separate resource acquisition from the initialized runtime. Clean up acquired resources when startup fails.
+- Use typed request and response objects for protocol operations. Use backed enums for finite operation, status, and error-code sets. Validate untrusted data at the boundary before constructing these objects.
+- Keep wire-format arrays and strings inside serialization and parsing code. Do not pass unvalidated associative arrays through application logic.
+- Replace magic numbers and domain strings with descriptive constants, enums, or value objects. Name units and explain protocol limits. Ordinary arithmetic identities and literal wire-field names in codecs do not need artificial wrappers.
+- Use explicit PHP types and the supported PHP 8.5 features where they express the model more accurately. Prefer immutable value objects. Do not substitute PHPDoc for available native types.
+- Split compound validation into readable checks with specific failures. Test each validation rule independently.
+- Use existing Symfony and Amp facilities instead of custom substitutes. Do not copy dependency internals, such as lock filename algorithms.
+- Review new and modified code against these rules before submission. Passing QA does not replace this review.
+
 ## Commands
 
 | Command | Scope |

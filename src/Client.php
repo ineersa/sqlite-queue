@@ -9,11 +9,35 @@ use Amp\CompositeCancellation;
 use Amp\Socket\ConnectContext;
 use Amp\Socket\Socket;
 use Amp\TimeoutCancellation;
+use Ineersa\SqliteQueue\Protocol\AcknowledgeRequest;
+use Ineersa\SqliteQueue\Protocol\EmptyReceiveResponse;
+use Ineersa\SqliteQueue\Protocol\ErrorCode;
+use Ineersa\SqliteQueue\Protocol\FailedResponse;
 use Ineersa\SqliteQueue\Protocol\Frame;
+use Ineersa\SqliteQueue\Protocol\HelloRequest;
+use Ineersa\SqliteQueue\Protocol\HelloResponse;
+use Ineersa\SqliteQueue\Protocol\Operation;
+use Ineersa\SqliteQueue\Protocol\ReceivedResponse;
+use Ineersa\SqliteQueue\Protocol\ReceiveRequest;
+use Ineersa\SqliteQueue\Protocol\RejectRequest;
+use Ineersa\SqliteQueue\Protocol\Request;
+use Ineersa\SqliteQueue\Protocol\RequestCodec;
+use Ineersa\SqliteQueue\Protocol\Response;
+use Ineersa\SqliteQueue\Protocol\ResponseCodec;
+use Ineersa\SqliteQueue\Protocol\SendRequest;
+use Ineersa\SqliteQueue\Protocol\SentResponse;
+use Ineersa\SqliteQueue\Protocol\SettledResponse;
 
 use function Amp\Socket\connect;
 
-/** One persistent connection, one outstanding call, and no automatic retries. */
+/**
+ * One persistent connection, one outstanding call, and no automatic retries.
+ *
+ * Cancellation policy, stated once for every ?Cancellation below: cancelling a call only
+ * aborts the local wait. The broker may already have applied the operation, so a cancelled
+ * call closes the client with an unknown outcome and is never retried; inspect the queue
+ * with a new connection created explicitly.
+ */
 final class Client
 {
     private int $nextId = 0;
@@ -28,6 +52,9 @@ final class Client
     {
     }
 
+    /**
+     * @param float $timeout per-exchange bound in seconds; 10 is the documented protocol default
+     */
     public static function connect(string $endpoint, float $timeout = 10, ?Cancellation $cancellation = null): self
     {
         if ($timeout <= 0 || !is_finite($timeout)) {
@@ -40,8 +67,8 @@ final class Client
         }
         $client = new self($socket, $timeout);
         try {
-            $reply = $client->exchange(['op' => 'hello'], cancellation: $cancellation);
-            if (($reply->control['result']['max_payload'] ?? null) !== Frame::MAX_PAYLOAD) {
+            $response = $client->exchange(new HelloRequest(0), $cancellation);
+            if (!$response instanceof HelloResponse) {
                 $client->invalidReply();
             }
         } catch (\Throwable $error) {
@@ -54,39 +81,34 @@ final class Client
 
     public function send(string $queue, string $body, string $headers = '', int $delay = 0, ?Cancellation $cancellation = null): int
     {
-        $reply = $this->exchange(['op' => 'send', 'queue' => $queue, 'delay' => $delay], $body, $headers, $cancellation);
-        $id = $reply->control['result'];
-        if (!\is_int($id) || $id < 1 || '' !== $reply->body || '' !== $reply->headers) {
+        $response = $this->exchange(new SendRequest($this->nextId, $queue, $delay, $body, $headers), $cancellation);
+        if (!$response instanceof SentResponse) {
             $this->invalidReply();
         }
 
-        return $id;
+        return $response->messageId;
     }
 
     public function receive(string $queue, ?Cancellation $cancellation = null): ?Delivery
     {
-        $reply = $this->exchange(['op' => 'receive', 'queue' => $queue], cancellation: $cancellation);
-        $result = $reply->control['result'];
-        if (null === $result && '' === $reply->body && '' === $reply->headers) {
+        $response = $this->exchange(new ReceiveRequest($this->nextId, $queue), $cancellation);
+        if ($response instanceof EmptyReceiveResponse) {
             return null;
         }
-        if (!\is_array($result) || !\is_int($result['id'] ?? null) || $result['id'] < 1
-            || ($result['queue'] ?? null) !== $queue || !\is_string($result['receipt'] ?? null)
-            || !\is_int($result['available_at'] ?? null) || !\is_int($result['reserved_until'] ?? null)) {
-            $this->invalidReply();
+        if ($response instanceof ReceivedResponse) {
+            return $response->delivery;
         }
-
-        return new Delivery($result['id'], $queue, $reply->body, $reply->headers, $result['receipt'], $result['available_at'], $result['reserved_until']);
+        $this->invalidReply();
     }
 
     public function acknowledge(string $receipt, ?Cancellation $cancellation = null): void
     {
-        $this->settle('acknowledge', $receipt, $cancellation);
+        $this->settle(Operation::Acknowledge, $receipt, $cancellation);
     }
 
     public function reject(string $receipt, ?Cancellation $cancellation = null): void
     {
-        $this->settle('reject', $receipt, $cancellation);
+        $this->settle(Operation::Reject, $receipt, $cancellation);
     }
 
     public function close(): void
@@ -95,16 +117,18 @@ final class Client
         $this->socket->close();
     }
 
-    private function settle(string $operation, string $receipt, ?Cancellation $cancellation): void
+    private function settle(Operation $operation, string $receipt, ?Cancellation $cancellation): void
     {
-        $reply = $this->exchange(['op' => $operation, 'receipt' => $receipt], cancellation: $cancellation);
-        if (null !== $reply->control['result'] || '' !== $reply->body || '' !== $reply->headers) {
+        $request = Operation::Acknowledge === $operation
+            ? new AcknowledgeRequest($this->nextId, $receipt)
+            : new RejectRequest($this->nextId, $receipt);
+        $response = $this->exchange($request, $cancellation);
+        if (!$response instanceof SettledResponse) {
             $this->invalidReply();
         }
     }
 
-    /** @param array<string, mixed> $control */
-    private function exchange(array $control, string $body = '', string $headers = '', ?Cancellation $cancellation = null): Frame
+    private function exchange(Request $request, ?Cancellation $cancellation = null): Response
     {
         if ($this->closed) {
             throw new TransportException('Client is closed; create a new connection explicitly.');
@@ -112,42 +136,57 @@ final class Client
         if ($this->busy) {
             throw new \LogicException('Only one outstanding request is permitted per client.');
         }
-        $id = $this->nextId;
-        $bytes = (new Frame(['v' => Frame::VERSION, 'id' => $id] + $control, $body, $headers))->encode();
+        // Local encoding never consumes the sequence: an oversize payload fails before it is sent.
+        try {
+            $bytes = RequestCodec::encode($request)->encode();
+        } catch (\Throwable $error) {
+            // A local protocol violation never reached the broker, so only a broken local
+            // encoder closes the client; anything else propagates with the connection usable.
+            if ($error instanceof ProtocolException) {
+                throw $error;
+            }
+            $this->close();
+            throw new TransportException('Broker confirmation unavailable; outcome may be unknown. Client is closed.', previous: $error);
+        }
         ++$this->nextId;
         $deadline = new TimeoutCancellation($this->timeout);
         $cancellation = null === $cancellation ? $deadline : new CompositeCancellation($deadline, $cancellation);
         $this->busy = true;
         try {
             Frame::write($this->socket, $bytes, $cancellation);
-            $reply = Frame::read($this->socket, $cancellation);
-            if (null === $reply || ($reply->control['v'] ?? null) !== Frame::VERSION || ($reply->control['id'] ?? null) !== $id
-                || !\is_bool($reply->control['ok'] ?? null)
-                || (true === $reply->control['ok'] && !\array_key_exists('result', $reply->control))) {
-                throw new ProtocolException('invalid_request', 'Invalid or uncorrelated broker response.');
+            $frame = Frame::read($this->socket, $cancellation);
+            if (null === $frame) {
+                throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid or uncorrelated broker response.');
             }
+            $response = ResponseCodec::decode($frame, $request);
         } catch (\Throwable $error) {
             $this->close();
             throw new TransportException('Broker confirmation unavailable; outcome may be unknown. Client is closed.', previous: $error);
         } finally {
             $this->busy = false;
         }
-        if (true === $reply->control['ok']) {
-            return $reply;
-        }
-        $code = $reply->control['error']['code'] ?? null;
-        if ('stale_receipt' === $code) {
-            throw new InvalidReceipt('Broker rejected a stale or foreign receipt.');
-        }
-        if ('invalid_queue_name' === $code) {
-            throw new \InvalidArgumentException('Broker rejected the queue name.');
-        }
-        $this->close();
-        if (\in_array($code, ['invalid_request', 'unsupported_protocol_version', 'frame_too_large'], true)) {
-            throw new ProtocolException($code, 'Broker rejected the request.');
+        if ($response instanceof FailedResponse) {
+            throw $this->failure($response->code);
         }
 
-        throw new TransportException('Broker failed the request; outcome may be unknown. Client is closed.');
+        return $response;
+    }
+
+    private function failure(ErrorCode $code): \Throwable
+    {
+        // Recoverable replies keep the connection usable; anything else closes it.
+        if (ErrorCode::StaleReceipt === $code) {
+            return new InvalidReceipt('Broker rejected a stale or foreign receipt.');
+        }
+        if (ErrorCode::InvalidQueueName === $code) {
+            return new \InvalidArgumentException('Broker rejected the queue name.');
+        }
+        $this->close();
+        if (ErrorCode::BrokerShuttingDown === $code || ErrorCode::InternalStorageFailure === $code) {
+            return new TransportException('Broker failed the request; outcome may be unknown. Client is closed.');
+        }
+
+        return new ProtocolException($code, 'Broker rejected the request.');
     }
 
     private function invalidReply(): never

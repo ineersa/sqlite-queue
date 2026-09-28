@@ -4,46 +4,29 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Broker;
 
-use Amp\Cancellation;
 use Amp\Future;
-use Amp\Parallel\Context\ContextFactory;
 use Amp\Parallel\Context\ProcessContext;
-use Amp\Parallel\Context\ProcessContextFactory;
 use Amp\TimeoutCancellation;
 
-use function Amp\async;
-
-/** Observe the existing driver's process, never replace its worker implementation. */
-final class Persistence implements ContextFactory
+/**
+ * Observable handle for the driver's persistence child.
+ *
+ * Always constructed with a live process: creation belongs to PersistenceFactory,
+ * which the SQLite connector drives through the ContextFactory contract.
+ */
+final class Persistence
 {
-    /** @var ProcessContext<mixed, mixed, mixed>|null */
-    private ?ProcessContext $context = null;
-    /** @var list<Future<void>> */
-    private array $drains = [];
-
     /**
-     * @param string|non-empty-list<string> $script
-     *
-     * @return ProcessContext<mixed, mixed, mixed>
+     * @param ProcessContext<mixed, mixed, mixed> $context
+     * @param list<Future<void>>                  $drains
      */
-    public function start(string|array $script, ?Cancellation $cancellation = null): ProcessContext
+    public function __construct(private readonly ProcessContext $context, private array $drains)
     {
-        $context = (new ProcessContextFactory(environment: ['PATH' => '/usr/bin:/bin', 'LANG' => 'C', 'TZ' => 'UTC']))->start($script, $cancellation);
-        $this->context = $context;
-        // Drain without logging: persistence diagnostics may contain SQL or data.
-        foreach ([$context->getStdout(), $context->getStderr()] as $stream) {
-            $this->drains[] = async(static function () use ($stream): void {
-                while (null !== $stream->read()) {
-                }
-            });
-        }
-
-        return $context;
     }
 
     public function pid(): int
     {
-        return $this->context?->getPid() ?? throw new \LogicException('Persistence has not started.');
+        return $this->context->getPid();
     }
 
     /** The driver owns join(); observing pipe EOF avoids joining its context twice. */
@@ -54,14 +37,32 @@ final class Persistence implements ContextFactory
         }
     }
 
+    /**
+     * Kill the owned child without joining it.
+     *
+     * A repeated connection close() cannot stop a worker that stopped answering: the driver
+     * marks its connection closed before the graceful close returns, and a later close()
+     * returns immediately. ProcessContext::close() kills the child unconditionally, so it
+     * works even though the channel flag can read closed while the worker still runs.
+     */
+    public function forceStop(): void
+    {
+        $this->context->close();
+    }
+
     public function close(): void
     {
-        if (null !== $this->context && !$this->context->isClosed()) {
-            $this->context->close();
+        try {
+            if (!$this->context->isClosed()) {
+                $this->context->close();
+            }
+            foreach ($this->drains as $drain) {
+                $drain->await(new TimeoutCancellation(5));
+            }
+        } finally {
+            // The child must be gone even when the graceful close or a drain gave up.
+            $this->forceStop();
+            $this->drains = [];
         }
-        foreach ($this->drains as $drain) {
-            $drain->await(new TimeoutCancellation(5));
-        }
-        $this->drains = [];
     }
 }

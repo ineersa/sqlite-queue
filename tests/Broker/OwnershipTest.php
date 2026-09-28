@@ -54,8 +54,7 @@ final class OwnershipTest extends TestCase
         [$database, $endpoint] = $this->paths();
         $first = $this->own($database, $endpoint);
         $this->assertSame(0o600, $this->permissions($database));
-        $this->assertFileExists($endpoint.'.lock');
-        $this->assertSame(0o600, $this->permissions($endpoint.'.lock'));
+        $this->assertPrivateLockDirectory();
 
         foreach ([1, 2] as $attempt) {
             try {
@@ -75,6 +74,46 @@ final class OwnershipTest extends TestCase
         $this->own($database, $endpoint);
     }
 
+    public function testSameDatabaseWithDifferentEndpointIsRefused(): void
+    {
+        [$database, $endpoint] = $this->paths();
+        $other = $this->fixture->path('queue-other.sock');
+        $first = $this->own($database, $endpoint);
+
+        try {
+            new Ownership($database, $other);
+            $this->fail('A second broker must not take the same database under another endpoint.');
+        } catch (\RuntimeException $error) {
+            $this->assertStringContainsString('Ownership unavailable', $error->getMessage());
+        }
+
+        $this->assertFileDoesNotExist($other);
+        $this->assertPrivateLockDirectory();
+
+        $first->close();
+        $this->own($database, $other);
+    }
+
+    public function testSameEndpointWithDifferentDatabaseIsRefused(): void
+    {
+        [$database, $endpoint] = $this->paths();
+        $other = $this->fixture->path('queue-other.sqlite');
+        $first = $this->own($database, $endpoint);
+
+        try {
+            new Ownership($other, $endpoint);
+            $this->fail('A second broker must not take the same endpoint with another database.');
+        } catch (\RuntimeException $error) {
+            $this->assertStringContainsString('Ownership unavailable', $error->getMessage());
+        }
+
+        $this->assertSame(0o600, $this->permissions($other));
+        $this->assertPrivateLockDirectory();
+
+        $first->close();
+        $this->own($other, $endpoint);
+    }
+
     public function testBoundSocketIsMadePrivateAndRemovedOnClose(): void
     {
         [$database, $endpoint] = $this->paths();
@@ -91,8 +130,7 @@ final class OwnershipTest extends TestCase
         $this->assertFileDoesNotExist($endpoint);
         $this->assertFileExists($database);
         $this->assertSame('engine state', file_get_contents($database));
-        $this->assertFileExists($endpoint.'.lock');
-        $this->assertSame(0o600, $this->permissions($endpoint.'.lock'));
+        $this->assertPrivateLockDirectory();
         $this->own($database, $endpoint);
     }
 
@@ -233,5 +271,14 @@ final class OwnershipTest extends TestCase
         clearstatcache(true, $path);
 
         return fileperms($path) & 0o777;
+    }
+
+    /**
+     * Symfony owns lock sidecar names and modes, so this asserts the permission boundary
+     * instead: the directory holding them stays private to the effective user.
+     */
+    private function assertPrivateLockDirectory(): void
+    {
+        $this->assertSame(0o700, $this->permissions($this->fixture->directory()));
     }
 }

@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Tests\Broker;
 
 use Amp\ByteStream\BufferedReader;
+use Amp\CancelledException;
 use Amp\Process\Process;
 use Amp\TimeoutCancellation;
 use Ineersa\SqliteQueue\Client;
@@ -16,6 +17,8 @@ use PHPUnit\Framework\TestCase;
 #[RequiresOperatingSystem('Linux')]
 final class BrokerProcessTest extends TestCase
 {
+    /** Bounded wait for a kernel-reported process state; stops and signal delivery are not ordered. */
+    private const int STATE_POLL_TIMEOUT_SECONDS = 5;
     private ?IsolatedDatabase $fixture = null;
     private string $socket = '';
     /** @var list<Process> */
@@ -208,6 +211,54 @@ final class BrokerProcessTest extends TestCase
         $this->assertFileExists($database);
     }
 
+    public function testStoppedPersistenceWorkerCannotWedgeShutdown(): void
+    {
+        $database = $this->fixture->path();
+        $broker = $this->startBroker($database, $this->socket);
+        $owned = $this->trackOwned($broker->getPid());
+        $this->assertCount(1, $owned['workers'], 'The broker must own exactly one persistence worker.');
+        $worker = $owned['workers'][0];
+
+        $client = $this->client();
+        $confirmed = $client->send('jobs', 'confirmed before stop');
+        $this->assertGreaterThan(0, $confirmed);
+        $client->close();
+        array_pop($this->clients);
+
+        $this->assertNotSame(0, posix_geteuid());
+        $this->assertSame(posix_geteuid(), fileowner('/proc/'.$worker), 'The stopped process must be this user\'s persistence worker.');
+        $this->assertTrue(posix_kill($worker, \SIGSTOP), 'The test must stop only the persistence worker.');
+        $this->assertSame('T', $this->waitForState($worker, 'T'), 'A stopped worker must be observable before the broker is signalled.');
+
+        $this->assertTrue(posix_kill($broker->getPid(), \SIGTERM), 'The test must signal the broker the same way a shell kill does.');
+        try {
+            $exit = $broker->join(new TimeoutCancellation(15));
+        } catch (CancelledException $error) {
+            // A join timeout still fails the test, but the broker, worker, and signal-mask
+            // states below distinguish a wedged shutdown from a lost shutdown signal.
+            $report = $this->captureWedgeEvidence($broker->getPid(), $worker);
+            $this->fail('Shutdown wedged past its 15s budget; process evidence at '.$report.': '.$error->getMessage());
+        }
+        $this->assertNotSame(0, $exit, 'A stopped persistence worker must not stop the broker from exiting.');
+        $this->assertTrackedGone();
+        $this->assertFileDoesNotExist($this->socket, 'Shutdown must release the endpoint without the worker responding.');
+        $this->assertFileExists($database, 'Shutdown must preserve confirmed data.');
+
+        $restarted = $this->startBroker($database, $this->socket);
+        $this->trackOwned($restarted->getPid());
+        $client = $this->client();
+        $delivery = $client->receive('jobs');
+        $this->assertNotNull($delivery, 'A confirmation must survive a force-stopped shutdown.');
+        $this->assertSame($confirmed, $delivery->id);
+        $this->assertSame('confirmed before stop', $delivery->body);
+        $client->acknowledge($delivery->receipt);
+        $client->close();
+        array_pop($this->clients);
+        $this->stopBroker($restarted);
+        $this->assertTrackedGone();
+        $this->assertFileExists($database);
+    }
+
     private function startBroker(string $database, string $socket): Process
     {
         $process = $this->spawn($database, $socket);
@@ -270,5 +321,69 @@ final class BrokerProcessTest extends TestCase
         foreach ($this->tracked as $pid) {
             $this->assertArrayNotHasKey($pid, $snapshot, 'A broker-owned process survived shutdown.');
         }
+    }
+
+    private function waitForState(int $pid, string $expected): string
+    {
+        $deadline = microtime(true) + self::STATE_POLL_TIMEOUT_SECONDS;
+        do {
+            $state = $this->processState($pid);
+            if ($expected === $state) {
+                return $state;
+            }
+            usleep(1000);
+        } while (microtime(true) < $deadline);
+
+        return $state;
+    }
+
+    private function processState(int $pid): string
+    {
+        $stat = @file_get_contents('/proc/'.$pid.'/stat');
+        if (false === $stat) {
+            return '';
+        }
+        $end = strrpos($stat, ')');
+
+        return false === $end ? '' : substr($stat, $end + 2, 1);
+    }
+
+    /**
+     * Snapshot the wedged tree to a report file before fallback cleanup destroys it.
+     *
+     * States and signal masks only; no payloads, no broker debug output.
+     */
+    private function captureWedgeEvidence(int $brokerPid, int $worker): string
+    {
+        $directory = \dirname(__DIR__, 2).'/var/qa/p1-wedge';
+        if (!is_dir($directory) && !mkdir($directory, 0o700, true) && !is_dir($directory)) {
+            return $directory.' (unwritable)';
+        }
+        $path = $directory.'/wedge-'.getmypid().'-'.time().'.log';
+        $lines = [];
+        $snapshot = ProcessTree::snapshot();
+        $owned = ProcessTree::ownedBy($brokerPid);
+        foreach (array_unique([...$owned['launchers'], ...$owned['workers'], $brokerPid, $worker]) as $pid) {
+            $stat = @file_get_contents('/proc/'.$pid.'/stat');
+            $state = '?';
+            if (\is_string($stat) && 1 === preg_match('/\)\s+(\S)/', $stat, $match)) {
+                $state = $match[1];
+            }
+            $masks = [];
+            $status = @file_get_contents('/proc/'.$pid.'/status');
+            if (\is_string($status)) {
+                foreach (['SigBlk', 'SigIgn', 'SigCgt'] as $name) {
+                    if (1 === preg_match('/^'.$name.':\s+([0-9a-f]+)/m', $status, $match)) {
+                        $masks[] = $name.'='.$match[1];
+                    }
+                }
+            }
+            $inTree = isset($snapshot[$pid]) ? substr($snapshot[$pid]['cmd'], -60) : 'absent-from-snapshot';
+            $lines[] = "pid={$pid} state={$state} wchan=".trim((string) @file_get_contents('/proc/'.$pid.'/wchan')).' '.implode(' ', $masks).' cmd='.$inTree;
+        }
+        $lines[] = 'socket-exists='.var_export(file_exists($this->socket), true);
+        @file_put_contents($path, implode("\n", $lines)."\n");
+
+        return $path;
     }
 }

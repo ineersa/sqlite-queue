@@ -12,7 +12,9 @@
         "amphp/socket": "^2.4",
         "amphp/sync": "^2.3",
         "fabpot/amphp-sqlite3": "^1.0",
-        "revolt/event-loop": "^1.0"
+        "revolt/event-loop": "^1.0",
+        "symfony/filesystem": "^8.0",
+        "symfony/lock": "^8.0"
     },
     "require-dev": {
         "ext-pcntl": "*",
@@ -34,7 +36,7 @@
     "suggest": {
         "ext-pcntl": "Required to run the foreground broker with signal handling.",
         "ext-posix": "Required to run the foreground broker with private file ownership checks.",
-        "symfony/console": "Required for the sqlite-queue CLI command (^8.0); the engine, broker API, and client do not require Symfony.",
+        "symfony/console": "Required for the sqlite-queue CLI command (^8.0), but not for the PHP APIs.",
         "symfony/messenger": "Required to use the Symfony Messenger transport adapter."
     },
     "autoload": {

@@ -19,7 +19,7 @@ Task 04 provides immediate receive. Notification waiting and the Messenger adapt
 
 4. Wait for a JSON line whose `event` is `ready` before starting clients. Process creation alone is not readiness.
 
-The executable uses Symfony Console `^8.0`. Development installation includes it. In a consuming project without development dependencies, install `symfony/console:^8.0` to use `vendor/bin/sqlite-queue`. The `Broker`, `Queue`, and `Client` APIs do not require Symfony.
+The executable uses Symfony Console `^8.0`. Development installation includes it. In a consuming project without development dependencies, install `symfony/console:^8.0` to use `vendor/bin/sqlite-queue`. The broker requires `symfony/lock:^8.0` and `symfony/filesystem:^8.0` at runtime for exclusive ownership. The `Queue` and `Client` APIs need no Symfony packages, and no Symfony application boot is involved anywhere.
 
 ## Send and settle a message
 
@@ -49,7 +49,7 @@ Use `reject($delivery->receipt)` for terminal disposal instead of acknowledgment
 
 Pass `delay: 1500` to `send()` to make a message unavailable for 1,500 milliseconds. `receive()` returns null immediately when no message is eligible. Do not build a busy polling loop as a substitute for Task 05 notifications.
 
-The default visibility timeout is 5,000 milliseconds. An unacknowledged reservation becomes eligible again at its persisted deadline. Closing a client does not shorten that deadline. For custom visibility or an application-owned cancellation token, use `Broker::run()` and its constructor options rather than adding a supervisor to this package.
+The default visibility timeout is 5,000 milliseconds. An unacknowledged reservation becomes eligible again at its persisted deadline. Closing a client does not shorten that deadline. For custom visibility, construct a `BrokerFactory` with that timeout and call `listen()` to receive a fully initialized `Broker`. For an application-owned cancellation token, pass it to `Broker::run()` rather than adding a supervisor to this package.
 
 ## Recover from a failed exchange
 
@@ -59,7 +59,9 @@ Client methods accept an optional Amp `Cancellation`. Cancellation during an exc
 
 ## Stop or restart
 
-Send SIGTERM or SIGINT, or press Ctrl-C in the foreground terminal. Wait for process exit before restarting. Normal stop removes the owned socket but preserves the database and endpoint lock file.
+Send SIGTERM or SIGINT, or press Ctrl-C in the foreground terminal. Wait for process exit before restarting. Normal stop removes the owned socket but preserves the database. Symfony FlockStore lock sidecars stay on disk under the private resource directories, which preserves the lock namespace.
+
+Shutdown runs under a five-second total watchdog. If any step stalls, the watchdog kills the owned persistence child directly through its process context instead of repeating the graceful connection close. The SQLite driver alone joins that context, so no second join can wedge the shutdown. Every shutdown step still runs after an earlier failure, and the first failure is what the caller receives.
 
 If an endpoint remains after an abrupt exit, do not remove it merely because a connection attempt fails. Verify that no broker or other listener owns it before removing it, or choose a new endpoint. Startup refuses existing sockets, regular files, and symlinks.
 

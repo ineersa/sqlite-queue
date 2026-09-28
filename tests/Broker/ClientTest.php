@@ -11,7 +11,9 @@ use Amp\Socket\ServerSocket;
 use Amp\Socket\Socket;
 use Amp\TimeoutCancellation;
 use Ineersa\SqliteQueue\Client;
+use Ineersa\SqliteQueue\Protocol\ErrorCode;
 use Ineersa\SqliteQueue\Protocol\Frame;
+use Ineersa\SqliteQueue\ProtocolException;
 use Ineersa\SqliteQueue\TransportException;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -156,6 +158,29 @@ final class ClientTest extends TestCase
         yield 'missing result' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true]))->encode()];
         yield 'unsupported version' => [(new Frame(['v' => 2, 'id' => 1, 'ok' => true, 'result' => 1]))->encode()];
         yield 'hand crafted control' => [pack('NN', 6, 2).'{}'];
+    }
+
+    public function testOversizePayloadFailsLocallyWithoutConsumingTheSequence(): void
+    {
+        $seen = [];
+        $endpoint = $this->serve(static function (Socket $socket) use (&$seen): void {
+            Frame::read($socket, new TimeoutCancellation(3));
+            $socket->write(self::helloReply());
+            while (null !== ($request = Frame::read($socket, new TimeoutCancellation(3)))) {
+                $seen[] = $request->control['id'];
+                $socket->write((new Frame(['v' => Frame::VERSION, 'id' => $request->control['id'], 'ok' => true, 'result' => 41]))->encode());
+            }
+        });
+        $client = Client::connect($endpoint);
+        $this->clients[] = $client;
+        try {
+            $client->send('jobs', str_repeat('x', Frame::MAX_PAYLOAD + 1));
+            $this->fail('An oversize payload must fail before it is sent.');
+        } catch (ProtocolException $error) {
+            $this->assertSame(ErrorCode::FrameTooLarge, $error->errorCode);
+        }
+        $this->assertSame(41, $client->send('jobs', 'fits'));
+        $this->assertSame([1], $seen, 'The failed send must not consume a sequence id.');
     }
 
     #[DataProvider('malformedReplies')]

@@ -15,7 +15,7 @@ See [Run the broker and use the client](docs/broker.md) for foreground startup a
   constraint allowed it but is outside the supported range, and PHP 8.6 and later are
   unverified.
 - `ext-sqlite3`, with SQLite 3.31.0 or newer. The SQLite library here is 3.45.1.
-- The broker executable also requires Unix sockets, `ext-posix`, `ext-pcntl`, and `symfony/console:^8.0`.
+- The broker also requires Unix sockets, `ext-posix`, and `symfony/lock:^8.0` with `symfony/filesystem:^8.0` as runtime dependencies. The broker executable additionally requires `ext-pcntl` and `symfony/console:^8.0`.
 - Development installation also requires `ext-pdo_sqlite`, `ext-posix`, and `ext-pcntl` for the benchmark. The benchmark requires Linux `/proc`.
 
 `fabpot/amphp-sqlite3` requires PHP 8.4, and the supported range starts at 8.5. Symfony
@@ -57,6 +57,8 @@ Runtime:
 | `amphp/amp` | `^3.1` | Futures and cancellation. |
 | `amphp/socket` | `^2.4` | Unix sockets, partial I/O, and backpressure. |
 | `amphp/parallel` | `^2.3` | Observe the persistence process supplied by the SQLite driver. |
+| `symfony/lock` | `^8.0` | Exclusive database and endpoint ownership. Required by the broker. |
+| `symfony/filesystem` | `^8.0` | Private file and socket handling for broker ownership. Required by the broker. |
 
 Development:
 

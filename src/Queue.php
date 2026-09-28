@@ -18,6 +18,9 @@ use Fabpot\Amp\Sqlite\SqliteTransactionMode;
 /** Owns one async connection. Deadlines are Unix wall-clock milliseconds. */
 final class Queue
 {
+    /** Queue names hold 1 to 255 ASCII letters, digits, dots, underscores, or hyphens, starting with a letter or digit. */
+    public const string NAME_PATTERN = '/\A[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}\z/D';
+
     private readonly LocalMutex $mutex;
     private readonly string $epoch;
     /** @var \Closure(): int */
@@ -307,7 +310,7 @@ final class Queue
 
     private static function validateQueue(string $queue): void
     {
-        if (1 !== preg_match('/\A[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}\z/D', $queue)) {
+        if (1 !== preg_match(self::NAME_PATTERN, $queue)) {
             throw new \InvalidArgumentException('Queue names must contain 1 to 255 ASCII letters, digits, dots, underscores, or hyphens and start with a letter or digit.');
         }
     }

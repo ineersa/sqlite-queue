@@ -9,6 +9,7 @@ use Amp\Future;
 use Amp\Socket\Socket;
 use Amp\TimeoutCancellation;
 use Ineersa\SqliteQueue\Broker\Broker;
+use Ineersa\SqliteQueue\Broker\BrokerFactory;
 use Ineersa\SqliteQueue\Client;
 use Ineersa\SqliteQueue\InvalidReceipt;
 use Ineersa\SqliteQueue\Protocol\Frame;
@@ -216,6 +217,32 @@ final class BrokerTest extends TestCase
         });
     }
 
+    public function testInvalidQueueNameKeepsSessionAndAdvancesSequence(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker();
+            $client = $this->connectClient();
+            try {
+                $client->send('', 'bad queue');
+                $this->fail('An invalid queue name must be rejected.');
+            } catch (\InvalidArgumentException) {
+            }
+            try {
+                $client->receive('also bad queue!');
+                $this->fail('An invalid queue name must be rejected.');
+            } catch (\InvalidArgumentException) {
+            }
+            // Both rejections advanced the sequence: the session still works.
+            $id = $client->send('jobs', 'good queue');
+            $delivery = $client->receive('jobs');
+            $this->assertNotNull($delivery);
+            $this->assertSame($id, $delivery->id);
+            $this->assertSame('good queue', $delivery->body);
+            $client->acknowledge($delivery->receipt);
+            $this->assertNull($client->receive('jobs'));
+        });
+    }
+
     public function testReadinessCallbackFailureReleasesOwnedTreeAndPreservesDatabase(): void
     {
         if (!ProcessTree::available()) {
@@ -226,7 +253,7 @@ final class BrokerTest extends TestCase
             $this->endpoint = $database->path('queue.sock');
             $during = null;
             $failure = new \RuntimeException('Readiness callback failure sentinel.');
-            $broker = new Broker($database->path(), $this->endpoint, 5000, fn (): int => $this->now);
+            $broker = (new BrokerFactory($database->path(), $this->endpoint, 5000, fn (): int => $this->now))->listen();
             $future = async(static function () use ($broker, &$during, $failure): int {
                 return $broker->run(static function (array $event) use (&$during, $failure): void {
                     $during = ProcessTree::ownedBy((int) getmypid());
@@ -295,7 +322,7 @@ final class BrokerTest extends TestCase
     {
         $database = $this->database ?? throw new \LogicException('Missing test database.');
         $this->endpoint = $database->path('queue.sock');
-        $this->broker = new Broker($database->path(), $this->endpoint, $visibilityTimeout, $clock);
+        $this->broker = (new BrokerFactory($database->path(), $this->endpoint, $visibilityTimeout, $clock))->listen();
         $ready = new DeferredFuture();
         $this->brokerFuture = async(fn (): int => $this->broker->run(static function (array $event) use ($ready): void {
             $ready->complete($event);
