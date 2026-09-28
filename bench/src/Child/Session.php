@@ -14,12 +14,15 @@ final class Session
     public readonly Recorder $recorder;
     public private(set) Connection $connection;
     public private(set) int $startedAt;
+    /**
+     * @var array<string, int|float>
+     */
     public array $pollTotals = [];
 
     public function __construct(public readonly Assignment $assignment)
     {
         $this->recorder = new Recorder(
-            $assignment->path('samples/' . $assignment->label() . '.jsonl'),
+            $assignment->path('samples/'.$assignment->label().'.jsonl'),
             $assignment->role->value,
             (string) $assignment->index,
         );
@@ -74,7 +77,7 @@ final class Session
         $deadline = hrtime(true) + (int) ($seconds * 1e9);
         while (!is_file($path)) {
             if (hrtime(true) > $deadline || $this->isStopped()) {
-                throw new \RuntimeException('Barrier stopped or timed out: ' . basename($path));
+                throw new \RuntimeException('Barrier stopped or timed out: '.basename($path));
             }
             usleep(1000);
         }
@@ -84,13 +87,13 @@ final class Session
     {
         $assignment = $this->assignment;
         $beforeReady = hrtime(true);
-        file_put_contents($assignment->path('ready/' . $assignment->label() . '.ready'), json_encode([
+        file_put_contents($assignment->path('ready/'.$assignment->label().'.ready'), json_encode([
             'event' => 'ready',
             'pid' => getmypid(),
             'clock_ns' => $beforeReady,
-        ], JSON_THROW_ON_ERROR));
+        ], \JSON_THROW_ON_ERROR));
 
-        $goPath = $assignment->path('go/' . $assignment->label());
+        $goPath = $assignment->path('go/'.$assignment->label());
         $this->awaitFile($goPath, Config::STARTUP_TIMEOUT_S + $assignment->workload['timeout_s']);
         $parentTime = (int) file_get_contents($goPath);
         $this->startedAt = hrtime(true);

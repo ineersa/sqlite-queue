@@ -26,7 +26,7 @@ final class BenchMessage
     {
         $bytes = self::payload($corrId, $size);
 
-        return new self($corrId, $queue, \hash('sha256', $bytes), $bytes, $size);
+        return new self($corrId, $queue, hash('sha256', $bytes), $bytes, $size);
     }
 
     public static function payload(string $corrId, int $size): string
@@ -39,16 +39,16 @@ final class BenchMessage
         $chunk = 0;
 
         while (\strlen($payload) < $size) {
-            $payload .= \hash('sha256', $corrId . ':' . $chunk, true);
+            $payload .= hash('sha256', $corrId.':'.$chunk, true);
             ++$chunk;
         }
 
-        return \substr($payload, 0, $size);
+        return substr($payload, 0, $size);
     }
 
     public function verify(): bool
     {
-        return $this->size === \strlen($this->bytes) && \hash('sha256', $this->bytes) === $this->digest;
+        return $this->size === \strlen($this->bytes) && hash('sha256', $this->bytes) === $this->digest;
     }
 
     /**
@@ -62,7 +62,7 @@ final class BenchMessage
         $expected = self::payload($this->corrId, $this->size);
 
         return $this->size === \strlen($this->bytes)
-            && \hash_equals(\hash('sha256', $expected), $this->digest)
-            && \hash_equals($expected, $this->bytes);
+            && hash_equals(hash('sha256', $expected), $this->digest)
+            && hash_equals($expected, $this->bytes);
     }
 }

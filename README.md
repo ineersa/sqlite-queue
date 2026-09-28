@@ -31,20 +31,7 @@ composer install
 
 ## Development
 
-```bash
-composer install
-composer qa          # validates composer.json, then runs correctness tests
-composer test        # all correctness tests
-composer test:driver # async-driver suite
-composer test:bench  # deterministic benchmark checks
-```
-
-`composer qa` runs `composer validate --no-check-publish` and then PHPUnit with
-`phpunit.xml.dist`. Each driver test opens its own file database under `var/tests/` and runs its
-async work on a fresh event loop. On Linux, `/proc` lets the suite prove on teardown that no
-persistence worker process is left behind. On a platform where `/proc` is unreadable, the
-driver suite skips before it creates any fixture instead of passing without that evidence.
-`var/` and `.phpunit.cache/` are not committed.
+See [AGENTS.md](AGENTS.md) for Castor commands, validation rules, and report paths.
 
 ## Status
 

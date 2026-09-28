@@ -16,12 +16,12 @@ final class Clock
 {
     public static function monotonicNs(): int
     {
-        return \hrtime(true);
+        return hrtime(true);
     }
 
     public static function wall(): float
     {
-        return \microtime(true);
+        return microtime(true);
     }
 
     /**
@@ -29,12 +29,12 @@ final class Clock
      */
     public static function uptime(): float
     {
-        $contents = @\file_get_contents('/proc/uptime');
+        $contents = @file_get_contents('/proc/uptime');
         if (!\is_string($contents)) {
             return 0.0;
         }
 
-        $parts = \preg_split('/\s+/', \trim($contents));
+        $parts = preg_split('/\s+/', trim($contents));
 
         return isset($parts[0]) ? (float) $parts[0] : 0.0;
     }

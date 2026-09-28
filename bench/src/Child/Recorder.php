@@ -48,7 +48,7 @@ final class Recorder
             'kind' => 'header',
             'role' => $this->role,
             'argument' => $this->argument,
-            'proc' => \getmypid(),
+            'proc' => getmypid(),
             'monotonic_origin_ns' => $this->originNs,
             'anchor' => Clock::anchor(),
             'sample_budget' => Config::SAMPLE_BUDGET_PER_PROCESS,
@@ -67,7 +67,7 @@ final class Recorder
                 $this->budgetExceeded = true;
                 $this->store->append([
                     'kind' => 'budget',
-                    'proc' => \getmypid(),
+                    'proc' => getmypid(),
                     'limit' => Config::SAMPLE_BUDGET_PER_PROCESS,
                     'first_dropped_kind' => $kind,
                 ]);
@@ -78,7 +78,7 @@ final class Recorder
 
         ++$this->written;
         $this->counts[$kind] = ($this->counts[$kind] ?? 0) + 1;
-        $this->store->append($record + ['proc' => \getmypid()]);
+        $this->store->append($record + ['proc' => getmypid()]);
     }
 
     public function error(string $where, \Throwable $error): void
@@ -89,7 +89,7 @@ final class Recorder
             $this->errors[] = [
                 'where' => $where,
                 'class' => $error::class,
-                'message' => \substr($error->getMessage(), 0, 500),
+                'message' => substr($error->getMessage(), 0, 500),
             ];
         }
 
@@ -97,10 +97,10 @@ final class Recorder
             ++$this->written;
             $this->store->append([
                 'kind' => 'error',
-                'proc' => \getmypid(),
+                'proc' => getmypid(),
                 'where' => $where,
                 'class' => $error::class,
-                'message' => \substr($error->getMessage(), 0, 500),
+                'message' => substr($error->getMessage(), 0, 500),
             ]);
         }
     }
@@ -112,11 +112,11 @@ final class Recorder
     {
         $this->store->append([
             'kind' => 'foot',
-            'proc' => \getmypid(),
+            'proc' => getmypid(),
             'role' => $this->role,
             'counts' => $this->counts,
             'errors' => $this->errors,
-            'rusage' => \getrusage(),
+            'rusage' => getrusage(),
             'budget_exceeded' => $this->budgetExceeded,
             'anchor' => Clock::anchor(),
         ] + $extra);

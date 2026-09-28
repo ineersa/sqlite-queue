@@ -9,12 +9,16 @@ use Symfony\Component\Process\Process as SymfonyProcess;
 
 final class ClockProbe
 {
-    /** Bounds the child's clock offset by parent request/reply timestamps. */
+    /**
+     * Bounds the child's clock offset by parent request/reply timestamps.
+     *
+     * @return array{verified: bool, method: string, offset_lower_ns: int, offset_upper_ns: int, samples: list<array{before_ns: int, child_ns: int, after_ns: int, offset_lower_ns: int, offset_upper_ns: int, roundtrip_ns: int}>}
+     */
     public static function run(): array
     {
         $input = new InputStream();
         $process = new SymfonyProcess(
-            [PHP_BINARY, Config::rootDir() . '/bin/benchmark', 'clock-probe', '--no-ansi'],
+            [\PHP_BINARY, Config::rootDir().'/bin/benchmark', 'clock-probe', '--no-ansi'],
             Config::rootDir(),
             Process::environment(),
             $input,
@@ -29,7 +33,7 @@ final class ClockProbe
                 $input->write("probe\n");
                 $reply = '';
                 $received = $process->waitUntil(static function (string $type, string $buffer) use (&$reply): bool {
-                    if ($type === SymfonyProcess::OUT) {
+                    if (SymfonyProcess::OUT === $type) {
                         $reply .= $buffer;
                     }
 

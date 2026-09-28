@@ -22,32 +22,42 @@ final class Process
     ) {
     }
 
+    /**
+     * @param list<string>                $argv
+     * @param array<string, string|false> $env
+     */
     public static function spawn(string $role, string $argument, array $argv, array $env, string $directory): self
     {
         foreach (['ready', 'logs'] as $subdirectory) {
-            $path = $directory . '/' . $subdirectory;
+            $path = $directory.'/'.$subdirectory;
             if (!is_dir($path) && !mkdir($path, 0700, true)) {
-                throw new \RuntimeException('Cannot create process artifact directory: ' . $path);
+                throw new \RuntimeException('Cannot create process artifact directory: '.$path);
             }
         }
 
-        $id = $role . '-' . preg_replace('/[^a-z0-9_-]+/i', '_', $argument);
-        $stdoutPath = $directory . '/logs/' . $id . '.out';
-        $stderrPath = $directory . '/logs/' . $id . '.err';
-        $readyPath = $directory . '/ready/' . $id . '.ready';
+        $id = $role.'-'.preg_replace('/[^a-z0-9_-]+/i', '_', $argument);
+        $stdoutPath = $directory.'/logs/'.$id.'.out';
+        $stderrPath = $directory.'/logs/'.$id.'.err';
+        $readyPath = $directory.'/ready/'.$id.'.ready';
         $process = new SymfonyProcess($argv, $directory, self::environment($env), timeout: null);
         $process->start(static function (string $type, string $data) use ($stdoutPath, $stderrPath): void {
-            file_put_contents($type === SymfonyProcess::ERR ? $stderrPath : $stdoutPath, $data, FILE_APPEND);
+            file_put_contents(SymfonyProcess::ERR === $type ? $stderrPath : $stdoutPath, $data, \FILE_APPEND);
         });
         $pid = $process->getPid();
-        if ($pid === null) {
-            throw new \RuntimeException('Process exited during startup: ' . $id . '. ' . $process->getErrorOutput());
+        if (null === $pid) {
+            throw new \RuntimeException('Process exited during startup: '.$id.'. '.$process->getErrorOutput());
         }
 
         return new self($process, $role, $argument, $pid, $readyPath, $stderrPath);
     }
 
-    /** Symfony inherits environment variables unless they are explicitly removed. */
+    /**
+     * Symfony inherits environment variables unless they are explicitly removed.
+     *
+     * @param array<string, string|false> $overrides
+     *
+     * @return array<string, string|false>
+     */
     public static function environment(array $overrides = []): array
     {
         $inherited = array_keys(getenv() + $_ENV);
@@ -55,27 +65,30 @@ final class Process
         return $overrides + ['PATH' => '/usr/bin:/bin', 'LANG' => 'C', 'TZ' => 'UTC'] + array_fill_keys($inherited, false);
     }
 
+    /**
+     * @return array<string, mixed>
+     */
     public function waitForReady(float $timeoutSeconds): array
     {
         $deadline = hrtime(true) + (int) ($timeoutSeconds * 1e9);
         while (hrtime(true) < $deadline) {
             if (is_file($this->readyPath)) {
                 $ready = json_decode(file_get_contents($this->readyPath), true);
-                if (is_array($ready) && ($ready['event'] ?? null) === 'ready') {
+                if (\is_array($ready) && ($ready['event'] ?? null) === 'ready') {
                     if (($ready['pid'] ?? null) !== $this->pid) {
-                        throw new \RuntimeException('Readiness PID mismatch for ' . $this->label());
+                        throw new \RuntimeException('Readiness PID mismatch for '.$this->label());
                     }
 
                     return $ready;
                 }
             }
             if (!$this->isRunning()) {
-                throw new \RuntimeException('Process exited before readiness: ' . $this->label() . '. ' . $this->errorTail());
+                throw new \RuntimeException('Process exited before readiness: '.$this->label().'. '.$this->errorTail());
             }
             usleep(2000);
         }
 
-        throw new \RuntimeException('Readiness timeout for ' . $this->label());
+        throw new \RuntimeException('Readiness timeout for '.$this->label());
     }
 
     public function wait(float $timeoutSeconds): int
@@ -99,22 +112,9 @@ final class Process
         $snapshot = ProcessTree::snapshot();
         $descendants = ProcessTree::descendants($this->pid, $snapshot);
         $owned = array_intersect_key($snapshot, array_flip($descendants));
-        $this->signalDescendants($owned, SIGTERM);
-        $this->process->stop(Config::KILL_GRACE_S, SIGKILL);
-        $this->signalDescendants($owned, SIGKILL);
-    }
-
-    private function signalDescendants(array $owned, int $signal): void
-    {
-        $current = ProcessTree::snapshot();
-        foreach (array_reverse(array_keys($owned)) as $pid) {
-            $identity = $owned[$pid];
-            if (($current[$pid]['start_time_ticks'] ?? null) === $identity['start_time_ticks']
-                && $identity['uid'] === posix_geteuid() && $identity['uid'] !== 0) {
-                // The process can exit between the snapshot and the signal.
-                @posix_kill($pid, $signal);
-            }
-        }
+        $this->signalDescendants($owned, \SIGTERM);
+        $this->process->stop(Config::KILL_GRACE_S, \SIGKILL);
+        $this->signalDescendants($owned, \SIGKILL);
     }
 
     public function isRunning(): bool
@@ -127,6 +127,9 @@ final class Process
         return $running;
     }
 
+    /**
+     * @return list<int>
+     */
     public function survivors(): array
     {
         return ProcessTree::descendants($this->pid, ProcessTree::snapshot());
@@ -149,7 +152,7 @@ final class Process
 
     public function label(): string
     {
-        return $this->role . ':' . $this->argument;
+        return $this->role.':'.$this->argument;
     }
 
     public function exitCode(): ?int
@@ -174,5 +177,21 @@ final class Process
         }
 
         return file_get_contents($this->stderrPath, offset: max(0, filesize($this->stderrPath) - 2000));
+    }
+
+    /**
+     * @param array<int, array{ppid: int, state: string, start_time_ticks: int, uid: int|false, cmd: string, cpu_seconds: float, rss_kb: int}> $owned
+     */
+    private function signalDescendants(array $owned, int $signal): void
+    {
+        $current = ProcessTree::snapshot();
+        foreach (array_reverse(array_keys($owned)) as $pid) {
+            $identity = $owned[$pid];
+            if (($current[$pid]['start_time_ticks'] ?? null) === $identity['start_time_ticks']
+                && $identity['uid'] === posix_geteuid() && 0 !== $identity['uid']) {
+                // The process can exit between the snapshot and the signal.
+                @posix_kill($pid, $signal);
+            }
+        }
     }
 }

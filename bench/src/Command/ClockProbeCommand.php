@@ -16,9 +16,9 @@ final class ClockProbeCommand extends Command
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
         $stream = $input instanceof StreamableInputInterface ? $input->getStream() : null;
-        $stream ??= STDIN;
+        $stream ??= \STDIN;
 
-        for ($round = 0; $round < 20 && fgets($stream) !== false; ++$round) {
+        for ($round = 0; $round < 20 && false !== fgets($stream); ++$round) {
             $output->writeln((string) hrtime(true));
         }
 

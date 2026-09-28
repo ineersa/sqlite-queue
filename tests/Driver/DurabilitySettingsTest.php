@@ -60,7 +60,7 @@ final class DurabilitySettingsTest extends DriverTestCase
      */
     public function testMemoryDatabaseUsesMemoryJournalAndFullSynchronous(): void
     {
-        $this->runAsync(function (): void {
+        $this->runAsync(static function (): void {
             $connection = (new SqliteConnector())->connect(new SqliteConfig(':memory:'));
 
             try {
@@ -91,7 +91,7 @@ final class DurabilitySettingsTest extends DriverTestCase
     {
         $databasePath = $this->database->path();
 
-        $this->runAsync(function () use ($databasePath): void {
+        $this->runAsync(static function () use ($databasePath): void {
             $config = static fn (): SqliteConfig => (new SqliteConfig($databasePath))
                 ->withJournalMode(SqliteJournalMode::Wal)
                 ->withSynchronousMode(SqliteSynchronousMode::Full);

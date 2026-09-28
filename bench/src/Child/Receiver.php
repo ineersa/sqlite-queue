@@ -10,16 +10,29 @@ use Ineersa\SqliteQueue\Bench\BenchMessage;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
 use Symfony\Component\Messenger\Transport\Receiver\ReceiverInterface;
+use Symfony\Component\Messenger\Transport\TransportInterface;
 
 /** Measures public transport calls without changing the Doctrine claim SQL. */
 final class Receiver implements ReceiverInterface
 {
+    /**
+     * @var array{polls: int, empty_polls: int, fetched: int, poll_ms: float}
+     */
     public private(set) array $polls = ['polls' => 0, 'empty_polls' => 0, 'fetched' => 0, 'poll_ms' => 0.0];
     public private(set) bool $failed = false;
+    /**
+     * @var array<string, array{t_handler_ns: int, handler_wall: float, payload_ok: bool}>
+     */
     private array $entries = [];
+    /**
+     * @var array<string, TransportInterface>
+     */
     private array $transports = [];
     private int $next = 0;
 
+    /**
+     * @param list<string> $queues
+     */
     public function __construct(
         private readonly Connection $connection,
         array $queues,
@@ -37,22 +50,23 @@ final class Receiver implements ReceiverInterface
     {
         $queues = array_keys($this->transports);
         foreach ($queues as $_) {
-            $queue = $queues[$this->next++ % count($queues)];
+            $queue = $queues[$this->next++ % \count($queues)];
             $start = hrtime(true);
             $envelopes = iterator_to_array($this->transports[$queue]->get());
             $this->polls['poll_ms'] += (hrtime(true) - $start) / 1e6;
             ++$this->polls['polls'];
-            $this->polls['fetched'] += count($envelopes);
-            if (!$envelopes) {
+            $this->polls['fetched'] += \count($envelopes);
+            if ([] === $envelopes) {
                 ++$this->polls['empty_polls'];
             } else {
                 yield from $envelopes;
+
                 return;
             }
         }
         // Positive evidence that the real worker reached an empty poll.
-        if (!is_file($this->directory . '/idle-' . $this->index)) {
-            file_put_contents($this->directory . '/idle-' . $this->index, (string) hrtime(true));
+        if (!is_file($this->directory.'/idle-'.$this->index)) {
+            file_put_contents($this->directory.'/idle-'.$this->index, (string) hrtime(true));
         }
     }
 
@@ -64,7 +78,7 @@ final class Receiver implements ReceiverInterface
             'payload_ok' => $message->matchesRegeneratedPayload(),
         ];
         if (!$this->entries[$message->corrId]['payload_ok']) {
-            throw new \RuntimeException('Payload mismatch: ' . $message->corrId);
+            throw new \RuntimeException('Payload mismatch: '.$message->corrId);
         }
     }
 
@@ -93,34 +107,38 @@ final class Receiver implements ReceiverInterface
         // The receiver has committed by this point. No transaction is held during the handler.
         $rowId = $envelope->last(TransportMessageIdStamp::class)?->getId();
         $stored = $this->connection->fetchOne('SELECT available_at FROM messenger_messages WHERE id = ?', [$rowId]);
-        $deadline = $stored === false ? null : (float) (new \DateTimeImmutable((string) $stored, new \DateTimeZone('UTC')))->format('U.u');
+        $deadline = false === $stored ? null : (float) (new \DateTimeImmutable((string) $stored, new \DateTimeZone('UTC')))->format('U.u');
         $start = hrtime(true);
         $error = null;
         try {
-            $this->transports[$message->queue]->$outcome($envelope);
+            if ('ack' === $outcome) {
+                $this->transports[$message->queue]->ack($envelope);
+            } else {
+                $this->transports[$message->queue]->reject($envelope);
+            }
         } catch (\Throwable $e) {
-            $error = $e::class . ': ' . $e->getMessage();
+            $error = $e::class.': '.$e->getMessage();
             $this->failed = true;
             throw $e;
         } finally {
             $end = hrtime(true);
-            if ($this->roundtrip && $outcome === 'ack' && $error === null) {
-                file_put_contents($this->directory . '/acks/' . $message->corrId, 'ack');
+            if ($this->roundtrip && 'ack' === $outcome && null === $error) {
+                file_put_contents($this->directory.'/acks/'.$message->corrId, 'ack');
             }
             $this->recorder->sample($entry + [
                 'kind' => 'deliver',
                 'msg' => $message->corrId,
                 'queue' => $message->queue,
                 'transport_id' => $rowId,
-                'outcome' => $error === null ? $outcome : 'error',
+                'outcome' => null === $error ? $outcome : 'error',
                 'error' => $error,
                 't_ack_invoke_ns' => $start,
-                't_ack_confirm_ns' => $error === null ? $end : null,
+                't_ack_confirm_ns' => null === $error ? $end : null,
                 'ack_duration_ms' => ($end - $start) / 1e6,
                 'handling_ms' => ($end - $entry['t_handler_ns']) / 1e6,
                 'stored_deadline_wall' => $deadline,
-                'lateness_ms' => $deadline === null ? null : ($entry['handler_wall'] - $deadline) * 1000,
-                'delivered_before_deadline' => $deadline !== null && $entry['handler_wall'] < $deadline,
+                'lateness_ms' => null === $deadline ? null : ($entry['handler_wall'] - $deadline) * 1000,
+                'delivered_before_deadline' => null !== $deadline && $entry['handler_wall'] < $deadline,
             ]);
             unset($this->entries[$message->corrId]);
         }

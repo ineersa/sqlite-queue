@@ -26,12 +26,27 @@ final class RunCommand extends Command implements SignalableCommandInterface
         parent::__construct();
     }
 
+    /**
+     * @return list<int>
+     */
+    public function getSubscribedSignals(): array
+    {
+        return [\SIGINT, \SIGTERM];
+    }
+
+    public function handleSignal(int $signal, int|false $previousExitCode = 0): int|false
+    {
+        $this->cancellation->request();
+
+        return false;
+    }
+
     protected function configure(): void
     {
         $this
             ->addOption('smoke', null, InputOption::VALUE_NONE, 'Run a small execution check, not a performance measurement.')
             ->addOption('workload', null, InputOption::VALUE_REQUIRED, 'Workload name, or all.', 'all')
-            ->setHelp('Available workloads: ' . implode(', ', array_keys(Config::workloads())));
+            ->setHelp('Available workloads: '.implode(', ', array_keys(Config::workloads())));
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int
@@ -45,7 +60,7 @@ final class RunCommand extends Command implements SignalableCommandInterface
         );
 
         $io->note('Baseline only. The broker candidate has not been measured.');
-        if ($report['baseline_status'] !== 'complete') {
+        if ('complete' !== $report['baseline_status']) {
             $io->warning('The capture contains failed or unexecuted repetitions. Their evidence has been retained.');
 
             return Command::FAILURE;
@@ -54,17 +69,5 @@ final class RunCommand extends Command implements SignalableCommandInterface
         $io->success('Every scheduled baseline repetition completed.');
 
         return Command::SUCCESS;
-    }
-
-    public function getSubscribedSignals(): array
-    {
-        return [SIGINT, SIGTERM];
-    }
-
-    public function handleSignal(int $signal, int|false $previousExitCode = 0): int|false
-    {
-        $this->cancellation->request();
-
-        return false;
     }
 }

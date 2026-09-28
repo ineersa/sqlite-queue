@@ -19,8 +19,14 @@ final class Runner
     private ?Connection $connection = null;
     private readonly Resources $resources;
     private int $deadline;
+    /**
+     * @var array<string, mixed>
+     */
     private array $facts = [];
 
+    /**
+     * @param array<string, mixed> $workload
+     */
     public function __construct(
         private readonly string $directory,
         private readonly array $workload,
@@ -29,6 +35,11 @@ final class Runner
         $this->resources = new Resources(getmypid());
     }
 
+    /**
+     * @param array<string, mixed> $clockProbe
+     *
+     * @return array<string, mixed>
+     */
     public function run(string $name, bool $warmup, array $clockProbe): array
     {
         $this->prepareDirectory();
@@ -58,21 +69,21 @@ final class Runner
     private function prepareDirectory(): void
     {
         foreach (['', '/ready', '/go', '/logs', '/samples', '/acks'] as $subdirectory) {
-            if (!mkdir($this->directory . $subdirectory, 0700, true)) {
-                throw new \RuntimeException('Cannot create repetition directory: ' . $this->directory . $subdirectory);
+            if (!mkdir($this->directory.$subdirectory, 0700, true)) {
+                throw new \RuntimeException('Cannot create repetition directory: '.$this->directory.$subdirectory);
             }
         }
         $config = [
             'directory' => $this->directory,
-            'database' => $this->directory . '/queue.sqlite',
+            'database' => $this->directory.'/queue.sqlite',
             'workload' => $this->workload,
         ];
-        file_put_contents($this->directory . '/config.json', json_encode($config, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR));
+        file_put_contents($this->directory.'/config.json', json_encode($config, \JSON_PRETTY_PRINT | \JSON_THROW_ON_ERROR));
     }
 
     private function initializeDatabase(): void
     {
-        $this->connection = Baseline::connect($this->directory . '/queue.sqlite');
+        $this->connection = Baseline::connect($this->directory.'/queue.sqlite');
         Baseline::transport($this->connection, $this->workload['queues'][0])->setup();
         $this->facts['setup_durability'] = Baseline::durability($this->connection);
     }
@@ -96,11 +107,11 @@ final class Runner
     {
         $this->cancellation->throwIfRequested();
         $process = Process::spawn($role->value, (string) $index, [
-            PHP_BINARY,
+            \PHP_BINARY,
             '-d', 'date.timezone=UTC',
-            Config::rootDir() . '/bin/benchmark',
+            Config::rootDir().'/bin/benchmark',
             'worker',
-            $this->directory . '/config.json',
+            $this->directory.'/config.json',
             $role->value,
             (string) $index,
             '--no-ansi',
@@ -114,7 +125,7 @@ final class Runner
 
     private function releaseWorkload(): void
     {
-        if ($this->workload['name'] === 'backlog') {
+        if ('backlog' === $this->workload['name']) {
             $this->release($this->producers);
             while ($this->anyRunning($this->producers)) {
                 $this->tick();
@@ -134,7 +145,7 @@ final class Runner
     private function release(array $processes): void
     {
         foreach ($processes as $process) {
-            $path = $this->directory . '/go/' . $process->role() . '-' . $process->argument();
+            $path = $this->directory.'/go/'.$process->role().'-'.$process->argument();
             file_put_contents($path, (string) hrtime(true));
         }
     }
@@ -142,7 +153,7 @@ final class Runner
     private function awaitIdleConsumers(): void
     {
         foreach ($this->consumers as $index => $consumer) {
-            while (!is_file($this->directory . '/idle-' . $index)) {
+            while (!is_file($this->directory.'/idle-'.$index)) {
                 if (!$consumer->isRunning()) {
                     throw new \RuntimeException('Consumer exited before idle readiness.');
                 }
@@ -176,7 +187,7 @@ final class Runner
     private function awaitDrain(): void
     {
         // Only inspect inventory after publication. Do not add DB reads to the publishing window.
-        while (array_sum(Baseline::inventory($this->connection)) !== 0) {
+        while (0 !== array_sum(Baseline::inventory($this->connection))) {
             if (!$this->anyRunning($this->consumers)) {
                 throw new \RuntimeException('All consumers exited with work pending.');
             }
@@ -194,6 +205,9 @@ final class Runner
         usleep(Config::PROGRESS_INTERVAL_US);
     }
 
+    /**
+     * @param list<Process> $processes
+     */
     private function anyRunning(array $processes): bool
     {
         return array_any($processes, static fn (Process $process): bool => $process->isRunning());
@@ -201,12 +215,12 @@ final class Runner
 
     private function shutdown(): void
     {
-        file_put_contents($this->directory . '/stop', 'stop');
+        file_put_contents($this->directory.'/stop', 'stop');
         foreach ($this->children as $process) {
             $process->wait(3.0);
         }
         $this->resources->sample();
-        if ($this->connection === null) {
+        if (null === $this->connection) {
             return;
         }
 
@@ -220,6 +234,9 @@ final class Runner
         }
     }
 
+    /**
+     * @return array<string, mixed>
+     */
     private function report(string $name): array
     {
         $this->facts['resources'] = $this->resources->summary();
@@ -235,10 +252,10 @@ final class Runner
         $result['facts'] = $this->facts;
         $result['workload'] = $this->workload;
         $result['directory'] = $this->directory;
-        file_put_contents($this->directory . '/result.json', json_encode($result, JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR));
+        file_put_contents($this->directory.'/result.json', json_encode($result, \JSON_PRETTY_PRINT | \JSON_THROW_ON_ERROR));
 
         foreach (['queue.sqlite', 'queue.sqlite-wal', 'queue.sqlite-shm'] as $file) {
-            $path = $this->directory . '/' . $file;
+            $path = $this->directory.'/'.$file;
             if (is_file($path)) {
                 unlink($path);
             }
@@ -247,12 +264,15 @@ final class Runner
         return $result;
     }
 
+    /**
+     * @return array{role: string, argument: string, path: string, exit_code: int|null, timed_out: bool, killed: bool, stderr: string}
+     */
     private function source(Process $process): array
     {
         return [
             'role' => $process->role(),
             'argument' => $process->argument(),
-            'path' => $this->directory . '/samples/' . $process->role() . '-' . $process->argument() . '.jsonl',
+            'path' => $this->directory.'/samples/'.$process->role().'-'.$process->argument().'.jsonl',
             'exit_code' => $process->exitCode(),
             'timed_out' => $process->timedOut(),
             'killed' => $process->killed(),
@@ -262,6 +282,6 @@ final class Runner
 
     private function recordError(\Throwable $error): void
     {
-        $this->facts['coordinator_errors'][] = $error::class . ': ' . $error->getMessage();
+        $this->facts['coordinator_errors'][] = $error::class.': '.$error->getMessage();
     }
 }

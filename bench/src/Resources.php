@@ -59,14 +59,14 @@ final class Resources
             }
             $this->lastCpu[$pid] = $process['cpu_seconds'];
 
-            $this->peakRss[$pid] = \max($this->peakRss[$pid] ?? 0, $process['rss_kb']);
+            $this->peakRss[$pid] = max($this->peakRss[$pid] ?? 0, $process['rss_kb']);
 
             $cpuSeconds += $process['cpu_seconds'];
             $rssKb += $process['rss_kb'];
         }
 
-        $this->peakTreeRssKb = \max($this->peakTreeRssKb, $rssKb);
-        $this->peakProcesses = \max($this->peakProcesses, \count($pids));
+        $this->peakTreeRssKb = max($this->peakTreeRssKb, $rssKb);
+        $this->peakProcesses = max($this->peakProcesses, \count($pids));
 
         $this->samples[] = [
             'wall' => Clock::wall(),
@@ -111,7 +111,7 @@ final class Resources
             return ['cpu_seconds' => 0.0, 'milliseconds' => 0.0, 'cpu_percent' => 0.0, 'samples' => $count];
         }
 
-        $cpuSeconds = \max(0.0, $last['cpu_seconds'] - $first['cpu_seconds']);
+        $cpuSeconds = max(0.0, $last['cpu_seconds'] - $first['cpu_seconds']);
         $milliseconds = ($last['wall'] - $first['wall']) * 1000;
 
         return [
@@ -137,7 +137,7 @@ final class Resources
      */
     public function observedPids(): array
     {
-        return \array_map('intval', \array_keys($this->observed));
+        return array_map('intval', array_keys($this->observed));
     }
 
     /**

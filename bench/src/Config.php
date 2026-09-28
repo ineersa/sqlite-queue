@@ -169,11 +169,7 @@ final class Config
         $workloads = self::workloads();
 
         if (!isset($workloads[$name])) {
-            throw new \InvalidArgumentException(\sprintf(
-                'Unknown workload "%s". Known workloads: %s.',
-                $name,
-                \implode(', ', \array_keys($workloads)),
-            ));
+            throw new \InvalidArgumentException(\sprintf('Unknown workload "%s". Known workloads: %s.', $name, implode(', ', array_keys($workloads))));
         }
 
         return $workloads[$name];
@@ -237,7 +233,6 @@ final class Config
 
     public static function varDir(): string
     {
-        return self::rootDir() . '/var/bench';
+        return self::rootDir().'/var/bench';
     }
-
 }

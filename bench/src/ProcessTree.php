@@ -19,7 +19,7 @@ final class ProcessTree
 
     public static function available(): bool
     {
-        return \is_dir('/proc/self');
+        return is_dir('/proc/self');
     }
 
     public static function setTicksPerSecond(int $ticks): void
@@ -48,26 +48,27 @@ final class ProcessTree
     {
         $processes = [];
 
-        foreach (\glob('/proc/[0-9]*') ?: [] as $directory) {
-            $pid = (int) \basename($directory);
-            $stat = @\file_get_contents($directory . '/stat');
+        $directories = glob('/proc/[0-9]*');
+        foreach (false === $directories ? [] : $directories as $directory) {
+            $pid = (int) basename($directory);
+            $stat = @file_get_contents($directory.'/stat');
             if (!\is_string($stat)) {
                 continue;
             }
 
-            if (\preg_match('/^(\d+) \((.*)\) (.*)$/s', $stat, $match) !== 1) {
+            if (1 !== preg_match('/^(\d+) \((.*)\) (.*)$/s', $stat, $match)) {
                 continue;
             }
 
-            $fields = \preg_split('/\s+/', \trim($match[3])) ?: [];
-            if (\count($fields) < 22) {
+            $fields = preg_split('/\s+/', trim($match[3]));
+            if (false === $fields || \count($fields) < 22) {
                 continue;
             }
 
-            $command = @\file_get_contents($directory . '/cmdline');
-            $command = \is_string($command) ? \trim(\str_replace("\0", ' ', $command)) : $match[2];
+            $command = @file_get_contents($directory.'/cmdline');
+            $command = \is_string($command) ? trim(str_replace("\0", ' ', $command)) : $match[2];
             if ('' === $command) {
-                $command = '[' . $match[2] . ']';
+                $command = '['.$match[2].']';
             }
 
             $processes[$pid] = [
@@ -75,9 +76,9 @@ final class ProcessTree
                 'state' => $fields[0],
                 'start_time_ticks' => (int) $fields[19],
                 'uid' => fileowner($directory),
-                'cmd' => \substr($command, 0, 300),
+                'cmd' => substr($command, 0, 300),
                 'cpu_seconds' => ((int) $fields[11] + (int) $fields[12]) / self::$ticksPerSecond,
-                'rss_kb' => \intdiv((int) $fields[21] * self::$pageSizeBytes, 1024),
+                'rss_kb' => intdiv((int) $fields[21] * self::$pageSizeBytes, 1024),
             ];
         }
 
@@ -88,6 +89,7 @@ final class ProcessTree
      * PIDs reachable from $root through parent links, excluding $root itself.
      *
      * @param array<int, array{ppid: int, state: string, start_time_ticks: int, uid: int|false, cmd: string, cpu_seconds: float, rss_kb: int}> $snapshot
+     *
      * @return list<int>
      */
     public static function descendants(int $root, array $snapshot): array
@@ -105,7 +107,7 @@ final class ProcessTree
         $queue = [$root];
 
         while ([] !== $queue) {
-            $current = \array_shift($queue);
+            $current = array_shift($queue);
             foreach ($children[$current] ?? [] as $child) {
                 if (isset($found[$child])) {
                     continue;
@@ -119,7 +121,7 @@ final class ProcessTree
             }
         }
 
-        return \array_map('intval', \array_keys($found));
+        return array_map('intval', array_keys($found));
     }
 
     /**
@@ -131,8 +133,9 @@ final class ProcessTree
     }
 
     /**
-     * @param list<int> $pids
+     * @param list<int>                                                                                                                        $pids
      * @param array<int, array{ppid: int, state: string, start_time_ticks: int, uid: int|false, cmd: string, cpu_seconds: float, rss_kb: int}> $snapshot
+     *
      * @return array<int, array{pid: int, cmd: string}>
      */
     public static function describe(array $pids, array $snapshot): array

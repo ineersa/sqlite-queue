@@ -6,6 +6,9 @@ namespace Ineersa\SqliteQueue\Bench\Child;
 
 final readonly class Assignment
 {
+    /**
+     * @param array<string, mixed> $workload
+     */
     public function __construct(
         public string $directory,
         public string $database,
@@ -21,12 +24,12 @@ final readonly class Assignment
     public static function fromFile(string $path, Role $role, int $index): self
     {
         if (!is_file($path) || !is_readable($path)) {
-            throw new \InvalidArgumentException('Cannot read worker assignment: ' . $path);
+            throw new \InvalidArgumentException('Cannot read worker assignment: '.$path);
         }
 
-        $config = json_decode(file_get_contents($path), true, 512, JSON_THROW_ON_ERROR);
-        if (!is_array($config) || !is_string($config['directory'] ?? null)
-            || !is_string($config['database'] ?? null) || !is_array($config['workload'] ?? null)) {
+        $config = json_decode(file_get_contents($path), true, 512, \JSON_THROW_ON_ERROR);
+        if (!\is_array($config) || !\is_string($config['directory'] ?? null)
+            || !\is_string($config['database'] ?? null) || !\is_array($config['workload'] ?? null)) {
             throw new \InvalidArgumentException('Worker assignment requires directory, database, and workload.');
         }
 
@@ -35,11 +38,11 @@ final readonly class Assignment
 
     public function label(): string
     {
-        return $this->role->value . '-' . $this->index;
+        return $this->role->value.'-'.$this->index;
     }
 
     public function path(string $relative): string
     {
-        return $this->directory . '/' . $relative;
+        return $this->directory.'/'.$relative;
     }
 }

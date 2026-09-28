@@ -29,16 +29,16 @@ final class Baseline
 
         // WAL is persistent per database file; synchronous and busy_timeout are per connection
         // and are applied on every connection this benchmark opens.
-        $connection->executeStatement('PRAGMA journal_mode=' . Config::EXPECTED_JOURNAL_MODE);
+        $connection->executeStatement('PRAGMA journal_mode='.Config::EXPECTED_JOURNAL_MODE);
         $connection->executeStatement('PRAGMA synchronous=FULL');
-        $connection->executeStatement('PRAGMA busy_timeout=' . Config::BUSY_TIMEOUT_MS);
+        $connection->executeStatement('PRAGMA busy_timeout='.Config::BUSY_TIMEOUT_MS);
         $connection->executeStatement('PRAGMA wal_autocheckpoint=1000');
 
         return $connection;
     }
 
     /**
-     * @return array{journal_mode: string, synchronous: int, busy_timeout: int, database: string, file_backed: bool}
+     * @return array{journal_mode: string, synchronous: int, busy_timeout: int, wal_autocheckpoint: int, database: string, file_backed: bool}
      */
     public static function durability(DbalConnection $connection): array
     {
@@ -46,7 +46,7 @@ final class Baseline
         $database = (string) ($parameters['path'] ?? ':memory:');
 
         return [
-            'journal_mode' => \strtolower((string) $connection->executeQuery('PRAGMA journal_mode')->fetchOne()),
+            'journal_mode' => strtolower((string) $connection->executeQuery('PRAGMA journal_mode')->fetchOne()),
             'synchronous' => (int) $connection->executeQuery('PRAGMA synchronous')->fetchOne(),
             'busy_timeout' => (int) $connection->executeQuery('PRAGMA busy_timeout')->fetchOne(),
             'wal_autocheckpoint' => (int) $connection->executeQuery('PRAGMA wal_autocheckpoint')->fetchOne(),
@@ -55,6 +55,9 @@ final class Baseline
         ];
     }
 
+    /**
+     * @param array{journal_mode: string, synchronous: int, file_backed: bool} $durability
+     */
     public static function isDurabilityEquivalent(array $durability): bool
     {
         return Config::EXPECTED_JOURNAL_MODE === $durability['journal_mode']
@@ -78,7 +81,7 @@ final class Baseline
     }
 
     /**
-     * @return array<string, int> Pending rows per queue.
+     * @return array<string, int> pending rows per queue
      */
     public static function inventory(DbalConnection $connection): array
     {

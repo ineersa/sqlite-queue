@@ -29,15 +29,15 @@ final class WorkerCommand extends Command
     protected function execute(InputInterface $input, OutputInterface $output): int
     {
         $role = Role::tryFrom((string) $input->getArgument('role'));
-        $index = filter_var($input->getArgument('index'), FILTER_VALIDATE_INT, ['options' => ['min_range' => 0]]);
-        if ($role === null || $index === false) {
+        $index = filter_var($input->getArgument('index'), \FILTER_VALIDATE_INT, ['options' => ['min_range' => 0]]);
+        if (null === $role || false === $index) {
             throw new \InvalidArgumentException('Expected a known worker role and a nonnegative integer index.');
         }
 
         date_default_timezone_set('UTC');
         $assignment = Assignment::fromFile((string) $input->getArgument('config'), $role, $index);
         $session = new Session($assignment);
-        $worker = $role === Role::Consumer ? new Consumer($session) : new Publisher($session);
+        $worker = Role::Consumer === $role ? new Consumer($session) : new Publisher($session);
         $session->execute($worker->run(...));
 
         return Command::SUCCESS;

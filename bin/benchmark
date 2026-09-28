@@ -8,7 +8,7 @@ use Ineersa\SqliteQueue\Bench\Command\RunCommand;
 use Ineersa\SqliteQueue\Bench\Command\WorkerCommand;
 use Symfony\Component\Console\Application;
 
-require dirname(__DIR__) . '/vendor/autoload.php';
+require dirname(__DIR__).'/vendor/autoload.php';
 
 $application = new Application('SQLite queue benchmark');
 $application->addCommand(new RunCommand());

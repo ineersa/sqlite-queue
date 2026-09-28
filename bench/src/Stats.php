@@ -14,9 +14,10 @@ namespace Ineersa\SqliteQueue\Bench;
 final class Stats
 {
     /**
-     * @param array<string, mixed> $workload
+     * @param array<string, mixed>                                                                                                          $workload
      * @param list<array{role: string, argument: string, path: string, exit_code: int|null, timed_out: bool, killed: bool, stderr: string}> $sources
-     * @param array<string, mixed> $facts
+     * @param array<string, mixed>                                                                                                          $facts
+     *
      * @return array<string, mixed>
      */
     public static function analyze(array $workload, string $repetition, array $sources, array $facts): array
@@ -47,7 +48,7 @@ final class Stats
                 switch ($kind) {
                     case 'header':
                         if (\is_array($record['durability'] ?? null)) {
-                            $durability[] = ($record['durability']) + [
+                            $durability[] = $record['durability'] + [
                                 'role' => $source['role'],
                                 'argument' => $source['argument'],
                                 'proc' => $record['proc'] ?? null,
@@ -139,23 +140,23 @@ final class Stats
             if (($process['kinds']['foot'] ?? 0) !== 1 || ($process['kinds']['header'] ?? 0) < 1 || ($process['kinds']['clock_check'] ?? 0) !== 1) {
                 $incomplete[] = 'missing lifecycle or clock evidence';
             }
-            if ($process['exit_code'] === null) {
+            if (null === $process['exit_code']) {
                 $incomplete[] = 'missing process exit status';
             }
         }
-        if ($duplicateSends) {
+        if (0 !== $duplicateSends) {
             $incomplete[] = 'duplicate send correlation IDs';
         }
-        if ($failures) {
+        if ([] !== $failures) {
             $incomplete[] = 'recorded operation failures';
         }
-        if (!empty($facts['survivors'])) {
+        if ([] !== ($facts['survivors'] ?? [])) {
             $incomplete[] = 'owned processes survived teardown';
         }
         foreach ($facts['coordinator_errors'] ?? [] as $error) {
             $incomplete[] = $error;
         }
-        $clocksValid = ($facts['clock_probe']['verified'] ?? false) === true && count($clockChecks) === count($sources) && $sources !== []
+        $clocksValid = ($facts['clock_probe']['verified'] ?? false) === true && \count($clockChecks) === \count($sources) && [] !== $sources
             && array_all($clockChecks, static fn (array $c): bool => ($c['valid'] ?? false) === true
                 && $c['before_ready_ns'] <= $c['parent_go_ns'] && $c['parent_go_ns'] <= $c['after_go_ns']);
         if (!$clocksValid) {
@@ -182,7 +183,7 @@ final class Stats
             'repetition' => $repetition,
             'warmup' => (bool) ($facts['warmup'] ?? false),
             'status' => [] === $incomplete ? 'complete' : 'incomplete',
-            'incomplete_reasons' => \array_values(\array_unique($incomplete)),
+            'incomplete_reasons' => array_values(array_unique($incomplete)),
             'processes' => $processes,
             'records' => $records,
             'corrupt_lines' => $corrupt,
@@ -203,10 +204,65 @@ final class Stats
     }
 
     /**
-     * @param array<string, array<string, mixed>> $sends
+     * Nearest-rank percentiles over the observed samples. No interpolation, no smoothing.
+     *
+     * @param list<int|float> $values
+     *
+     * @return array{count: int, min: float|null, p50: float|null, p95: float|null, p99: float|null, max: float|null, mean: float|null, tail: string}
+     */
+    public static function percentiles(array $values): array
+    {
+        $values = array_values(array_map('floatval', $values));
+        sort($values);
+
+        $count = \count($values);
+
+        if (0 === $count) {
+            return [
+                'count' => 0,
+                'min' => null,
+                'p50' => null,
+                'p95' => null,
+                'p99' => null,
+                'max' => null,
+                'mean' => null,
+                'tail' => 'inconclusive',
+            ];
+        }
+
+        return [
+            'count' => $count,
+            'min' => $values[0],
+            'p50' => self::percentile($values, 50.0),
+            'p95' => self::percentile($values, 95.0),
+            'p99' => self::percentile($values, 99.0),
+            'max' => $values[$count - 1],
+            'mean' => array_sum($values) / $count,
+            'tail' => $count >= Config::MIN_TAIL_SAMPLES ? 'ok' : 'inconclusive',
+        ];
+    }
+
+    /**
+     * @param list<float> $sorted
+     */
+    public static function percentile(array $sorted, float $percentile): ?float
+    {
+        $count = \count($sorted);
+        if (0 === $count) {
+            return null;
+        }
+
+        $rank = (int) ceil($percentile / 100 * $count);
+
+        return $sorted[max(0, min($count - 1, $rank - 1))];
+    }
+
+    /**
+     * @param array<string, array<string, mixed>>       $sends
      * @param array<string, list<array<string, mixed>>> $deliveries
-     * @param array<string, mixed> $workload
-     * @param array<string, mixed> $facts
+     * @param array<string, mixed>                      $workload
+     * @param array<string, mixed>                      $facts
+     *
      * @return array<string, array<string, mixed>>
      */
     private static function metrics(array $sends, array $deliveries, array $workload, array $facts): array
@@ -256,23 +312,23 @@ final class Stats
                 }
                 $delivered[$msg] = true;
 
-                if (($delivery['outcome'] ?? '') === 'ack' && \is_numeric($delivery['ack_duration_ms'] ?? null)) {
+                if (($delivery['outcome'] ?? '') === 'ack' && is_numeric($delivery['ack_duration_ms'] ?? null)) {
                     $ackInvocationMs[] = (float) $delivery['ack_duration_ms'];
                 }
-                if (\is_numeric($delivery['handling_ms'] ?? null)) {
+                if (is_numeric($delivery['handling_ms'] ?? null)) {
                     $deliverMs[] = (float) $delivery['handling_ms'];
                 }
-                if ($confirmed && \is_numeric($delivery['t_handler_ns'] ?? null)) {
+                if ($confirmed && is_numeric($delivery['t_handler_ns'] ?? null)) {
                     $publishToHandlerMs[] = ((int) $delivery['t_handler_ns'] - (int) $send['t_invoke_ns']) / 1e6;
                     $confirmationToHandlerMs[] = ((int) $delivery['t_handler_ns'] - (int) $send['t_confirm_ns']) / 1e6;
                 }
-                if ($confirmed && ($delivery['outcome'] ?? '') === 'ack' && \is_numeric($delivery['t_ack_confirm_ns'] ?? null)) {
+                if ($confirmed && ($delivery['outcome'] ?? '') === 'ack' && is_numeric($delivery['t_ack_confirm_ns'] ?? null)) {
                     $cycleMs[] = ((int) $delivery['t_ack_confirm_ns'] - (int) $send['t_invoke_ns']) / 1e6;
                     $size = (int) ($send['size'] ?? 0);
                     $byPayload[$size <= Config::SMALL_PAYLOAD_BYTES ? 'small' : 'large']['cycle_ms'][] =
                         ((int) $delivery['t_ack_confirm_ns'] - (int) $send['t_invoke_ns']) / 1e6;
                 }
-                if ($measured && \is_numeric($delivery['lateness_ms'] ?? null)) {
+                if (is_numeric($delivery['lateness_ms'] ?? null)) {
                     $latenessMs[] = (float) $delivery['lateness_ms'];
                 }
             }
@@ -314,11 +370,12 @@ final class Stats
     }
 
     /**
-     * @param array<string, mixed> $workload
-     * @param array<string, array<string, mixed>> $sends
+     * @param array<string, mixed>                      $workload
+     * @param array<string, array<string, mixed>>       $sends
      * @param array<string, list<array<string, mixed>>> $deliveries
-     * @param list<array<string, mixed>> $failures
-     * @param array<string, mixed> $facts
+     * @param list<array<string, mixed>>                $failures
+     * @param array<string, mixed>                      $facts
+     *
      * @return array<string, mixed>
      */
     private static function integrity(array $workload, array $sends, array $deliveries, array $failures, array $facts): array
@@ -327,8 +384,8 @@ final class Stats
         $expectedMeasuredSends = Config::expectedMeasuredSends($workload);
 
         $sent = \count($sends);
-        $sentOk = \count(\array_filter($sends, static fn (array $send): bool => true === ($send['ok'] ?? false)));
-        $deliveredMessages = \array_keys($deliveries);
+        $sentOk = \count(array_filter($sends, static fn (array $send): bool => true === ($send['ok'] ?? false)));
+        $deliveredMessages = array_keys($deliveries);
         $deliveryCount = 0;
         $ackCount = 0;
         $rejectCount = 0;
@@ -356,7 +413,7 @@ final class Stats
                 if (true !== ($record['payload_ok'] ?? false)) {
                     ++$payloadMismatch;
                 }
-                if (\is_numeric($record['lateness_ms'] ?? null) && (float) $record['lateness_ms'] < 0) {
+                if (is_numeric($record['lateness_ms'] ?? null) && (float) $record['lateness_ms'] < 0) {
                     ++$negativeLateness;
                 }
                 if (true === ($record['delivered_before_deadline'] ?? false)) {
@@ -365,9 +422,9 @@ final class Stats
             }
         }
 
-        $unknownDeliveries = \count(\array_diff($deliveredMessages, \array_keys($sends)));
-        $missingDeliveries = \count(\array_diff(\array_keys($sends), $deliveredMessages));
-        $pendingRows = \array_sum(\is_array($facts['inventory'] ?? null) ? $facts['inventory'] : []);
+        $unknownDeliveries = \count(array_diff($deliveredMessages, array_keys($sends)));
+        $missingDeliveries = \count(array_diff(array_keys($sends), $deliveredMessages));
+        $pendingRows = array_sum(\is_array($facts['inventory'] ?? null) ? $facts['inventory'] : []);
 
         $incomplete = [];
         if ($sent !== $expectedSends) {
@@ -412,7 +469,7 @@ final class Stats
             'missing_deliveries' => $missingDeliveries,
             'unknown_deliveries' => $unknownDeliveries,
             'failures' => \count($failures),
-            'unfinished' => \max(0, $expectedSends - count($ackedMessages)),
+            'unfinished' => max(0, $expectedSends - \count($ackedMessages)),
             'pending_rows_after_run' => $pendingRows,
             'deliveries_before_deadline' => $earlyDeliveries,
             'negative_lateness_samples' => $negativeLateness,
@@ -422,6 +479,7 @@ final class Stats
 
     /**
      * @param list<array<string, mixed>> $connections
+     *
      * @return array{verified: bool, connections: int, violations: list<string>}
      */
     private static function durability(array $connections): array
@@ -438,9 +496,9 @@ final class Stats
                     '%s:%s reported journal_mode=%s synchronous=%s file_backed=%s',
                     $connection['role'] ?? '?',
                     $connection['argument'] ?? '?',
-                    \var_export($connection['journal_mode'] ?? null, true),
-                    \var_export($connection['synchronous'] ?? null, true),
-                    \var_export($connection['file_backed'] ?? null, true),
+                    var_export($connection['journal_mode'] ?? null, true),
+                    var_export($connection['synchronous'] ?? null, true),
+                    var_export($connection['file_backed'] ?? null, true),
                 );
             }
         }
@@ -453,8 +511,9 @@ final class Stats
     }
 
     /**
-     * @param array<string, array<string, mixed>> $sends
+     * @param array<string, array<string, mixed>>       $sends
      * @param array<string, list<array<string, mixed>>> $deliveries
+     *
      * @return array<string, float|null>
      */
     private static function throughput(array $sends, array $deliveries): array
@@ -480,12 +539,12 @@ final class Stats
         }
 
         return [
-            'publish_seconds' => [] === $sendInvokes ? null : (\max($sendConfirms) - \min($sendInvokes)) / 1e9,
-            'publish_per_second' => [] === $sendInvokes ? null : self::rate(\count($sendInvokes), (\max($sendConfirms) - \min($sendInvokes)) / 1e9),
-            'handling_seconds' => [] === $handledWindows ? null : (\max(\array_map('max', $handledWindows)) - \min(\array_map('min', $handledWindows))) / 1e9,
+            'publish_seconds' => [] === $sendInvokes ? null : (max($sendConfirms) - min($sendInvokes)) / 1e9,
+            'publish_per_second' => [] === $sendInvokes ? null : self::rate(\count($sendInvokes), (max($sendConfirms) - min($sendInvokes)) / 1e9),
+            'handling_seconds' => [] === $handledWindows ? null : (max(array_map('max', $handledWindows)) - min(array_map('min', $handledWindows))) / 1e9,
             'handled_per_second' => [] === $handledWindows ? null : self::rate(
                 \count($handledWindows),
-                (\max(\array_map('max', $handledWindows)) - \min(\array_map('min', $handledWindows))) / 1e9,
+                (max(array_map('max', $handledWindows)) - min(array_map('min', $handledWindows))) / 1e9,
             ),
         ];
     }
@@ -493,58 +552,5 @@ final class Stats
     private static function rate(int $count, float $seconds): ?float
     {
         return $seconds > 0 ? $count / $seconds : null;
-    }
-
-    /**
-     * Nearest-rank percentiles over the observed samples. No interpolation, no smoothing.
-     *
-     * @param list<int|float> $values
-     * @return array{count: int, min: float|null, p50: float|null, p95: float|null, p99: float|null, max: float|null, mean: float|null, tail: string}
-     */
-    public static function percentiles(array $values): array
-    {
-        $values = \array_values(\array_map('floatval', $values));
-        \sort($values);
-
-        $count = \count($values);
-
-        if (0 === $count) {
-            return [
-                'count' => 0,
-                'min' => null,
-                'p50' => null,
-                'p95' => null,
-                'p99' => null,
-                'max' => null,
-                'mean' => null,
-                'tail' => 'inconclusive',
-            ];
-        }
-
-        return [
-            'count' => $count,
-            'min' => $values[0],
-            'p50' => self::percentile($values, 50.0),
-            'p95' => self::percentile($values, 95.0),
-            'p99' => self::percentile($values, 99.0),
-            'max' => $values[$count - 1],
-            'mean' => \array_sum($values) / $count,
-            'tail' => $count >= Config::MIN_TAIL_SAMPLES ? 'ok' : 'inconclusive',
-        ];
-    }
-
-    /**
-     * @param list<float> $sorted
-     */
-    public static function percentile(array $sorted, float $percentile): ?float
-    {
-        $count = \count($sorted);
-        if (0 === $count) {
-            return null;
-        }
-
-        $rank = (int) \ceil($percentile / 100 * $count);
-
-        return $sorted[\max(0, \min($count - 1, $rank - 1))];
     }
 }

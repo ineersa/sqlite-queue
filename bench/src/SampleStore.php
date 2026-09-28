@@ -14,12 +14,12 @@ namespace Ineersa\SqliteQueue\Bench;
 final class SampleStore
 {
     /** @var resource|null */
-    private $handle = null;
+    private $handle;
 
     public function __construct(private string $path)
     {
         $directory = \dirname($path);
-        if (!\is_dir($directory) && !\mkdir($directory, 0o700, true) && !\is_dir($directory)) {
+        if (!is_dir($directory) && !mkdir($directory, 0o700, true) && !is_dir($directory)) {
             throw new \RuntimeException(\sprintf('Cannot create the sample directory "%s".', $directory));
         }
     }
@@ -36,15 +36,15 @@ final class SampleStore
     {
         $handle = $this->handle();
 
-        $line = \json_encode($record, \JSON_THROW_ON_ERROR | \JSON_UNESCAPED_SLASHES | \JSON_PRESERVE_ZERO_FRACTION);
-        \fwrite($handle, $line . "\n");
-        \fflush($handle);
+        $line = json_encode($record, \JSON_THROW_ON_ERROR | \JSON_UNESCAPED_SLASHES | \JSON_PRESERVE_ZERO_FRACTION);
+        fwrite($handle, $line."\n");
+        fflush($handle);
     }
 
     public function close(): void
     {
         if (null !== $this->handle) {
-            \fclose($this->handle);
+            fclose($this->handle);
             $this->handle = null;
         }
     }
@@ -54,11 +54,11 @@ final class SampleStore
      */
     public static function read(string $path): array
     {
-        if (!\is_file($path)) {
+        if (!is_file($path)) {
             return ['records' => [], 'corrupt' => 0, 'missing' => true];
         }
 
-        $contents = \file_get_contents($path);
+        $contents = file_get_contents($path);
         if (false === $contents) {
             return ['records' => [], 'corrupt' => 0, 'missing' => true];
         }
@@ -66,15 +66,14 @@ final class SampleStore
         $records = [];
         $corrupt = 0;
 
-        foreach (\explode("\n", $contents) as $line) {
-            $line = \trim($line);
+        foreach (explode("\n", $contents) as $line) {
+            $line = trim($line);
             if ('' === $line) {
                 continue;
             }
 
             try {
-                /** @var mixed $decoded */
-                $decoded = \json_decode($line, true, 512, \JSON_THROW_ON_ERROR);
+                $decoded = json_decode($line, true, 512, \JSON_THROW_ON_ERROR);
             } catch (\JsonException) {
                 ++$corrupt;
 
@@ -99,7 +98,7 @@ final class SampleStore
     private function handle()
     {
         if (null === $this->handle) {
-            $handle = \fopen($this->path, 'ab');
+            $handle = fopen($this->path, 'ab');
             if (false === $handle) {
                 throw new \RuntimeException(\sprintf('Cannot open the sample file "%s".', $this->path));
             }

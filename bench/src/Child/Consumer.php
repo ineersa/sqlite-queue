@@ -28,10 +28,10 @@ final readonly class Consumer
             $this->session->recorder,
             $assignment->directory,
             $assignment->index,
-            $assignment->workload['name'] === 'roundtrip',
+            'roundtrip' === $assignment->workload['name'],
         );
         $bus = new MessageBus([
-            new HandleMessageMiddleware(new HandlersLocator([BenchMessage::class => [$receiver->enter(...)] ])),
+            new HandleMessageMiddleware(new HandlersLocator([BenchMessage::class => [$receiver->enter(...)]])),
         ]);
         $events = new EventDispatcher();
         $events->addListener(WorkerRunningEvent::class, function (WorkerRunningEvent $event) use ($receiver): void {

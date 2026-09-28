@@ -28,10 +28,10 @@ final class Publisher
         $assignment = $this->session->assignment;
         $workload = $assignment->workload;
 
-        if ($assignment->role === Role::Publisher) {
+        if (Role::Publisher === $assignment->role) {
             $count = $workload['publishers'][$assignment->index]['count'];
             for ($index = 0; $index < $count; ++$index) {
-                $queue = $workload['queues'][$index % count($workload['queues'])];
+                $queue = $workload['queues'][$index % \count($workload['queues'])];
                 $this->publish($queue, 0, true, $workload['pacing_us']);
             }
         } else {
@@ -66,7 +66,7 @@ final class Publisher
         $this->waitUntil($target);
         $position = $this->position++;
         $message = BenchMessage::generate(
-            $assignment->label() . '-' . $position,
+            $assignment->label().'-'.$position,
             $queue,
             Config::payloadSize($position),
         );
@@ -82,7 +82,7 @@ final class Publisher
             $transportId = $result->last(TransportMessageIdStamp::class)?->getId();
         } catch (\Throwable $exception) {
             $confirmedAt = hrtime(true);
-            $error = $exception::class . ': ' . $exception->getMessage();
+            $error = $exception::class.': '.$exception->getMessage();
             $this->failed = true;
         }
 
@@ -91,21 +91,21 @@ final class Publisher
             'msg' => $message->corrId,
             'queue' => $queue,
             'transport_id' => $transportId,
-            'ok' => $error === null,
+            'ok' => null === $error,
             'error' => $error,
             'size' => $message->size,
             'measured' => $measured,
             't_invoke_ns' => $invokedAt,
             't_confirm_ns' => $confirmedAt,
             'duration_ms' => ($confirmedAt - $invokedAt) / 1e6,
-            'schedule_lag_ms' => $pacing ? ($invokedAt - $target) / 1e6 : null,
+            'schedule_lag_ms' => 0 !== $pacing ? ($invokedAt - $target) / 1e6 : null,
             'requested_deadline_wall' => $invokedWall + $delay / 1000,
             'delay_ms' => $delay,
         ]);
 
-        if ($error === null && $assignment->workload['name'] === 'roundtrip') {
+        if (null === $error && 'roundtrip' === $assignment->workload['name']) {
             $remaining = $assignment->workload['timeout_s'] - (hrtime(true) - $this->session->startedAt) / 1e9;
-            $this->session->awaitFile($assignment->path('acks/' . $message->corrId), max(0.01, $remaining));
+            $this->session->awaitFile($assignment->path('acks/'.$message->corrId), max(0.01, $remaining));
         }
     }
 
