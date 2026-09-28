@@ -20,6 +20,8 @@ decisions and names the evidence still owed by later tasks.
 
 Task 02 is complete. The standalone Doctrine SQLite runner captured all 24 scheduled baseline repetitions, including 14 incomplete repetitions caused by lock failures. The [method](../../docs/benchmark-method.md) and [capture](../../docs/benchmark-baseline.md) retain failures, raw evidence, and comparison limits. No candidate has been measured. Task 08 still owes matched A/B runs and sufficient tail samples.
 
+Task 03 is complete. The [queue engine](../../docs/queue-engine.md) implements durable send, atomic receive, fenced settlement, visibility expiry, and persisted millisecond availability. File-backed tests cover concurrency, commit barriers, rollback, database-full failure, and persistence-worker death. Task 04 consumes this storage API; sockets and notifications are not implemented yet.
+
 ### Implementation task index
 
 Read this plan before the assigned task. The task files divide the work; they do not replace these contracts. All tasks start as TODO. Keep focused correctness proof with each implementation task rather than postponing it to Task 07.
@@ -28,7 +30,7 @@ Read this plan before the assigned task. The task files divide the work; they do
 | --- | --- | --- |
 | [01: setup and contracts](TASK-01-SETUP-AND-CONTRACTS.md) | Done. Dependency matrix, QA foundation, async-driver verification, required policy decisions | None |
 | [02: benchmark baseline](TASK-02-BENCHMARK-BASELINE.md) | Done. Package-local runner and recorded standard Messenger SQLite baseline, including failures | 01 |
-| [03: async SQLite queue](TASK-03-ASYNC-SQLITE-QUEUE.md) | Durable engine, atomic claims, receipts, persisted delayed availability | 01 |
+| [03: async SQLite queue](TASK-03-ASYNC-SQLITE-QUEUE.md) | Done. Durable engine, atomic claims, receipts, persisted delayed availability | 01 |
 | [04: broker and client](TASK-04-BROKER-AND-CLIENT.md) | Bounded sockets, foreground service, ownership and lifecycle | 03 |
 | [05: delayed wakeups](TASK-05-DELAYED-WAKEUPS.md) | Race-safe notifications, deadline scheduling, restart and cancellation | 04 |
 | [06: Messenger adapter](TASK-06-MESSENGER-ADAPTER.md) | Real worker integration, serializers, DelayStamp, retry/idle mapping | 05 |

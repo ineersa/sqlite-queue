@@ -2,11 +2,11 @@
 
 A reusable PHP queue broker backed by SQLite, with a Symfony Messenger transport adapter.
 
-This checkout holds the package setup, async-driver verification, and a standalone Doctrine SQLite benchmark baseline. The queue engine,
-broker, client, and Messenger adapter do not exist yet. See
+This checkout includes the async SQLite queue engine, driver verification, and a standalone Doctrine SQLite benchmark baseline.
+The broker, socket client, and Messenger adapter do not exist yet. See
 [docs/contracts.md](docs/contracts.md) for the settled package contracts and
 [docs/driver-verification.md](docs/driver-verification.md) for the measured driver behavior
-the later tasks depend on.
+the later tasks depend on. The [queue engine reference](docs/queue-engine.md) describes the storage API, schema, and receipt lifecycle.
 
 ## Requirements
 
@@ -38,7 +38,7 @@ See [AGENTS.md](AGENTS.md) for Castor commands, validation rules, and report pat
 | Area | State |
 | --- | --- |
 | Package setup, dependency matrix, driver verification | Done in Task 01 |
-| Queue engine and schema | Not started, Task 03 |
+| Queue engine and schema | Done in Task 03, including durable delayed availability |
 | Foreground `sqlite-queue broker` and PHP client | Not started, Task 04 |
 | Delayed wakeups | Not started, Task 05 |
 | Symfony Messenger adapter | Not started, Task 06 |
@@ -53,6 +53,7 @@ Runtime:
 | --- | --- | --- |
 | `fabpot/amphp-sqlite3` | `^1.0` | Async SQLite client. One process per connection. |
 | `revolt/event-loop` | `^1.0` | Event loop used by the driver and the future broker. |
+| `amphp/sync` | `^2.3` | Whole-operation mutex for queue storage. |
 
 Development:
 

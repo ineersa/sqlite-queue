@@ -8,6 +8,9 @@
          failOnWarning="true"
          beStrictAboutOutputDuringTests="true">
     <testsuites>
+        <testsuite name="queue">
+            <directory>tests/Queue</directory>
+        </testsuite>
         <testsuite name="driver">
             <directory>tests/Driver</directory>
         </testsuite>

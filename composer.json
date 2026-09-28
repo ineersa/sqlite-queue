@@ -6,6 +6,7 @@
     "require": {
         "php": "^8.5",
         "ext-sqlite3": "*",
+        "amphp/sync": "^2.3",
         "fabpot/amphp-sqlite3": "^1.0",
         "revolt/event-loop": "^1.0"
     },
