@@ -33,7 +33,7 @@ final class Command extends BaseCommand
         $this
             ->addOption('database', null, InputOption::VALUE_REQUIRED, 'Absolute path to the private queue database file.')
             ->addOption('endpoint', null, InputOption::VALUE_REQUIRED, 'Absolute path to the private Unix socket file.')
-            ->addOption('trace-file', null, InputOption::VALUE_REQUIRED, 'Optional regular file that receives non-payload shutdown lifecycle lines for support and tests; created if absent.')
+            ->addOption('trace-file', null, InputOption::VALUE_REQUIRED, 'Optional new regular file that receives non-payload shutdown lifecycle lines after cleanup; exclusive create only.')
             ->setHelp('Readiness, framing bounds, ownership, failure handling, and client recovery are documented in docs/broker-protocol.md.');
     }
 
@@ -42,6 +42,10 @@ final class Command extends BaseCommand
         $errors = $output instanceof ConsoleOutputInterface ? $output->getErrorOutput() : $output;
         $watchers = [];
         $trace = null;
+        /** @var list<array{event: string, pid: int, monotonic_ns: int}> */
+        $signalMilestones = [];
+        /** @var list<array{event: string, pid: int, monotonic_ns: int}> */
+        $brokerMilestones = [];
         try {
             $database = $input->getOption('database');
             $endpoint = $input->getOption('endpoint');
@@ -52,7 +56,6 @@ final class Command extends BaseCommand
             // The destination is validated and created before any broker resource is acquired, so an
             // unusable one fails the command clearly instead of silently dropping shutdown evidence.
             $trace = \is_string($traceFile) && '' !== $traceFile ? self::openTraceFile($traceFile) : null;
-            $diagnostic = null === $trace ? null : self::traceWriter($trace);
             if (!\function_exists('pcntl_signal') || !\function_exists('posix_geteuid')) {
                 throw new \RuntimeException('The broker requires the pcntl and posix extensions.');
             }
@@ -62,11 +65,16 @@ final class Command extends BaseCommand
             // not bind to DeferredCancellation::cancel(?Throwable).
             $shutdown = new DeferredCancellation();
             foreach ([\SIGINT, \SIGTERM] as $signal) {
-                $watchers[] = EventLoop::onSignal($signal, static function () use ($shutdown, $diagnostic): void {
-                    // Observation only: a broken tracer must never prevent cancel().
-                    self::observe($diagnostic, 'signal-dispatched');
+                $watchers[] = EventLoop::onSignal($signal, static function () use ($shutdown, &$signalMilestones): void {
+                    // Bound the trace to the first signal transition. Later signals keep cancel()
+                    // idempotent without appending unbounded duplicate milestones during cleanup.
+                    if ($shutdown->getCancellation()->isRequested()) {
+                        return;
+                    }
+                    // Memory only during the critical path. File I/O happens after broker cleanup.
+                    $signalMilestones[] = ['event' => 'signal-dispatched', 'pid' => (int) getmypid(), 'monotonic_ns' => (int) hrtime(true)];
                     $shutdown->cancel();
-                    self::observe($diagnostic, 'cancellation-requested');
+                    $signalMilestones[] = ['event' => 'cancellation-requested', 'pid' => (int) getmypid(), 'monotonic_ns' => (int) hrtime(true)];
                 });
             }
             $watchers[] = EventLoop::repeat(self::SIGNAL_DISPATCH_INTERVAL_SECONDS, static function (): void {
@@ -75,7 +83,9 @@ final class Command extends BaseCommand
             $broker = (new BrokerFactory($database, $endpoint, cancellation: $shutdown->getCancellation()))->listen();
             $code = $broker->run(function (array $event) use ($output): void {
                 $this->write($event, $output);
-            }, $shutdown->getCancellation(), $diagnostic);
+            }, $shutdown->getCancellation(), static function (array $event) use (&$brokerMilestones): void {
+                $brokerMilestones[] = $event;
+            });
             $this->write(['event' => 'stopped', 'exit_code' => $code], $output);
 
             return $code;
@@ -86,6 +96,13 @@ final class Command extends BaseCommand
         } finally {
             foreach ($watchers as $watcher) {
                 EventLoop::cancel($watcher);
+            }
+            // Flush after watcher cleanup even when run() throws the shared-budget cancellation.
+            // An empty file during a hang still no longer identifies the missing stage. Sorting by
+            // captured timestamps preserves chronology when storage failure starts shutdown before
+            // a later signal. Trace I/O can still delay process exit on a slow filesystem.
+            if (\is_resource($trace)) {
+                self::writeTrace($trace, self::orderedTraceEvents($signalMilestones, $brokerMilestones));
             }
             if (\is_resource($trace)) {
                 @fclose($trace);
@@ -100,64 +117,59 @@ final class Command extends BaseCommand
     }
 
     /**
-     * Builds the optional non-payload trace sink: one JSON line per shutdown milestone, carrying the
-     * process id and a monotonic timestamp, so a stalled shutdown can be ordered against its signal.
+     * Writes buffered shutdown milestones after broker cleanup. Failures are swallowed because the
+     * trace is an observation and must never undo completed shutdown work.
      *
-     * Writes are plain appends with no blocking lock: the broker must never wait on an external
-     * flock while shutting down. A write failure is swallowed, because the trace is an observation
-     * and must never arm the deadline, release the budget, or skip a cleanup step.
-     *
-     * @param resource $trace destination opened by {@see self::openTraceFile()}
-     *
-     * @return \Closure(array{event: string, pid: int, monotonic_ns: int}): void
+     * @param resource                                                $trace
+     * @param list<array{event: string, pid: int, monotonic_ns: int}> $events
      */
-    private static function traceWriter($trace): \Closure
+    private static function writeTrace($trace, array $events): void
     {
-        return static function (array $event) use ($trace): void {
+        foreach ($events as $event) {
             try {
                 $written = @fwrite($trace, json_encode($event, \JSON_THROW_ON_ERROR)."\n");
-                // Cross-process visibility for a wedged join, not crash durability.
                 if (false !== $written) {
                     @fflush($trace);
                 }
             } catch (\Throwable) {
             }
-        };
+        }
     }
 
     /**
-     * Best-effort lifecycle observation. Never throws into the signal or shutdown path.
+     * Merges signal and broker milestones by the timestamps captured when each event occurred.
      *
-     * @param (\Closure(array{event: string, pid: int, monotonic_ns: int}): void)|null $diagnostic
+     * @param list<array{event: string, pid: int, monotonic_ns: int}> $signalEvents
+     * @param list<array{event: string, pid: int, monotonic_ns: int}> $brokerEvents
+     *
+     * @return list<array{event: string, pid: int, monotonic_ns: int}>
      */
-    private static function observe(?\Closure $diagnostic, string $milestone): void
+    private static function orderedTraceEvents(array $signalEvents, array $brokerEvents): array
     {
-        if (null === $diagnostic) {
-            return;
-        }
-        try {
-            $diagnostic(['event' => $milestone, 'pid' => (int) getmypid(), 'monotonic_ns' => (int) hrtime(true)]);
-        } catch (\Throwable) {
-        }
+        $events = [...$signalEvents, ...$brokerEvents];
+        usort($events, static fn (array $left, array $right): int => $left['monotonic_ns'] <=> $right['monotonic_ns']);
+
+        return $events;
     }
 
     /**
-     * Validates and opens the optional trace destination as an empty append-only regular file.
+     * Validates and opens the optional trace destination as a new exclusive regular file.
      *
-     * Only a regular file is accepted. Opening a FIFO would block until a reader appears, and a
-     * device would consume the evidence instead of recording it. The file is created before the
-     * broker acquires anything, so its existence proves the destination was usable.
+     * Only a new regular file is accepted. An existing path is refused without modifying it.
+     * Opening a FIFO would block until a reader appears, and a device would consume the evidence
+     * instead of recording it. The file is created before the broker acquires anything, so its
+     * existence proves the destination was usable.
      *
      * @return resource
      */
     private static function openTraceFile(string $path)
     {
-        if (file_exists($path) && !is_file($path)) {
-            throw new \InvalidArgumentException('The trace file must be a writable regular file, not a '.var_export(@filetype($path), true).': '.$path);
+        if (file_exists($path)) {
+            throw new \InvalidArgumentException('The trace file must not already exist: '.$path);
         }
-        $trace = @fopen($path, 'ab');
+        $trace = @fopen($path, 'xb');
         if (false === $trace) {
-            throw new \RuntimeException('The trace file could not be created for append: '.$path);
+            throw new \RuntimeException('The trace file could not be created exclusively: '.$path);
         }
 
         return $trace;

@@ -261,9 +261,17 @@ final class BrokerProcessTest extends TestCase
         $fifo = $this->evidenceDirectory().'/refused-trace.fifo';
         @unlink($fifo);
         $this->assertTrue(posix_mkfifo($fifo, 0o600), 'The test needs a FIFO to prove it is refused rather than opened.');
+        $existing = $this->evidenceDirectory().'/existing-trace.log';
+        @unlink($existing);
+        $this->assertNotFalse(@file_put_contents($existing, "keep-me\n"), 'The test needs an existing regular file to prove exclusive create refuses it.');
         $before = ProcessTree::ownedBy(getmypid());
         try {
-            $destinations = ['device' => '/dev/null', 'fifo' => $fifo, 'directory' => $this->fixture->directory()];
+            $destinations = [
+                'device' => '/dev/null',
+                'fifo' => $fifo,
+                'directory' => $this->fixture->directory(),
+                'existing-file' => $existing,
+            ];
             foreach ($destinations as $kind => $destination) {
                 $database = $this->fixture->path();
                 $process = $this->spawn($database, $this->socket, $destination);
@@ -288,11 +296,13 @@ final class BrokerProcessTest extends TestCase
                 $this->assertFileDoesNotExist($this->socket, 'A rejected trace destination ('.$kind.') must fail before the endpoint binds.');
                 $this->assertSame([], glob($this->fixture->directory().'/*') ?: [], 'A rejected trace destination ('.$kind.') must not create broker files.');
             }
+            $this->assertSame("keep-me\n", (string) file_get_contents($existing), 'An existing regular file must be refused without modification.');
             $after = ProcessTree::ownedBy(getmypid());
             $this->assertSame([], array_values(array_diff($after['workers'], $before['workers'])), 'A rejected trace destination must not start a persistence worker.');
             $this->assertSame([], array_values(array_diff($after['launchers'], $before['launchers'])), 'A rejected trace destination must not start a worker launcher.');
         } finally {
             @unlink($fifo);
+            @unlink($existing);
         }
     }
 
@@ -334,7 +344,8 @@ final class BrokerProcessTest extends TestCase
         $trace = $this->tracePath();
         $broker = $this->startBroker($database, $this->socket, $trace);
         // Positive barrier for the trace wiring: the destination is created before the broker serves,
-        // so a wedged run leaves a readable file whose contents separate "no milestone" from "not opened".
+        // so a wedged run leaves a readable destination. An empty on-disk file no longer identifies
+        // the missing stage, because flushing is deferred until after cleanup.
         $this->assertFileExists($trace, 'The trace destination must exist before the broker serves.');
         $this->assertSame('', (string) file_get_contents($trace), 'A serving broker must record no shutdown milestone.');
         $owned = $this->trackOwned($broker->getPid());
@@ -356,9 +367,8 @@ final class BrokerProcessTest extends TestCase
         try {
             $exit = $broker->join(new TimeoutCancellation(15));
         } catch (CancelledException $error) {
-            // A join timeout still fails the test, but the broker, worker, and signal-mask
-            // states below distinguish a wedged shutdown from a lost shutdown signal, and the
-            // trace shows which shutdown edges the broker reached. Both files are retained here.
+            // A join timeout still fails the test, but the broker and worker state are retained.
+            // An empty on-disk trace no longer identifies the missing stage during a hang.
             $report = $this->captureWedgeEvidence($broker->getPid(), $worker, $trace);
             $this->fail('Shutdown wedged past its 15s budget; process evidence at '.$report.' and trace at '.$trace.': '.$error->getMessage());
         }
@@ -698,7 +708,9 @@ final class BrokerProcessTest extends TestCase
     /** Trace path for one P1 run; the file is retained only when the shutdown wedges. */
     private function tracePath(): string
     {
-        return $this->evidenceDirectory().'/trace-'.(int) getmypid().'-'.time().'.log';
+        static $sequence = 0;
+
+        return $this->evidenceDirectory().'/trace-'.(int) getmypid().'-'.hrtime(true).'-'.(++$sequence).'.log';
     }
 
     /** Private scratch directory for support evidence; created on demand. */

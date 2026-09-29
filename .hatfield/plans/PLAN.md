@@ -22,7 +22,7 @@ Task 02 is complete. The standalone Doctrine SQLite runner captured all 24 sched
 
 Task 03 is complete. The [queue engine](../../docs/queue-engine.md) implements durable send, atomic receive, fenced settlement, visibility expiry, and persisted millisecond availability. File-backed tests cover concurrency, commit barriers, rollback, database-full failure, and persistence-worker death.
 
-Task 04 is complete. The [foreground broker and PHP client](../../docs/broker.md) expose the engine over bounded Unix sockets. Tests cover malformed traffic, connection limits, slow readers, cancellation, ownership conflicts, restart, and persistence-child failure. The [protocol reference](../../docs/broker-protocol.md) defines limits and recovery. Notification waiting remains Task 05 work; no broker performance result is claimed.
+Task 04 is blocked. The [foreground broker and PHP client](../../docs/broker.md) expose the engine over bounded Unix sockets, and tests cover malformed traffic, connection limits, slow readers, cancellation, ownership conflicts, restart, and persistence-child failure. The [protocol reference](../../docs/broker-protocol.md) defines limits and recovery. Signal-driven shutdown proof remains unresolved, so Task 05 must not treat Task 04 as complete. Notification waiting remains Task 05 work; no broker performance result is claimed.
 
 ### Implementation task index
 
@@ -33,7 +33,7 @@ Read this plan before the assigned task. The task files divide the work; they do
 | [01: setup and contracts](TASK-01-SETUP-AND-CONTRACTS.md) | Done. Dependency matrix, QA foundation, async-driver verification, required policy decisions | None |
 | [02: benchmark baseline](TASK-02-BENCHMARK-BASELINE.md) | Done. Package-local runner and recorded standard Messenger SQLite baseline, including failures | 01 |
 | [03: async SQLite queue](TASK-03-ASYNC-SQLITE-QUEUE.md) | Done. Durable engine, atomic claims, receipts, persisted delayed availability | 01 |
-| [04: broker and client](TASK-04-BROKER-AND-CLIENT.md) | Done. Bounded sockets, foreground service, ownership and lifecycle | 03 |
+| [04: broker and client](TASK-04-BROKER-AND-CLIENT.md) | Blocked. Bounded sockets and foreground service are present; signal-driven shutdown proof is unresolved | 03 |
 | [05: delayed wakeups](TASK-05-DELAYED-WAKEUPS.md) | Race-safe notifications, deadline scheduling, restart and cancellation | 04 |
 | [06: Messenger adapter](TASK-06-MESSENGER-ADAPTER.md) | Real worker integration, serializers, DelayStamp, retry/idle mapping | 05 |
 | [07: failure and lifecycle proof](TASK-07-FAILURE-AND-LIFECYCLE-PROOF.md) | Remaining cross-component fault cases and independent safety review | 06 |

@@ -11,7 +11,6 @@ use Amp\Future;
 use Amp\Socket\ServerSocket;
 use Amp\Socket\Socket;
 use Amp\TimeoutCancellation;
-use Fabpot\Amp\Sqlite\SqliteConnection;
 use Ineersa\SqliteQueue\InvalidReceipt;
 use Ineersa\SqliteQueue\Protocol\ErrorCode;
 use Ineersa\SqliteQueue\Protocol\Frame;
@@ -43,14 +42,20 @@ final class Broker
     private readonly DeferredCancellation $deadline;
     /** Pending shutdown timer, or null before the first stop request and after the disarm. */
     private ?string $shutdownTimer = null;
-    /** Optional non-payload lifecycle observer. Null, the default, writes nothing at all. */
+    /**
+     * In-memory shutdown milestones with timestamps captured at the event. The optional observer
+     * is invoked only after cleanup and ownership release, so diagnostic I/O cannot block stop.
+     *
+     * @var list<array{event: string, pid: int, monotonic_ns: int}>
+     */
+    private array $milestones = [];
+    /** Optional non-payload lifecycle observer. Null, the default, receives nothing at all. */
     private ?\Closure $diagnostic = null;
 
     /** Fully acquired by BrokerFactory; a constructed broker is ready to serve. */
     public function __construct(
         private readonly ServerSocket $server,
         private readonly Queue $queue,
-        private readonly SqliteConnection $connection,
         private readonly Persistence $persistence,
         private readonly Ownership $ownership,
     ) {
@@ -71,8 +76,6 @@ final class Broker
         }
         $this->started = true;
         $this->diagnostic = $diagnostic;
-        // Record delivery before stop() so a wedged trace can separate cancel() from the stop path.
-        // Observation failures must never prevent stopping.
         $subscription = $cancellation?->subscribe(function (): void {
             $this->diagnose('cancellation-delivered');
             $this->stop();
@@ -155,6 +158,10 @@ final class Broker
             } catch (\Throwable $error) {
                 $failure ??= $error;
             }
+            // Flush only after cleanup and ownership release. A hung observer cannot delay stop,
+            // escalation, or resource release, and an empty on-disk file during a hang no longer
+            // identifies which in-memory stage was last reached.
+            $this->flushDiagnostics();
             if (null !== $failure) {
                 throw $failure;
             }
@@ -182,7 +189,7 @@ final class Broker
     /** Arms the single shutdown deadline; only the first stop request may reach this. */
     private function armShutdownDeadline(): void
     {
-        // The timer is installed before any observer runs, so an observation can never prevent arming.
+        // The timer is installed before any milestone is recorded, so recording cannot prevent arming.
         $this->shutdownTimer = EventLoop::delay(self::SHUTDOWN_BUDGET_SECONDS, function (): void {
             $this->failed = true;
             $this->diagnose('deadline-fired');
@@ -202,7 +209,8 @@ final class Broker
      * A force-stop failure must not escape into the event loop, and it must not leave the budget
      * unreleased either: the failure becomes the cancellation cause, so the awaiters resume with
      * the real reason instead of waiting for a deadline that already fired. Releasing the budget
-     * happens before the observation, so a broken observer cannot delay the awaiters.
+     * happens before the milestone is recorded, so recording cannot delay the awaiters. The
+     * optional observer still runs only after ownership release.
      *
      * @param DeferredCancellation $deadline  the single shutdown budget to release
      * @param \Closure(): void     $forceStop
@@ -233,14 +241,25 @@ final class Broker
     /** Reports one shutdown milestone to the optional observer; no payload, nothing when disabled. */
     private function diagnose(string $milestone): void
     {
+        // Memory only during shutdown. Flushing the optional observer happens after ownership release.
+        $this->milestones[] = ['event' => $milestone, 'pid' => (int) getmypid(), 'monotonic_ns' => (int) hrtime(true)];
+    }
+
+    /** Delivers buffered milestones after cleanup. Observer failures cannot undo completed work. */
+    private function flushDiagnostics(): void
+    {
         $observer = $this->diagnostic;
+        $events = $this->milestones;
+        $this->milestones = [];
+        $this->diagnostic = null;
         if (null === $observer) {
             return;
         }
-        try {
-            $observer(['event' => $milestone, 'pid' => (int) getmypid(), 'monotonic_ns' => (int) hrtime(true)]);
-        } catch (\Throwable) {
-            // Observation only: a failing observer must never arm, release, or skip cleanup.
+        foreach ($events as $event) {
+            try {
+                $observer($event);
+            } catch (\Throwable) {
+            }
         }
     }
 
@@ -249,9 +268,7 @@ final class Broker
     {
         return [
             $this->queue->close(...),
-            $this->connection->close(...),
-            // The engine and the driver close through the same connection, so the persistence
-            // pipes are observed with the shared budget as well.
+            // Queue owns the SQLite connection. Persistence remains the independent force-stop path.
             function () use ($budget): void {
                 $this->persistence->close($budget);
             },
@@ -324,9 +341,8 @@ final class Broker
                         return;
                     } catch (\Throwable) {
                         $this->failed = true;
-                        $this->writeError($socket, $expected, ErrorCode::InternalStorageFailure);
-                        // Same shutdown entry as every other path, so exactly one place arms the
-                        // shared deadline. The reply above is flushed before stop() closes sockets.
+                        // Prefer stopping over a potentially five-second error write. The protocol
+                        // already allows storage failure to close sockets before an error reply.
                         $this->stop();
 
                         return;

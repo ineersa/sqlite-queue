@@ -138,13 +138,12 @@ final class Client
         }
         $id = $this->nextId;
         // Local encoding never consumes the sequence. An oversize payload throws ProtocolException
-        // with the connection usable; unencodable control throws JsonException, which closes the
-        // client because the request can never be framed.
+        // with the connection usable. Unencodable control is also a local validation failure:
+        // nothing was written, so the client and request id stay intact.
         try {
             $bytes = (new Frame(['v' => Frame::VERSION, 'id' => $id, 'op' => $operation->value] + $params, $body, $headers))->encode();
         } catch (\JsonException $error) {
-            $this->close();
-            throw new TransportException('Broker confirmation unavailable; outcome may be unknown. Client is closed.', previous: $error);
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Request control is not valid UTF-8 JSON.');
         }
         ++$this->nextId;
         $deadline = new TimeoutCancellation($this->timeout);

@@ -70,6 +70,9 @@ final class BrokerFactory
             $release[] = $connection->close(...);
             // Queue closes the transferred connection when its own initialization fails.
             $queue = new Queue($connection, $this->visibilityTimeout, $this->clock);
+            // After Queue construction succeeds, it owns the connection. Replace the direct
+            // connection close with Queue::close so a later startup failure does not close twice.
+            array_pop($release);
             $release[] = $queue->close(...);
             $mask = umask(0077);
             try {
@@ -80,7 +83,7 @@ final class BrokerFactory
             $release[] = $server->close(...);
             $ownership->recordSocket();
 
-            return new Broker($server, $queue, $connection, $persistence, $ownership);
+            return new Broker($server, $queue, $persistence, $ownership);
         } catch (\Throwable $error) {
             // Kill any spawned child before graceful releases: connect() may fail after the
             // connector starts the worker but before the handle is assigned, and a wedged

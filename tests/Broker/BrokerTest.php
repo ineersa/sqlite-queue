@@ -460,15 +460,17 @@ final class BrokerTest extends TestCase
             $future = $this->brokerFuture ?? throw new \LogicException('Missing broker future.');
             $broker->stop();
 
-            // stop() is synchronous and the serving loop is suspended in accept(), so both events
-            // can only come from stop() itself: the deadline is armed before any cleanup step runs.
-            $this->assertSame(['shutdown-requested', 'deadline-armed'], array_column($events, 'event'));
+            // Observer flush is deferred until after ownership release. In-memory milestones and the
+            // armed timer prove stop() recorded and armed before cleanup finishes.
+            $this->assertSame([], $events, 'Diagnostic observers must not run before cleanup finishes.');
+            $this->assertSame(['shutdown-requested', 'deadline-armed'], $this->recordedMilestones($broker));
+            $this->assertNotNull($this->shutdownTimerId($broker), 'The first stop request must arm the deadline before cleanup.');
             $this->assertFalse($future->isComplete(), 'The serving loop must still be suspended when the deadline is armed.');
-            $this->assertSame((int) getmypid(), $events[0]['pid']);
-            $this->assertLessThanOrEqual($events[1]['monotonic_ns'], $events[0]['monotonic_ns']);
 
             $this->assertSame(0, $future->await(new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS)));
             $this->assertSame(['shutdown-requested', 'deadline-armed'], array_column($events, 'event'), 'A shutdown inside the budget must disarm the deadline before it fires.');
+            $this->assertSame((int) getmypid(), $events[0]['pid']);
+            $this->assertLessThanOrEqual($events[1]['monotonic_ns'], $events[0]['monotonic_ns']);
             $this->assertFileDoesNotExist($this->endpoint);
         });
     }
@@ -488,7 +490,8 @@ final class BrokerTest extends TestCase
             $broker->stop();
             $broker->stop();
 
-            $this->assertSame(['shutdown-requested', 'deadline-armed'], array_column($events, 'event'));
+            $this->assertSame([], $events, 'Diagnostic observers must wait until after cleanup.');
+            $this->assertSame(['shutdown-requested', 'deadline-armed'], $this->recordedMilestones($broker));
             $this->assertSame(0, $future->await(new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS)));
             // The finally calls stop() again: still one request and one arm.
             $this->assertSame(['shutdown-requested', 'deadline-armed'], array_column($events, 'event'));
@@ -536,10 +539,64 @@ final class BrokerTest extends TestCase
             $future = $this->brokerFuture ?? throw new \LogicException('Missing broker future.');
             $broker->stop();
 
-            $this->assertSame(2, $calls, 'A failing observer must still be notified for both shutdown milestones.');
+            $this->assertSame(0, $calls, 'A failing observer must not run before cleanup finishes.');
             $this->assertSame(0, $future->await(new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS)));
+            $this->assertSame(2, $calls, 'A failing observer must still be notified for both shutdown milestones after cleanup.');
             $this->assertFileDoesNotExist($this->endpoint);
         });
+    }
+
+    /**
+     * Storage failure must stop the service under the shared budget instead of spending a separate
+     * five-second write attempting to deliver internal_storage_failure.
+     */
+    public function testStorageFailureStopsWithoutAPreBudgetErrorWrite(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker();
+            $broker = $this->broker ?? throw new \LogicException('Missing test broker.');
+            $future = $this->brokerFuture ?? throw new \LogicException('Missing broker future.');
+            $client = $this->connectClient(1.0);
+
+            $queue = (new \ReflectionProperty(Broker::class, 'queue'))->getValue($broker);
+            $this->assertInstanceOf(\Ineersa\SqliteQueue\Queue::class, $queue);
+            $connection = (new \ReflectionProperty(\Ineersa\SqliteQueue\Queue::class, 'connection'))->getValue($queue);
+            $this->assertInstanceOf(\Fabpot\Amp\Sqlite\SqliteConnection::class, $connection);
+            $connection->close();
+
+            $started = microtime(true);
+            try {
+                $client->send('jobs', 'must fail after storage death');
+                $this->fail('A closed storage connection must fail the client exchange.');
+            } catch (TransportException) {
+            }
+            $exit = $future->await(new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS));
+            $elapsed = microtime(true) - $started;
+
+            $this->assertSame(1, $exit, 'Storage failure must fail the broker process.');
+            $this->assertLessThan(3.0, $elapsed, 'Shutdown must not spend a separate five-second error write before arming the budget.');
+            $this->assertFileDoesNotExist($this->endpoint, 'Storage failure must release the endpoint.');
+            // tearDown asserts a clean exit; this case already consumed the failed future.
+            $this->broker = null;
+            $this->brokerFuture = null;
+        });
+    }
+
+    /** @return list<string> */
+    private function recordedMilestones(Broker $broker): array
+    {
+        $events = (new \ReflectionProperty(Broker::class, 'milestones'))->getValue($broker);
+        $this->assertIsArray($events);
+
+        return array_column($events, 'event');
+    }
+
+    private function shutdownTimerId(Broker $broker): ?string
+    {
+        $timer = (new \ReflectionProperty(Broker::class, 'shutdownTimer'))->getValue($broker);
+        $this->assertTrue(null === $timer || \is_string($timer));
+
+        return $timer;
     }
 
     private function connectClient(float $timeout = 10): Client

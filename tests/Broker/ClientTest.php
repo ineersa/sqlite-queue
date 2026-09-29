@@ -194,14 +194,15 @@ final class ClientTest extends TestCase
         $this->assertSame([1], $seen, 'The failed send must not consume a sequence id.');
     }
 
-    public function testUnencodableControlClosesClientWithoutSending(): void
+    public function testUnencodableControlFailsLocallyWithoutSendingOrClosing(): void
     {
-        $seen = 0;
+        $seen = [];
         $endpoint = $this->serve(static function (Socket $socket) use (&$seen): void {
             Frame::read($socket, new TimeoutCancellation(3));
             $socket->write(self::helloReply());
-            while (null !== Frame::read($socket, new TimeoutCancellation(3))) {
-                ++$seen;
+            while (null !== ($request = Frame::read($socket, new TimeoutCancellation(3)))) {
+                $seen[] = $request->control['id'] ?? null;
+                $socket->write((new Frame(['v' => Frame::VERSION, 'id' => $request->control['id'], 'ok' => true, 'result' => 17]))->encode());
             }
         });
         $client = Client::connect($endpoint);
@@ -209,17 +210,11 @@ final class ClientTest extends TestCase
         try {
             $client->send("bad\xffqueue", 'payload');
             $this->fail('Unencodable control must fail before it is sent.');
-        } catch (TransportException $error) {
-            $this->assertStringContainsString('outcome may be unknown', $error->getMessage());
+        } catch (ProtocolException $error) {
+            $this->assertSame(ErrorCode::InvalidRequest, $error->errorCode);
         }
-        $this->awaitBackground();
-        $this->assertSame(0, $seen, 'No operation bytes may reach the broker.');
-        try {
-            $client->send('jobs', 'payload');
-            $this->fail('An invalidated client must reject further calls.');
-        } catch (TransportException $error) {
-            $this->assertStringContainsString('Client is closed', $error->getMessage());
-        }
+        $this->assertSame(17, $client->send('jobs', 'payload'));
+        $this->assertSame([1], $seen, 'The rejected request must not be sent or consume a sequence id.');
     }
 
     #[DataProvider('malformedReplies')]
