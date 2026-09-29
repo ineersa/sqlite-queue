@@ -16,7 +16,7 @@ $database = $argv[1] ?? '';
 $endpoint = $argv[2] ?? '';
 
 try {
-    (new BrokerFactory($database, $endpoint))->listen();
+    (new BrokerFactory($database, $endpoint))->create();
     $report = ['outcome' => 'served'];
 } catch (Throwable $error) {
     $report = ['outcome' => 'threw', 'class' => $error::class, 'message' => $error->getMessage()];

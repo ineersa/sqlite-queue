@@ -11,7 +11,7 @@ use Amp\Sync\Channel;
  *
  * The first argument names the environment variable the caller set, and the second names an ini
  * directive the caller configured, so both assertions stay tied to the caller's own values. The
- * child exits immediately: PersistenceFactoryTest joins it to prove a clean exit.
+ * child exits immediately: SqliteWorkerContextFactoryTest joins it to prove a clean exit.
  */
 return static function (Channel $channel) use ($argv): null {
     $marker = $argv[1] ?? '';

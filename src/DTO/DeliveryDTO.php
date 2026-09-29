@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace Ineersa\SqliteQueue;
+namespace Ineersa\SqliteQueue\DTO;
 
-final readonly class Delivery
+final readonly class DeliveryDTO
 {
     public function __construct(
         public int $id,

@@ -6,7 +6,6 @@ namespace Ineersa\SqliteQueue\Protocol;
 
 use Amp\Cancellation;
 use Amp\Socket\Socket;
-use Ineersa\SqliteQueue\ProtocolException;
 
 final readonly class Frame
 {
@@ -27,7 +26,10 @@ final readonly class Frame
         if ($bodyLength + $headersLength > Limits::MAX_PAYLOAD) {
             throw new ProtocolException(ErrorCode::FrameTooLarge, 'Message exceeds the payload limit.');
         }
-        $control = json_encode(array_replace($this->control, ['body_length' => $bodyLength, 'headers_length' => $headersLength]), \JSON_THROW_ON_ERROR);
+        $control = json_encode(array_replace($this->control, [
+            ControlField::BodyLength->value => $bodyLength,
+            ControlField::HeadersLength->value => $headersLength,
+        ]), \JSON_THROW_ON_ERROR);
         $controlLength = \strlen($control);
         $length = Limits::CONTROL_LENGTH_BYTES + $controlLength + $bodyLength + $headersLength;
         if ($controlLength > Limits::MAX_CONTROL || $length > Limits::MAX_FRAME) {
@@ -57,11 +59,15 @@ final readonly class Frame
         } catch (\JsonException) {
             throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid control JSON.');
         }
-        if (!\is_array($control) || !\is_int($control['body_length'] ?? null) || !\is_int($control['headers_length'] ?? null)) {
+        if (
+            !\is_array($control)
+            || !\is_int($control[ControlField::BodyLength->value] ?? null)
+            || !\is_int($control[ControlField::HeadersLength->value] ?? null)
+        ) {
             throw new ProtocolException(ErrorCode::InvalidRequest, 'Missing payload lengths.');
         }
-        $bodyLength = $control['body_length'];
-        $headersLength = $control['headers_length'];
+        $bodyLength = $control[ControlField::BodyLength->value];
+        $headersLength = $control[ControlField::HeadersLength->value];
         if (!self::isPayloadLengths($bodyLength, $headersLength, $length, $controlLength)) {
             throw new ProtocolException(ErrorCode::InvalidRequest, 'Payload lengths do not match frame.');
         }

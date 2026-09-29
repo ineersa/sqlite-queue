@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace Ineersa\SqliteQueue;
+namespace Ineersa\SqliteQueue\Exception;
 
 /** The receipt is expired, unknown, or belongs to another session or engine epoch. */
-final class InvalidReceipt extends \RuntimeException
+final class InvalidReceiptException extends \RuntimeException
 {
 }

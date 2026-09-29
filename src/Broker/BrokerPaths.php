@@ -10,7 +10,7 @@ use Symfony\Component\Filesystem\Path;
  * Canonical broker file locations.
  *
  * Parsing only checks path preconditions: absolute locations under directories that exist,
- * belong to the effective user, and are private. Lock acquisition stays in Ownership so a
+ * belong to the effective user, and are private. Lock acquisition stays in BrokerLifetimeLocks so a
  * second broker racing the same paths still conflicts on the lock instead of the check.
  */
 final readonly class BrokerPaths

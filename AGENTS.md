@@ -18,6 +18,9 @@ Apply these rules throughout the repository, including implementation, tooling, 
 - Replace magic numbers and domain strings with descriptive constants, enums, or value objects. Name units and explain protocol limits. Ordinary arithmetic identities and literal wire-field names at the boundary do not need artificial wrappers.
 - Use explicit PHP types and the supported PHP 8.5 features where they express the model more accurately. Prefer immutable value objects. Do not substitute PHPDoc for available native types.
 - Split compound validation into readable checks with specific failures. Test each validation rule independently.
+- Name exception classes with the `Exception` suffix and place them in their component namespace or `Exception`, never in the package root. Put data-transfer objects in `DTO` with the `DTO` suffix.
+- Separate queue policy from SQL, transactions, and connection ownership. Keep client-session lifetime in the broker and file cleanup outside lifetime-lock components. Validate queue names when constructing `QueueName`.
+- Make correctness tests deterministic. Use controlled clocks, barriers, observable state, and explicit cancellation instead of elapsed-time thresholds or sleeps as proof. Safety timeouts may abort hung tests; performance measurements belong in benchmarks.
 - Use existing Symfony and Amp facilities instead of custom substitutes. Do not copy dependency internals, such as lock filename algorithms.
 - Review new and modified code against these rules before submission. Passing QA does not replace this review.
 

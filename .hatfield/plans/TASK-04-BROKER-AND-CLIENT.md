@@ -1,6 +1,6 @@
 # Task 04: foreground broker, socket protocol, and PHP client
 
-Status: BLOCKED — implementation present, signal-driven shutdown proof unresolved; notification waiting remains Task 05
+Status: DONE for the approved SIGTERM and SIGKILL scope. Notification waiting remains Task 05.
 Repository: `/home/ineersa/projects/sqlite-queue`
 Dependencies: [Task 03](TASK-03-ASYNC-SQLITE-QUEUE.md)
 Read first: [PLAN.md](PLAN.md), sections 3, 5–7, and 10–11.
@@ -35,7 +35,7 @@ Notification waiting is completed in Task 05. This intermediate immediate-receiv
 - [x] Malformed, truncated, oversized, or unsupported traffic fails explicitly with bounded memory use.
 - [x] Slow or disconnected clients cannot hold a database transaction or block unrelated socket progress through unbounded output.
 - [x] Lost confirmation and reconnect follow the approved contract, without treating unknown outcome as known failure.
-- [ ] Normal shutdown, cancellation, partial startup, and persistence-child failure clean up the complete owned tree while preserving the database.
+- [x] Normal SIGTERM shutdown, cancellation, partial startup, and SIGKILL persistence-child failure clean up the owned tree while preserving the database. Deliberately SIGSTOPped-worker shutdown is excluded by explicit scope decision.
 - [x] Default logs contain no message payloads, serialized envelopes, or credentials.
 
 ## Validation and handoff
@@ -57,7 +57,7 @@ Document protocol versioning/errors, operational bounds, startup/stop behavior, 
 
 ## Review follow-up (PR #4, after the record above)
 
-The counts in the completion record above describe the Task 04 implementation at review time. They are historical, not current. The follow-up below changed the implementation again.
+The following record describes earlier PR #4 revisions, not the current implementation. Names, trace support, and the release blocker recorded here are superseded by the post-merge decisions below.
 
 - `BrokerFactory::listen()` acquires the required resources and constructs a ready-to-run `Broker`. Startup failures release acquired steps in reverse order. `Persistence` holds a required `ProcessContext`, and `PersistenceFactory` tracks the handles it creates. `Ownership` permits a null socket identity before binding and after close, when there is no owned socket to remove.
 - Shutdown runs under a five-second total watchdog that kills the owned persistence child directly through its process context. A repeated graceful connection close cannot interrupt a wedged worker, because the driver marks its connection closed before that close returns. The driver alone joins the context. A live regression test stops the idle worker, stops the broker, and proves bounded exit, released ownership, and restart recovery. The test fails before the fix and passes after it.
@@ -76,3 +76,11 @@ The counts in the completion record above describe the Task 04 implementation at
 - Shutdown milestones are recorded in memory at `signal-dispatched`, `cancellation-requested`, `cancellation-delivered`, `shutdown-requested`, `deadline-armed`, `deadline-fired`, and `persistence-force-stop`, with the process id and a monotonic timestamp captured at the event. Optional observers and the CLI `--trace-file` sink are flushed only after broker cleanup and ownership release, so diagnostic I/O cannot block cancel, stop, arming, escalation, or resource release. The CLI cancels its signal and repeat watchers before writing, bounds the signal buffer to the first cancellation transition, and sorts merged milestones by captured timestamps. The optional write can still delay process exit on a slow filesystem. `--trace-file=PATH` requires a new exclusive regular file created before acquisition; an existing path is refused without modification, and a FIFO, device, or unwritable destination fails startup. An empty on-disk file during a hang no longer identifies the missing stage, because flushing is deferred. Deterministic tests cover deferred flush, arming before cleanup, repeated stop not re-arming, escalation releasing the budget when the force-stop throws, a failing observer after cleanup, and a rejected existing or non-regular destination that fails before the database or endpoint exists. SIGTERM handler identity is recorded only by a test fixture, not by production code.
 - Queue owns the SQLite connection. `Broker` no longer stores or closes that connection directly; `Persistence` remains the independent force-stop capability. Fatal storage failure stops the service without a pre-budget `internal_storage_failure` write.
 - The intermittent SIGTERM hang remains unresolved and keeps Task 04 blocked. Earlier empty-trace captures cannot be read as a missing stage after deferred flush. Do not treat Task 05's Task 04 dependency as satisfied.
+
+## Post-merge decisions and responsibility refactor
+
+PR #4 merged at `70bc6cf`. The user removed `testStoppedPersistenceWorkerCannotWedgeShutdown` from the required release scope. Its historical failure is not a remaining Task 04 gate, and removing the test does not establish a root cause or fix. Normal SIGTERM shutdown and SIGKILL failure/recovery coverage remain.
+
+The [responsibility refactor](TASK-04-RESPONSIBILITY-REFACTOR.md) implements the subsequent whiteboard decisions. `Queue` owns message policy, `SqliteQueueStorage` owns SQL and the connection, and `Broker` owns session lifetime. `BrokerLifetimeLocks` manages locks only. The factory and runtime manage files and identity-checked socket removal. Exceptions and the delivery DTO use their agreed namespaces and names.
+
+Production trace support and the unused `internal_storage_failure` code are removed. Tests use barriers, controlled cancellation, and state assertions instead of elapsed-time correctness thresholds. Full Castor QA passes with 190 tests and 1,047 assertions. Task 05's dependency is now satisfied; this does not implement Task 05 or claim benchmark acceptance.

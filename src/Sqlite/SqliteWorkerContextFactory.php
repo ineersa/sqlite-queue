@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Ineersa\SqliteQueue\Broker;
+namespace Ineersa\SqliteQueue\Sqlite;
 
 use Amp\Cancellation;
 use Amp\DeferredCancellation;
@@ -13,15 +13,21 @@ use Amp\Parallel\Context\ProcessContextFactory;
 use function Amp\async;
 
 /**
- * Starts the driver's persistence child and keeps its observable handle.
+ * Starts the vendor SQLite worker and retains a handle to that same process.
  *
- * The SQLite connector owns when start() runs; persistence() exposes the single
- * handle it created. Observe the existing driver's process, never replace its
- * worker implementation.
+ * Vendor SqliteConnector calls this ContextFactory. The factory delegates to Amp's
+ * ProcessContextFactory and keeps SqliteWorkerHandle for the identical worker the driver
+ * starts. The driver alone joins that context; the handle supplies independent observation
+ * and termination because the locked driver's idle graceful close has no timeout, marks the
+ * connection closed before awaiting, and cannot be interrupted by repeating close().
+ * Temporary integration workaround until the driver offers a bounded close/abort API; not a
+ * replacement SQL driver.
+ *
+ * The connector owns when start() runs; worker() exposes the single handle it created.
  */
-final class PersistenceFactory implements ContextFactory
+final class SqliteWorkerContextFactory implements ContextFactory
 {
-    /** @var list<Persistence> */
+    /** @var list<SqliteWorkerHandle> */
     private array $created = [];
 
     /**
@@ -47,23 +53,23 @@ final class PersistenceFactory implements ContextFactory
         // event loop referenced forever when the pipes never reach EOF.
         $drainCancellation = new DeferredCancellation();
         $drains = [];
-        // Drain without logging: persistence diagnostics may contain SQL or data.
+        // Drain without logging: worker diagnostics may contain SQL or data.
         foreach ([$context->getStdout(), $context->getStderr()] as $stream) {
             $drains[] = async(static function () use ($stream, $drainCancellation): void {
                 while (null !== $stream->read($drainCancellation->getCancellation())) {
                 }
             });
         }
-        $this->created[] = new Persistence($context, $drains, $drainCancellation);
+        $this->created[] = new SqliteWorkerHandle($context, $drains, $drainCancellation);
 
         return $context;
     }
 
-    public function persistence(): Persistence
+    public function worker(): SqliteWorkerHandle
     {
-        // The connector starts exactly one persistence child per connection.
+        // The connector starts exactly one SQLite worker per connection.
         if (1 !== \count($this->created)) {
-            throw new \LogicException('The connector must start exactly one persistence child per connection.');
+            throw new \LogicException('The connector must start exactly one SQLite worker per connection.');
         }
 
         return $this->created[0];
@@ -72,7 +78,7 @@ final class PersistenceFactory implements ContextFactory
     /**
      * Every handle the connector has started through this factory, oldest first.
      *
-     * @return list<Persistence>
+     * @return list<SqliteWorkerHandle>
      */
     public function created(): array
     {
@@ -89,9 +95,9 @@ final class PersistenceFactory implements ContextFactory
     public function forceStopAll(): void
     {
         $failure = null;
-        foreach ($this->created as $persistence) {
+        foreach ($this->created as $worker) {
             try {
-                $persistence->forceStop();
+                $worker->forceStop();
             } catch (\Throwable $error) {
                 $failure ??= $error;
             }

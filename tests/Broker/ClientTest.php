@@ -11,10 +11,12 @@ use Amp\Socket\ServerSocket;
 use Amp\Socket\Socket;
 use Amp\TimeoutCancellation;
 use Ineersa\SqliteQueue\Client;
+use Ineersa\SqliteQueue\Exception\InvalidReceiptException;
+use Ineersa\SqliteQueue\Exception\TransportException;
 use Ineersa\SqliteQueue\Protocol\ErrorCode;
 use Ineersa\SqliteQueue\Protocol\Frame;
-use Ineersa\SqliteQueue\ProtocolException;
-use Ineersa\SqliteQueue\TransportException;
+use Ineersa\SqliteQueue\Protocol\Operation;
+use Ineersa\SqliteQueue\Protocol\ProtocolException;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -150,25 +152,26 @@ final class ClientTest extends TestCase
         }
     }
 
-    /** @return iterable<string, array{string}> */
+    /** @return iterable<string, array{string, string}> */
     public static function malformedReplies(): iterable
     {
-        yield 'uncorrelated id' => [(new Frame(['v' => 1, 'id' => 7, 'ok' => true, 'result' => 1]))->encode()];
-        yield 'missing confirmation flag' => [(new Frame(['v' => 1, 'id' => 1, 'result' => 1]))->encode()];
-        yield 'missing result' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true]))->encode()];
-        yield 'unsupported version' => [(new Frame(['v' => 2, 'id' => 1, 'ok' => true, 'result' => 1]))->encode()];
-        yield 'hand crafted control' => [pack('NN', 6, 2).'{}'];
-        yield 'unknown error code' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => false, 'error' => ['code' => 'nope']]))->encode()];
-        yield 'missing error' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => false]))->encode()];
-        yield 'failure with body' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => false, 'error' => ['code' => 'stale_receipt']], 'b'))->encode()];
-        yield 'failure with result' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => false, 'result' => null, 'error' => ['code' => 'stale_receipt']]))->encode()];
-        yield 'sent id zero' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true, 'result' => 0]))->encode()];
-        yield 'sent id string' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true, 'result' => '7']))->encode()];
-        yield 'sent with body' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true, 'result' => 7], 'b'))->encode()];
-        yield 'delivery wrong queue' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true, 'result' => ['id' => 7, 'queue' => 'other', 'receipt' => 'r', 'available_at' => 1, 'reserved_until' => 2]]))->encode()];
-        yield 'delivery id zero' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true, 'result' => ['id' => 0, 'queue' => 'jobs', 'receipt' => 'r', 'available_at' => 1, 'reserved_until' => 2]]))->encode()];
-        yield 'delivery integer receipt' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true, 'result' => ['id' => 7, 'queue' => 'jobs', 'receipt' => 5, 'available_at' => 1, 'reserved_until' => 2]]))->encode()];
-        yield 'delivery string available_at' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true, 'result' => ['id' => 7, 'queue' => 'jobs', 'receipt' => 'r', 'available_at' => '1', 'reserved_until' => 2]]))->encode()];
+        yield 'uncorrelated id' => [(new Frame(['v' => 1, 'id' => 7, 'ok' => true, 'result' => 1]))->encode(), 'Response id must equal the outstanding request id.'];
+        yield 'missing confirmation flag' => [(new Frame(['v' => 1, 'id' => 1, 'result' => 1]))->encode(), 'Response ok must be a boolean.'];
+        yield 'missing result' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true]))->encode(), 'Successful response must include result.'];
+        yield 'unsupported version' => [(new Frame(['v' => 2, 'id' => 1, 'ok' => true, 'result' => 1]))->encode(), 'Response v must equal protocol version 1.'];
+        yield 'hand crafted control' => [pack('NN', 6, 2).'{}', 'Missing payload lengths.'];
+        yield 'unknown error code' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => false, 'error' => ['code' => 'nope']]))->encode(), 'Failure response error.code is not a known protocol error.'];
+        yield 'removed internal storage failure' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => false, 'error' => ['code' => 'internal_storage_failure']]))->encode(), 'Failure response error.code is not a known protocol error.'];
+        yield 'missing error' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => false]))->encode(), 'Failure response must include an error object.'];
+        yield 'failure with body' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => false, 'error' => ['code' => 'stale_receipt']], 'b'))->encode(), 'Failure response must not include a payload.'];
+        yield 'failure with result' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => false, 'result' => null, 'error' => ['code' => 'stale_receipt']]))->encode(), 'Failure response must not include result.'];
+        yield 'sent id zero' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true, 'result' => 0]))->encode(), 'SEND result must be a positive integer.'];
+        yield 'sent id string' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true, 'result' => '7']))->encode(), 'SEND result must be an integer.'];
+        yield 'sent with body' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true, 'result' => 7], 'b'))->encode(), 'SEND must not include a payload.'];
+        yield 'delivery wrong queue' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true, 'result' => ['id' => 7, 'queue' => 'other', 'receipt' => 'r', 'available_at' => 1, 'reserved_until' => 2]]))->encode(), 'RECEIVE result.queue must equal the requested queue.'];
+        yield 'delivery id zero' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true, 'result' => ['id' => 0, 'queue' => 'jobs', 'receipt' => 'r', 'available_at' => 1, 'reserved_until' => 2]]))->encode(), 'RECEIVE result.id must be a positive integer.'];
+        yield 'delivery integer receipt' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true, 'result' => ['id' => 7, 'queue' => 'jobs', 'receipt' => 5, 'available_at' => 1, 'reserved_until' => 2]]))->encode(), 'RECEIVE result.receipt must be a string.'];
+        yield 'delivery string available_at' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true, 'result' => ['id' => 7, 'queue' => 'jobs', 'receipt' => 'r', 'available_at' => '1', 'reserved_until' => 2]]))->encode(), 'RECEIVE result.available_at must be an integer.'];
     }
 
     public function testOversizePayloadFailsLocallyWithoutConsumingTheSequence(): void
@@ -218,7 +221,7 @@ final class ClientTest extends TestCase
     }
 
     #[DataProvider('malformedReplies')]
-    public function testMalformedOrUncorrelatedReplyInvalidatesClient(string $reply): void
+    public function testMalformedOrUncorrelatedReplyInvalidatesClient(string $reply, string $reason): void
     {
         $endpoint = $this->serve(static function (Socket $socket) use ($reply): void {
             Frame::read($socket, new TimeoutCancellation(3));
@@ -229,11 +232,17 @@ final class ClientTest extends TestCase
         });
         $client = Client::connect($endpoint);
         $this->clients[] = $client;
+        $operation = str_starts_with($reason, 'RECEIVE') ? 'receive' : 'send';
         try {
-            $client->send('jobs', 'payload');
+            if ('receive' === $operation) {
+                $client->receive('jobs');
+            } else {
+                $client->send('jobs', 'payload');
+            }
             $this->fail('A malformed reply must not be accepted as confirmation.');
-        } catch (TransportException $error) {
-            $this->assertStringContainsString('outcome may be unknown', $error->getMessage());
+        } catch (ProtocolException $error) {
+            $this->assertSame(ErrorCode::InvalidRequest, $error->errorCode);
+            $this->assertSame($reason, $error->getMessage());
         }
         try {
             $client->send('jobs', 'payload');
@@ -243,32 +252,32 @@ final class ClientTest extends TestCase
         }
     }
 
-    /** @return iterable<string, array{array<string, mixed>|int|null, string, string}> */
+    /** @return iterable<string, array{array<string, mixed>|int|null, string, string, string}> */
     public static function malformedDeliveries(): iterable
     {
         $good = ['id' => 7, 'queue' => 'jobs', 'receipt' => 'r', 'available_at' => 1, 'reserved_until' => 2];
-        yield 'missing id' => [[...$good, 'id' => null], '', ''];
-        yield 'string id' => [[...$good, 'id' => '7'], '', ''];
-        yield 'zero id' => [[...$good, 'id' => 0], '', ''];
-        yield 'negative id' => [[...$good, 'id' => -3], '', ''];
-        yield 'other queue' => [[...$good, 'queue' => 'other'], '', ''];
-        yield 'missing queue' => [[...$good, 'queue' => null], '', ''];
-        yield 'integer receipt' => [[...$good, 'receipt' => 5], '', ''];
-        yield 'missing receipt' => [[...$good, 'receipt' => null], '', ''];
-        yield 'string available_at' => [[...$good, 'available_at' => '1'], '', ''];
-        yield 'missing available_at' => [[...$good, 'available_at' => null], '', ''];
-        yield 'string reserved_until' => [[...$good, 'reserved_until' => '2'], '', ''];
-        yield 'missing reserved_until' => [[...$good, 'reserved_until' => null], '', ''];
-        yield 'integer result' => [7, '', ''];
-        yield 'empty receive with body' => [null, 'b', ''];
-        yield 'empty receive with headers' => [null, '', 'h'];
+        yield 'missing id' => [[...$good, 'id' => null], '', '', 'RECEIVE result.id must be an integer.'];
+        yield 'string id' => [[...$good, 'id' => '7'], '', '', 'RECEIVE result.id must be an integer.'];
+        yield 'zero id' => [[...$good, 'id' => 0], '', '', 'RECEIVE result.id must be a positive integer.'];
+        yield 'negative id' => [[...$good, 'id' => -3], '', '', 'RECEIVE result.id must be a positive integer.'];
+        yield 'other queue' => [[...$good, 'queue' => 'other'], '', '', 'RECEIVE result.queue must equal the requested queue.'];
+        yield 'missing queue' => [[...$good, 'queue' => null], '', '', 'RECEIVE result.queue must equal the requested queue.'];
+        yield 'integer receipt' => [[...$good, 'receipt' => 5], '', '', 'RECEIVE result.receipt must be a string.'];
+        yield 'missing receipt' => [[...$good, 'receipt' => null], '', '', 'RECEIVE result.receipt must be a string.'];
+        yield 'string available_at' => [[...$good, 'available_at' => '1'], '', '', 'RECEIVE result.available_at must be an integer.'];
+        yield 'missing available_at' => [[...$good, 'available_at' => null], '', '', 'RECEIVE result.available_at must be an integer.'];
+        yield 'string reserved_until' => [[...$good, 'reserved_until' => '2'], '', '', 'RECEIVE result.reserved_until must be an integer.'];
+        yield 'missing reserved_until' => [[...$good, 'reserved_until' => null], '', '', 'RECEIVE result.reserved_until must be an integer.'];
+        yield 'integer result' => [7, '', '', 'RECEIVE result must be an object or null.'];
+        yield 'empty receive with body' => [null, 'b', '', 'empty RECEIVE must not include a payload.'];
+        yield 'empty receive with headers' => [null, '', 'h', 'empty RECEIVE must not include a payload.'];
     }
 
     /**
      * @param array<string, mixed>|int|null $result
      */
     #[DataProvider('malformedDeliveries')]
-    public function testMalformedDeliveryInvalidatesClient(array|int|null $result, string $body, string $headers): void
+    public function testMalformedDeliveryInvalidatesClient(array|int|null $result, string $body, string $headers, string $reason): void
     {
         $endpoint = $this->serve(static function (Socket $socket) use ($result, $body, $headers): void {
             Frame::read($socket, new TimeoutCancellation(3));
@@ -282,8 +291,9 @@ final class ClientTest extends TestCase
         try {
             $client->receive('jobs');
             $this->fail('A malformed delivery must not be accepted.');
-        } catch (TransportException $error) {
-            $this->assertStringContainsString('outcome may be unknown', $error->getMessage());
+        } catch (ProtocolException $error) {
+            $this->assertSame(ErrorCode::InvalidRequest, $error->errorCode);
+            $this->assertSame($reason, $error->getMessage());
         }
         try {
             $client->receive('jobs');
@@ -293,16 +303,16 @@ final class ClientTest extends TestCase
         }
     }
 
-    /** @return iterable<string, array{int|null, string, string}> */
+    /** @return iterable<string, array{int|null, string, string, string}> */
     public static function malformedSettlements(): iterable
     {
-        yield 'with result' => [5, '', ''];
-        yield 'with body' => [null, 'b', ''];
-        yield 'with headers' => [null, '', 'h'];
+        yield 'with result' => [5, '', '', 'ACKNOWLEDGE result must be null.'];
+        yield 'with body' => [null, 'b', '', 'ACKNOWLEDGE must not include a payload.'];
+        yield 'with headers' => [null, '', 'h', 'ACKNOWLEDGE must not include a payload.'];
     }
 
     #[DataProvider('malformedSettlements')]
-    public function testMalformedSettlementInvalidatesClient(?int $result, string $body, string $headers): void
+    public function testMalformedSettlementInvalidatesClient(?int $result, string $body, string $headers, string $reason): void
     {
         $endpoint = $this->serve(static function (Socket $socket) use ($result, $body, $headers): void {
             Frame::read($socket, new TimeoutCancellation(3));
@@ -316,8 +326,9 @@ final class ClientTest extends TestCase
         try {
             $client->acknowledge('receipt');
             $this->fail('A malformed settlement must not be accepted.');
-        } catch (TransportException $error) {
-            $this->assertStringContainsString('outcome may be unknown', $error->getMessage());
+        } catch (ProtocolException $error) {
+            $this->assertSame(ErrorCode::InvalidRequest, $error->errorCode);
+            $this->assertSame($reason, $error->getMessage());
         }
         try {
             $client->acknowledge('receipt');
@@ -329,32 +340,118 @@ final class ClientTest extends TestCase
 
     public function testConnectRejectsWrongMaxPayload(): void
     {
-        $this->assertConnectFails(['max_payload' => 1], '', '', 'A broker advertising a different payload bound must not be trusted.');
+        $this->assertConnectFails(['max_payload' => 1], '', '', 'HELLO result.max_payload must equal the client payload limit.');
     }
 
-    /** @return iterable<string, array{array<string, mixed>|string, string, string}> */
+    /** @return iterable<string, array{array<string, mixed>|string, string, string, string}> */
     public static function malformedHellos(): iterable
     {
         $good = ['max_payload' => Frame::MAX_PAYLOAD];
-        yield 'string result' => ['x', '', ''];
-        yield 'missing max payload' => [[], '', ''];
-        yield 'with body' => [$good, 'b', ''];
-        yield 'with headers' => [$good, '', 'h'];
+        yield 'string result' => ['x', '', '', 'HELLO result must be an object.'];
+        yield 'missing max payload' => [[], '', '', 'HELLO result.max_payload must equal the client payload limit.'];
+        yield 'with body' => [$good, 'b', '', 'HELLO must not include a payload.'];
+        yield 'with headers' => [$good, '', 'h', 'HELLO must not include a payload.'];
     }
 
     /**
      * @param array<string, mixed>|string $result
      */
     #[DataProvider('malformedHellos')]
-    public function testMalformedHelloRejectsConnection(array|string $result, string $body, string $headers): void
+    public function testMalformedHelloRejectsConnection(array|string $result, string $body, string $headers, string $reason): void
     {
-        $this->assertConnectFails($result, $body, $headers, 'A malformed hello must not be trusted.');
+        $this->assertConnectFails($result, $body, $headers, $reason);
+    }
+
+    public function testStaleReceiptKeepsTheClientUsable(): void
+    {
+        $seen = [];
+        $endpoint = $this->serve(static function (Socket $socket) use (&$seen): void {
+            Frame::read($socket, new TimeoutCancellation(3));
+            $socket->write(self::helloReply());
+            while (null !== ($request = Frame::read($socket, new TimeoutCancellation(3)))) {
+                $seen[] = $request->control['id'];
+                if (1 === $request->control['id']) {
+                    $socket->write((new Frame(['v' => Frame::VERSION, 'id' => 1, 'ok' => false, 'error' => ['code' => ErrorCode::StaleReceipt->value]]))->encode());
+                    continue;
+                }
+                $socket->write((new Frame(['v' => Frame::VERSION, 'id' => $request->control['id'], 'ok' => true, 'result' => 9]))->encode());
+            }
+        });
+        $client = Client::connect($endpoint);
+        $this->clients[] = $client;
+        try {
+            $client->acknowledge('stale');
+            $this->fail('A stale receipt must be rejected.');
+        } catch (InvalidReceiptException) {
+        }
+        $this->assertSame(9, $client->send('jobs', 'next'));
+        $this->assertSame([1, 2], $seen);
+    }
+
+    public function testInvalidQueueNameKeepsTheClientUsable(): void
+    {
+        $seen = [];
+        $endpoint = $this->serve(static function (Socket $socket) use (&$seen): void {
+            Frame::read($socket, new TimeoutCancellation(3));
+            $socket->write(self::helloReply());
+            while (null !== ($request = Frame::read($socket, new TimeoutCancellation(3)))) {
+                $seen[] = $request->control['id'];
+                if (1 === $request->control['id']) {
+                    $socket->write((new Frame(['v' => Frame::VERSION, 'id' => 1, 'ok' => false, 'error' => ['code' => ErrorCode::InvalidQueueName->value]]))->encode());
+                    continue;
+                }
+                $socket->write((new Frame(['v' => Frame::VERSION, 'id' => $request->control['id'], 'ok' => true, 'result' => 11]))->encode());
+            }
+        });
+        $client = Client::connect($endpoint);
+        $this->clients[] = $client;
+        try {
+            $client->send('-jobs', 'payload');
+            $this->fail('An invalid queue name must be rejected.');
+        } catch (\InvalidArgumentException) {
+        }
+        $this->assertSame(11, $client->send('jobs', 'next'));
+        $this->assertSame([1, 2], $seen);
+    }
+
+    public function testBrokerShuttingDownInvalidatesTheClient(): void
+    {
+        $endpoint = $this->serve(static function (Socket $socket): void {
+            Frame::read($socket, new TimeoutCancellation(3));
+            $socket->write(self::helloReply());
+            if (null !== Frame::read($socket, new TimeoutCancellation(3))) {
+                $socket->write((new Frame(['v' => Frame::VERSION, 'id' => 1, 'ok' => false, 'error' => ['code' => ErrorCode::BrokerShuttingDown->value]]))->encode());
+            }
+        });
+        $client = Client::connect($endpoint);
+        $this->clients[] = $client;
+        try {
+            $client->send('jobs', 'payload');
+            $this->fail('A shutting-down broker must invalidate the client.');
+        } catch (TransportException $error) {
+            $this->assertStringContainsString('outcome may be unknown', $error->getMessage());
+        }
+        try {
+            $client->send('jobs', 'payload');
+            $this->fail('An invalidated client must reject further calls.');
+        } catch (TransportException $error) {
+            $this->assertStringContainsString('Client is closed', $error->getMessage());
+        }
+    }
+
+    public function testAllowedFieldsMatchTheBrokerRequestContract(): void
+    {
+        $this->assertSame([], Operation::Hello->allowedFields());
+        $this->assertSame(['queue', 'delay'], Operation::Send->allowedFields());
+        $this->assertSame(['queue'], Operation::Receive->allowedFields());
+        $this->assertSame(['receipt'], Operation::Acknowledge->allowedFields());
+        $this->assertSame(['receipt'], Operation::Reject->allowedFields());
     }
 
     /**
      * @param array<string, mixed>|string $result
      */
-    private function assertConnectFails(array|string $result, string $body, string $headers, string $message): void
+    private function assertConnectFails(array|string $result, string $body, string $headers, string $reason): void
     {
         $endpoint = $this->serve(static function (Socket $socket) use ($result, $body, $headers): void {
             Frame::read($socket, new TimeoutCancellation(3));
@@ -363,9 +460,10 @@ final class ClientTest extends TestCase
         try {
             $client = Client::connect($endpoint);
             $this->clients[] = $client;
-            $this->fail($message);
-        } catch (TransportException $error) {
-            $this->assertStringContainsString('Invalid broker response', $error->getMessage());
+            $this->fail('A malformed hello must not be trusted.');
+        } catch (ProtocolException $error) {
+            $this->assertSame(ErrorCode::InvalidRequest, $error->errorCode);
+            $this->assertSame($reason, $error->getMessage());
         }
     }
 
