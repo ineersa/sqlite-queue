@@ -71,7 +71,12 @@ final class Broker
         }
         $this->started = true;
         $this->diagnostic = $diagnostic;
-        $subscription = $cancellation?->subscribe($this->stop(...));
+        // Record delivery before stop() so a wedged trace can separate cancel() from the stop path.
+        // Observation failures must never prevent stopping.
+        $subscription = $cancellation?->subscribe(function (): void {
+            $this->diagnose('cancellation-delivered');
+            $this->stop();
+        });
         $monitor = async(function (): void {
             try {
                 $this->persistence->awaitExit();

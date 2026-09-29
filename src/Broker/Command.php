@@ -62,8 +62,11 @@ final class Command extends BaseCommand
             // not bind to DeferredCancellation::cancel(?Throwable).
             $shutdown = new DeferredCancellation();
             foreach ([\SIGINT, \SIGTERM] as $signal) {
-                $watchers[] = EventLoop::onSignal($signal, static function () use ($shutdown): void {
+                $watchers[] = EventLoop::onSignal($signal, static function () use ($shutdown, $diagnostic): void {
+                    // Observation only: a broken tracer must never prevent cancel().
+                    self::observe($diagnostic, 'signal-dispatched');
                     $shutdown->cancel();
+                    self::observe($diagnostic, 'cancellation-requested');
                 });
             }
             $watchers[] = EventLoop::repeat(self::SIGNAL_DISPATCH_INTERVAL_SECONDS, static function (): void {
@@ -112,10 +115,30 @@ final class Command extends BaseCommand
     {
         return static function (array $event) use ($trace): void {
             try {
-                @fwrite($trace, json_encode($event, \JSON_THROW_ON_ERROR)."\n");
+                $written = @fwrite($trace, json_encode($event, \JSON_THROW_ON_ERROR)."\n");
+                // Cross-process visibility for a wedged join, not crash durability.
+                if (false !== $written) {
+                    @fflush($trace);
+                }
             } catch (\Throwable) {
             }
         };
+    }
+
+    /**
+     * Best-effort lifecycle observation. Never throws into the signal or shutdown path.
+     *
+     * @param (\Closure(array{event: string, pid: int, monotonic_ns: int}): void)|null $diagnostic
+     */
+    private static function observe(?\Closure $diagnostic, string $milestone): void
+    {
+        if (null === $diagnostic) {
+            return;
+        }
+        try {
+            $diagnostic(['event' => $milestone, 'pid' => (int) getmypid(), 'monotonic_ns' => (int) hrtime(true)]);
+        } catch (\Throwable) {
+        }
     }
 
     /**

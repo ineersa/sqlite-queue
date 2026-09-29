@@ -364,7 +364,15 @@ final class BrokerProcessTest extends TestCase
         }
         $this->assertNotSame(0, $exit, 'A stopped persistence worker must not stop the broker from exiting.');
         $this->assertSame(
-            ['shutdown-requested', 'deadline-armed', 'deadline-fired', 'persistence-force-stop'],
+            [
+                'signal-dispatched',
+                'cancellation-requested',
+                'cancellation-delivered',
+                'shutdown-requested',
+                'deadline-armed',
+                'deadline-fired',
+                'persistence-force-stop',
+            ],
             $this->traceMilestones($trace),
             'The broker must record every shutdown edge it reached.',
         );
@@ -387,6 +395,58 @@ final class BrokerProcessTest extends TestCase
         $this->stopBroker($restarted);
         $this->assertTrackedGone();
         $this->assertFileExists($database);
+    }
+
+    /**
+     * Runs the real Broker Command through Symfony Console and records the SIGTERM handler at
+     * readiness. The fixture does not duplicate signal registration; production code never
+     * inspects handlers.
+     */
+    public function testShutdownTraceFixtureRecordsTheSigtermHandlerAtReadiness(): void
+    {
+        $database = $this->fixture->path();
+        $trace = $this->tracePath();
+        $handler = $this->evidenceDirectory().'/handler-'.(int) getmypid().'-'.time().'.json';
+        $broker = Process::start([
+            \PHP_BINARY,
+            __DIR__.'/Fixtures/broker-shutdown-trace-probe.php',
+            $database,
+            $this->socket,
+            $trace,
+            $handler,
+        ], null, ['PATH' => '/usr/bin:/bin', 'LANG' => 'C']);
+        $this->processes[] = $broker;
+        $line = (new BufferedReader($broker->getStdout()))->readUntil("\n", new TimeoutCancellation(10), 65536);
+        $ready = json_decode((string) $line, true, 16, \JSON_THROW_ON_ERROR);
+        $this->assertIsArray($ready);
+        $this->assertSame('ready', $ready['event'] ?? null);
+        $this->assertSame($broker->getPid(), $ready['pid'] ?? null);
+        $this->trackOwned($broker->getPid());
+
+        $this->assertFileExists($handler, 'The fixture must record the SIGTERM handler at readiness.');
+        $probe = json_decode((string) file_get_contents($handler), true, 16, \JSON_THROW_ON_ERROR);
+        $this->assertIsArray($probe);
+        $this->assertSame('sigterm-handler', $probe['event'] ?? null);
+        $this->assertSame('Closure', $probe['type'] ?? null);
+        $this->assertSame('Revolt\\EventLoop\\Driver\\StreamSelectDriver', $probe['scope'] ?? null);
+        $this->assertSame('handleSignal', $probe['name'] ?? null);
+
+        $this->assertTrue(posix_kill($broker->getPid(), \SIGTERM));
+        $this->assertSame(0, $broker->join(new TimeoutCancellation(10)));
+        $this->assertSame(
+            [
+                'signal-dispatched',
+                'cancellation-requested',
+                'cancellation-delivered',
+                'shutdown-requested',
+                'deadline-armed',
+            ],
+            $this->traceMilestones($trace),
+            'A clean stop must record the pre-stop edges and arm the deadline without firing it.',
+        );
+        @unlink($trace);
+        @unlink($handler);
+        $this->assertTrackedGone();
     }
 
     private function startBroker(string $database, string $socket, ?string $traceFile = null): Process
