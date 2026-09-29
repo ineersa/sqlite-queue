@@ -19,6 +19,10 @@ final class BrokerProcessTest extends TestCase
 {
     /** Bounded wait for a kernel-reported process state; stops and signal delivery are not ordered. */
     private const int STATE_POLL_TIMEOUT_SECONDS = 5;
+    /** Bounded wait for the signal-window probe to observe how the broker waits for events. */
+    private const int PROBE_MARKER_TIMEOUT_SECONDS = 5;
+    /** Bound on a broker shutdown; the production budget is five seconds. */
+    private const int SIGNAL_BOUND_SECONDS = 10;
     private ?IsolatedDatabase $fixture = null;
     private string $socket = '';
     /** @var list<Process> */
@@ -211,6 +215,72 @@ final class BrokerProcessTest extends TestCase
         $this->assertFileExists($database);
     }
 
+    public function testMissingPosixExtensionFailsBeforeAcquiringResources(): void
+    {
+        $database = $this->fixture->path();
+        $before = glob($this->fixture->directory().'/*');
+        $this->assertSame([], false === $before ? [] : $before, 'The fixture directory must start empty.');
+        $owned = ProcessTree::ownedBy(getmypid());
+
+        $process = Process::start([
+            \PHP_BINARY,
+            '-d',
+            'disable_functions=posix_geteuid',
+            __DIR__.'/Fixtures/broker-posix-probe.php',
+            $database,
+            $this->socket,
+        ], null, ['PATH' => '/usr/bin:/bin', 'LANG' => 'C']);
+        $this->processes[] = $process;
+
+        $stdout = '';
+        while (null !== ($chunk = $process->getStdout()->read(new TimeoutCancellation(10)))) {
+            $stdout .= $chunk;
+        }
+        $report = json_decode($stdout, true, 16, \JSON_THROW_ON_ERROR);
+        $this->assertIsArray($report);
+        $this->assertSame('threw', $report['outcome'] ?? null, 'A broker without ext-posix must refuse to start.');
+        $this->assertSame(\RuntimeException::class, $report['class'] ?? null, 'A missing capability must raise a catchable exception, not an undefined-function Error.');
+        $this->assertSame(0, $process->join(new TimeoutCancellation(10)));
+
+        $after = glob($this->fixture->directory().'/*');
+        $this->assertSame([], false === $after ? [] : $after, 'A refused startup must not create a database, endpoint, or lock file.');
+        $started = ProcessTree::ownedBy(getmypid());
+        $this->assertSame([], array_values(array_diff($started['workers'], $owned['workers'])), 'A refused startup left a persistence worker.');
+        $this->assertSame([], array_values(array_diff($started['launchers'], $owned['launchers'])), 'A refused startup left a worker launcher.');
+    }
+
+    public function testBrokerStopsWhenTheSignalArrivesInsideTheSelectWindow(): void
+    {
+        $database = $this->fixture->path();
+        $log = $this->fixture->path('signal-window.log');
+        $probe = $this->startSignalWindowProbe($database, $log);
+        $pid = $probe->getPid();
+        $owned = $this->trackOwned($pid);
+        $this->assertCount(1, $owned['workers'], 'The probe broker must own exactly one persistence worker.');
+        $worker = $owned['workers'][0];
+
+        $marker = $this->awaitProbeMarker($log, ['lost-window', 'deadline']);
+        if ('lost-window' === $marker) {
+            // The probe delivered SIGTERM while the driver had already drained its signal queue
+            // and was about to block without a deadline, which is the window where a signal
+            // cannot wake the loop. The broker must still stop on its own.
+            $this->assertBrokerStopsOnItsOwn($probe, $pid, $worker);
+        } else {
+            // The loop never waited without a deadline, so the probe found no window to target.
+            // The broker must still stop when the signal arrives from outside.
+            $deadline = $this->probeDeadlineSeconds($log);
+            $this->assertIsFloat($deadline, 'The probe must report the deadline it observed.');
+            $this->assertLessThanOrEqual(2.0, $deadline, 'The loop must keep waking near its one-second interval.');
+            $this->assertTrue(posix_kill($pid, \SIGTERM), 'The test must signal the broker the way a shell kill does.');
+            $this->assertBrokerStops($probe, $pid, $worker, 'A signalled broker must stop.');
+        }
+
+        $this->assertNotContains('lost-window', $this->probeMarkers($log), 'The broker must never wait for events without a deadline.');
+        $this->assertFileDoesNotExist($this->socket, 'A stopped broker must release the endpoint.');
+        $this->assertFileExists($database, 'Shutdown must preserve the database.');
+        $this->assertTrackedGone();
+    }
+
     public function testStoppedPersistenceWorkerCannotWedgeShutdown(): void
     {
         $database = $this->fixture->path();
@@ -279,6 +349,107 @@ final class BrokerProcessTest extends TestCase
         $this->processes[] = $process;
 
         return $process;
+    }
+
+    /**
+     * Starts the signal-window probe, which runs the real broker command and reports how the
+     * waiting loop looks from inside the driver's select call.
+     */
+    private function startSignalWindowProbe(string $database, string $log): Process
+    {
+        $process = Process::start([
+            \PHP_BINARY,
+            __DIR__.'/Fixtures/broker-signal-window-probe.php',
+            $log,
+            $database,
+            $this->socket,
+        ], null, ['PATH' => '/usr/bin:/bin', 'LANG' => 'C']);
+        $line = (new BufferedReader($process->getStdout()))->readUntil("\n", new TimeoutCancellation(10), 65536);
+        $ready = json_decode((string) $line, true, 16, \JSON_THROW_ON_ERROR);
+        $this->assertIsArray($ready);
+        $this->assertSame('ready', $ready['event'] ?? null, 'The probe broker must report readiness.');
+        $this->processes[] = $process;
+
+        return $process;
+    }
+
+    /** Waits for one of the probe's markers, so a stale probe fails instead of passing silently. */
+    private function awaitProbeMarker(string $log, array $markers): string
+    {
+        $deadline = microtime(true) + self::PROBE_MARKER_TIMEOUT_SECONDS;
+        do {
+            $seen = $this->probeMarkers($log);
+            foreach ($markers as $marker) {
+                if (\in_array($marker, $seen, true)) {
+                    return $marker;
+                }
+            }
+            usleep(5000);
+        } while (microtime(true) < $deadline);
+
+        $this->fail('The probe recorded no select-window marker within '.self::PROBE_MARKER_TIMEOUT_SECONDS.'s: '.implode(', ', $seen));
+    }
+
+    /** @return list<string> */
+    private function probeMarkers(string $log): array
+    {
+        $markers = [];
+        foreach ($this->probeEntries($log) as $entry) {
+            if (\is_string($entry['probe'] ?? null)) {
+                $markers[] = $entry['probe'];
+            }
+        }
+
+        return $markers;
+    }
+
+    /** The select deadline the probe observed while the broker waits for events, in seconds. */
+    private function probeDeadlineSeconds(string $log): ?float
+    {
+        foreach ($this->probeEntries($log) as $entry) {
+            if ('deadline' === ($entry['probe'] ?? null)) {
+                $seconds = $entry['seconds'] ?? null;
+
+                return \is_int($seconds) || \is_float($seconds) ? (float) $seconds : null;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * The probe's JSON records, oldest first.
+     *
+     * @return list<array<string, mixed>>
+     */
+    private function probeEntries(string $log): array
+    {
+        $lines = is_file($log) ? file($log, \FILE_IGNORE_NEW_LINES | \FILE_SKIP_EMPTY_LINES) : [];
+        $entries = [];
+        foreach (false === $lines ? [] : $lines as $line) {
+            $entry = json_decode($line, true, 8);
+            if (\is_array($entry)) {
+                $entries[] = $entry;
+            }
+        }
+
+        return $entries;
+    }
+
+    private function assertBrokerStopsOnItsOwn(Process $probe, int $pid, int $worker): void
+    {
+        $this->assertBrokerStops($probe, $pid, $worker, 'A signal delivered inside the select window must still stop the broker.');
+    }
+
+    private function assertBrokerStops(Process $probe, int $pid, int $worker, string $message): void
+    {
+        try {
+            $exit = $probe->join(new TimeoutCancellation(self::SIGNAL_BOUND_SECONDS));
+        } catch (CancelledException $error) {
+            $report = $this->captureWedgeEvidence($pid, $worker);
+            $this->fail($message.' Evidence at '.$report.': '.$error->getMessage());
+        }
+        $this->assertSame(0, $exit, $message);
     }
 
     private function spawn(string $database, string $socket): Process
@@ -372,14 +543,15 @@ final class BrokerProcessTest extends TestCase
             $masks = [];
             $status = @file_get_contents('/proc/'.$pid.'/status');
             if (\is_string($status)) {
-                foreach (['SigBlk', 'SigIgn', 'SigCgt'] as $name) {
+                foreach (['SigBlk', 'SigIgn', 'SigCgt', 'SigPnd', 'ShdPnd'] as $name) {
                     if (1 === preg_match('/^'.$name.':\s+([0-9a-f]+)/m', $status, $match)) {
                         $masks[] = $name.'='.$match[1];
                     }
                 }
             }
             $inTree = isset($snapshot[$pid]) ? substr($snapshot[$pid]['cmd'], -60) : 'absent-from-snapshot';
-            $lines[] = "pid={$pid} state={$state} wchan=".trim((string) @file_get_contents('/proc/'.$pid.'/wchan')).' '.implode(' ', $masks).' cmd='.$inTree;
+            $syscall = trim((string) @file_get_contents('/proc/'.$pid.'/syscall'));
+            $lines[] = "pid={$pid} state={$state} wchan=".trim((string) @file_get_contents('/proc/'.$pid.'/wchan')).' '.implode(' ', $masks).' syscall='.$syscall.' cmd='.$inTree;
         }
         $lines[] = 'socket-exists='.var_export(file_exists($this->socket), true);
         @file_put_contents($path, implode("\n", $lines)."\n");

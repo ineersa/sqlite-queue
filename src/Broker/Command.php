@@ -16,6 +16,18 @@ use Symfony\Component\Console\Output\OutputInterface;
 #[AsCommand(name: 'broker', description: 'Run the foreground SQLite queue broker on a private local Unix socket.')]
 final class Command extends BaseCommand
 {
+    /**
+     * Upper bound, in seconds, on how long the serving loop may wait for events without waking.
+     *
+     * Revolt's stream-select driver drains its queued signals, computes the select timeout, and
+     * then blocks in select(). A shutdown signal delivered in the gap between that drain and that
+     * select is queued, but nothing can wake a select that has no deadline: the signal waits until
+     * some descriptor becomes readable. This repeating no-op timer keeps a deadline pending, so
+     * the driver recomputes its timeout and dispatches the queued signal within one interval. It
+     * wakes the loop once per second; it never touches storage.
+     */
+    private const float SIGNAL_DISPATCH_INTERVAL_SECONDS = 1.0;
+
     protected function configure(): void
     {
         $this
@@ -47,6 +59,9 @@ final class Command extends BaseCommand
                     $shutdown->cancel();
                 });
             }
+            $watchers[] = EventLoop::repeat(self::SIGNAL_DISPATCH_INTERVAL_SECONDS, static function (): void {
+            });
+
             $broker = (new BrokerFactory($database, $endpoint, cancellation: $shutdown->getCancellation()))->listen();
             $code = $broker->run(function (array $event) use ($output): void {
                 $this->write($event, $output);

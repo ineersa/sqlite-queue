@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Broker;
 
 use Amp\Cancellation;
+use Amp\TimeoutCancellation;
 use Fabpot\Amp\Sqlite\SqliteConfig;
 use Fabpot\Amp\Sqlite\SqliteConnector;
 use Fabpot\Amp\Sqlite\SqliteJournalMode;
@@ -24,6 +25,8 @@ use function Amp\Socket\listen;
 final class BrokerFactory
 {
     private const int BUSY_TIMEOUT_MS = 5000;
+    /** Budget for observing the persistence pipes while a failed startup releases resources, in seconds. */
+    private const int RELEASE_BUDGET_SECONDS = 5;
 
     /**
      * @param int                    $visibilityTimeout redelivery delay in milliseconds; 5000 is the approved product default
@@ -41,6 +44,12 @@ final class BrokerFactory
 
     public function listen(): Broker
     {
+        // Capability check before acquisition: private path validation calls posix_geteuid(),
+        // and a disabled extension would otherwise surface as an undefined-function Error
+        // halfway through startup.
+        if (!\function_exists('posix_geteuid')) {
+            throw new \RuntimeException('The broker requires the posix extension to validate file ownership.');
+        }
         /** @var list<callable(): void> */
         $release = [];
         $persistenceFactory = new PersistenceFactory();
@@ -55,7 +64,9 @@ final class BrokerFactory
             $connection = (new SqliteConnector($persistenceFactory))->connect($config, $this->cancellation);
             $persistence = $persistenceFactory->persistence();
             // Pushed before the connection so cleanup still closes the connection first.
-            $release[] = $persistence->close(...);
+            $release[] = static function () use ($persistence): void {
+                $persistence->close(new TimeoutCancellation(self::RELEASE_BUDGET_SECONDS));
+            };
             $release[] = $connection->close(...);
             // Queue closes the transferred connection when its own initialization fails.
             $queue = new Queue($connection, $this->visibilityTimeout, $this->clock);

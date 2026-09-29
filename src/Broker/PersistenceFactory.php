@@ -20,20 +20,27 @@ use function Amp\async;
  */
 final class PersistenceFactory implements ContextFactory
 {
-    /** @var array<string, string> */
-    private const array ISOLATED_ENVIRONMENT = ['PATH' => '/usr/bin:/bin', 'LANG' => 'C', 'TZ' => 'UTC'];
-
     /** @var list<Persistence> */
     private array $created = [];
 
     /**
+     * The signature is fixed by {@see ContextFactory}: the connector passes either a plain script
+     * path or a non-empty `[path, ...arguments]` list, and a cancellation is optional in the
+     * interface contract. The union and the nullable parameter are API requirements, not local
+     * choices, so neither may be narrowed here.
+     *
      * @param string|non-empty-list<string> $script
      *
      * @return ProcessContext<mixed, mixed, mixed>
      */
+    #[\Override]
     public function start(string|array $script, ?Cancellation $cancellation = null): ProcessContext
     {
-        $context = (new ProcessContextFactory(environment: self::ISOLATED_ENVIRONMENT))->start($script, $cancellation);
+        // The child inherits the broker's environment. Amp replaces the entire environment when
+        // given a non-empty array, which would drop what a PHP child needs to start correctly:
+        // TMPDIR, and the configuration paths PHPRC and PHP_INI_SCAN_DIR that load shared
+        // extensions such as sqlite3.
+        $context = (new ProcessContextFactory())->start($script, $cancellation);
         $drains = [];
         // Drain without logging: persistence diagnostics may contain SQL or data.
         foreach ([$context->getStdout(), $context->getStderr()] as $stream) {

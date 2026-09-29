@@ -4,9 +4,9 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Broker;
 
+use Amp\Cancellation;
 use Amp\Future;
 use Amp\Parallel\Context\ProcessContext;
-use Amp\TimeoutCancellation;
 
 /**
  * Observable handle for the driver's persistence child.
@@ -50,18 +50,28 @@ final class Persistence
         $this->context->close();
     }
 
-    public function close(): void
+    /**
+     * Kill the owned child, then observe its pipes until EOF or the shared budget expires.
+     *
+     * Cancellation is required: this runs inside a shutdown budget, and a timeout created here
+     * would extend that budget behind the caller's back. The pipes can outlive the child, so the
+     * observation must be bounded — a shell launcher that never exits keeps their write ends
+     * open, and EOF never arrives.
+     */
+    public function close(Cancellation $budget): void
     {
+        // The child must be gone even when the graceful close or a drain gives up.
+        $this->forceStop();
         try {
-            if (!$this->context->isClosed()) {
-                $this->context->close();
-            }
             foreach ($this->drains as $drain) {
-                $drain->await(new TimeoutCancellation(5));
+                $drain->await($budget);
             }
         } finally {
-            // The child must be gone even when the graceful close or a drain gave up.
-            $this->forceStop();
+            // A pipe still open past the budget is abandoned: nothing can act on its result
+            // after shutdown, so its error must not reach the event loop handler.
+            foreach ($this->drains as $drain) {
+                $drain->ignore();
+            }
             $this->drains = [];
         }
     }

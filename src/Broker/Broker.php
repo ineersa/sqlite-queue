@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Broker;
 
 use Amp\Cancellation;
+use Amp\CancelledException;
+use Amp\DeferredCancellation;
 use Amp\Future;
 use Amp\Socket\ServerSocket;
 use Amp\Socket\Socket;
@@ -26,9 +28,8 @@ final class Broker
     private const int IDLE_READ_TIMEOUT = 5;
     private const int OPERATION_TIMEOUT = 30;
     private const int WRITE_TIMEOUT = 5;
-    private const int SHUTDOWN_WATCHDOG_TIMEOUT = 5;
-    private const int CLIENT_DRAIN_TIMEOUT = 6;
-    private const int MONITOR_TIMEOUT = 5;
+    /** Total budget for one shutdown, in seconds. Every awaited shutdown step shares this deadline. */
+    private const int SHUTDOWN_BUDGET_SECONDS = 5;
     /** @var array<int, array{socket: Socket, session: string, future: Future<void>}> */
     private array $clients = [];
     private bool $stopping = false;
@@ -95,43 +96,52 @@ final class Broker
             }
         } finally {
             $this->stop();
-            // Total shutdown budget: the watchdog fires five seconds after shutdown starts no
-            // matter which step is stuck — including the client drain, where in-flight SQL may
-            // stall. The driver marks its connection closed before its graceful close returns,
-            // so repeating that close cannot interrupt a worker that stopped answering; only
-            // killing the owned child releases the database and endpoint locks on time. The
-            // per-step timeouts below are backstops for the remainder, not budget extensions.
-            $watchdog = EventLoop::delay(self::SHUTDOWN_WATCHDOG_TIMEOUT, function (): void {
+            // One deadline for the whole shutdown: every awaited step below waits on this same
+            // cancellation, so no step can start a fresh timer and stretch the budget. The
+            // budget covers the client drain too, where in-flight SQL may stall. The timer is
+            // referenced, so it keeps the loop alive until it fires: no step is ever released by
+            // the loop running out of work instead of by this deadline.
+            $deadline = new DeferredCancellation();
+            $timer = EventLoop::delay(self::SHUTDOWN_BUDGET_SECONDS, function () use ($deadline): void {
+                // Escalate before releasing the awaits, so the child is dead before any caller
+                // resumes and a step stuck on that child cannot hold the shutdown. Killing the
+                // owned child is the only action that releases a storage worker that stopped
+                // answering: the driver marks its connection closed before its graceful close
+                // returns, so repeating that close cannot interrupt such a worker.
                 $this->failed = true;
                 $this->persistence->forceStop();
+                $deadline->cancel(new \RuntimeException('Broker shutdown budget exhausted.'));
             });
+            $budget = $deadline->getCancellation();
             $failure = null;
             try {
                 foreach ($this->clients as $client) {
-                    $client['future']->await(new TimeoutCancellation(self::CLIENT_DRAIN_TIMEOUT));
+                    $client['future']->await($budget);
                 }
             } catch (\Throwable $error) {
                 $failure = $error;
             }
             // Every step runs: an earlier failure must not leave the persistence child alive.
-            foreach ($this->shutdown() as $step) {
+            foreach ($this->shutdown($budget) as $step) {
                 try {
-                    $step();
+                    $this->awaitStep($step, $budget);
                 } catch (\Throwable $error) {
                     $failure ??= $error;
                 }
             }
             try {
-                $monitor->await(new TimeoutCancellation(self::MONITOR_TIMEOUT));
+                $monitor->await($budget);
             } catch (\Throwable $error) {
                 $failure ??= $error;
             }
-            EventLoop::cancel($watchdog);
+            EventLoop::cancel($timer);
             if (null !== $subscription) {
                 $cancellation?->unsubscribe($subscription);
             }
             // Ownership release is collected like every other step: a late release failure
-            // must not mask the earlier error that actually failed the shutdown.
+            // must not mask the earlier error that actually failed the shutdown. It is not
+            // budgeted, because the child is already force-stopped and the release must happen
+            // before another broker may take the database or the endpoint.
             try {
                 $this->ownership->close();
             } catch (\Throwable $error) {
@@ -155,14 +165,39 @@ final class Broker
         }
     }
 
-    /** @return list<callable(): void> Storage steps whose failure must not skip later steps. */
-    private function shutdown(): array
+    /** @return list<\Closure(): void> Storage steps whose failure must not skip later steps. */
+    private function shutdown(Cancellation $budget): array
     {
         return [
             $this->queue->close(...),
             $this->connection->close(...),
-            $this->persistence->close(...),
+            // The engine and the driver close through the same connection, so the persistence
+            // pipes are observed with the shared budget as well.
+            function () use ($budget): void {
+                $this->persistence->close($budget);
+            },
         ];
+    }
+
+    /**
+     * Wait for one shutdown step under the shared budget.
+     *
+     * The engine and driver closes accept no Cancellation, so the step runs in its own fiber
+     * and the caller waits on it with the shared deadline. A step abandoned at the deadline
+     * keeps running; its later outcome is ignored because the caller has already escalated
+     * and cannot act on it.
+     *
+     * @param \Closure(): void $step
+     */
+    private function awaitStep(\Closure $step, Cancellation $budget): void
+    {
+        $future = async($step);
+        try {
+            $future->await($budget);
+        } catch (CancelledException $cancelled) {
+            $future->ignore();
+            throw $cancelled;
+        }
     }
 
     private function serve(Socket $socket, string $session): void

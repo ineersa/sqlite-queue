@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Tests\Broker;
 
+use Amp\CancelledException;
 use Amp\DeferredFuture;
 use Amp\Future;
 use Amp\Socket\Socket;
@@ -24,6 +25,10 @@ use function Amp\Socket\connect;
 
 final class BrokerTest extends TestCase
 {
+    /** The broker's shared shutdown budget is five seconds; the floor proves a step actually blocked. */
+    private const float SHUTDOWN_FLOOR_SECONDS = 4.0;
+    /** Upper bound for a shutdown that must not wait on a fresh per-step clock. */
+    private const int SHUTDOWN_BOUND_SECONDS = 10;
     private ?IsolatedDatabase $database = null;
     private ?Broker $broker = null;
     /** @var Future<int>|null */
@@ -360,6 +365,83 @@ final class BrokerTest extends TestCase
         });
     }
 
+    /**
+     * A stopped launcher keeps the persistence pipes and the exit-code pipe open, so the driver
+     * close blocks in its join and force-stop cannot release it. Only a shared shutdown budget
+     * can end that shutdown.
+     */
+    public function testShutdownBudgetEndsACloseBlockedByAStoppedLauncher(): void
+    {
+        if (!ProcessTree::available()) {
+            $this->markTestSkipped('The /proc filesystem is unavailable.');
+        }
+        $this->runAsync(function (): void {
+            $database = $this->database ?? throw new \LogicException('Missing test database.');
+            $this->endpoint = $database->path('queue.sock');
+            $broker = (new BrokerFactory($database->path(), $this->endpoint, 5000, fn (): int => $this->now))->listen();
+            $ready = new DeferredFuture();
+            $brokerFuture = async(static function () use ($broker, $ready): int {
+                return $broker->run(static function (array $event) use ($ready): void {
+                    $ready->complete($event);
+                });
+            });
+            $ready->getFuture()->await(new TimeoutCancellation(15));
+
+            $client = $this->connectClient();
+            $confirmed = $client->send('jobs', 'confirmed before the stopped launcher');
+            $client->close();
+
+            $owned = ProcessTree::ownedBy((int) getmypid());
+            $this->assertCount(1, $owned['launchers'], 'The broker must own exactly one worker launcher.');
+            $this->assertCount(1, $owned['workers'], 'The broker must own exactly one persistence worker.');
+            $launcher = $owned['launchers'][0];
+            $worker = $owned['workers'][0];
+            $this->assertNotSame(0, posix_geteuid());
+            $this->assertSame(posix_geteuid(), fileowner('/proc/'.$launcher), 'The stopped process must be this user\'s worker launcher.');
+
+            try {
+                $this->assertTrue(posix_kill($launcher, \SIGSTOP), 'The test must stop only the worker launcher.');
+                $this->assertSame('T', $this->waitForState($launcher, 'T'), 'A stopped launcher must be observable before the broker stops.');
+
+                // Isolate the shutdown budget from signal delivery.
+                $started = microtime(true);
+                $broker->stop();
+                $outcome = $brokerFuture->catch(static fn (\Throwable $error): string => $error::class);
+                try {
+                    $settled = $outcome->await(new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS));
+                } catch (CancelledException) {
+                    $settled = null;
+                }
+                $elapsed = microtime(true) - $started;
+
+                $this->assertNotNull($settled, 'Shutdown must settle within the shared budget while the launcher holds the pipes open.');
+                $this->assertGreaterThan(self::SHUTDOWN_FLOOR_SECONDS, $elapsed, 'The driver close must have blocked until the shared budget expired.');
+                $this->assertLessThan(self::SHUTDOWN_BOUND_SECONDS, $elapsed, 'Shutdown must not wait on a fresh per-step clock.');
+                $this->assertSame(CancelledException::class, $settled, 'The shared budget must cancel the blocked shutdown.');
+                $this->assertFileDoesNotExist($this->endpoint, 'Shutdown must release the endpoint while the launcher is stopped.');
+                $this->assertFileExists($database->path(), 'Shutdown must preserve confirmed data.');
+                $this->assertSame([], ProcessTree::ownedBy((int) getmypid())['workers'], 'The force-stopped worker must not survive the shutdown.');
+                $this->assertSame('T', $this->processState($launcher), 'The broker does not own the launcher, so this test must reap it.');
+            } finally {
+                // A stopped launcher is outside the broker's ownership and would otherwise
+                // survive the test run.
+                @posix_kill($launcher, \SIGKILL);
+                @posix_kill($worker, \SIGKILL);
+                $broker->stop();
+                $brokerFuture->ignore();
+            }
+
+            $this->startBroker(5000, fn (): int => $this->now);
+            $client = $this->connectClient();
+            $delivery = $client->receive('jobs');
+            $this->assertNotNull($delivery, 'A confirmation must survive a budgeted shutdown.');
+            $this->assertSame($confirmed, $delivery->id);
+            $this->assertSame('confirmed before the stopped launcher', $delivery->body);
+            $client->acknowledge($delivery->receipt);
+            $client->close();
+        });
+    }
+
     private function connectClient(float $timeout = 10): Client
     {
         $client = Client::connect($this->endpoint, $timeout);
@@ -385,6 +467,32 @@ final class BrokerTest extends TestCase
         $this->peers[] = $peer;
 
         return $peer;
+    }
+
+    /** Bounded wait for a kernel-reported process state; stops and signal delivery are not ordered. */
+    private function waitForState(int $pid, string $expected): string
+    {
+        $deadline = microtime(true) + 5;
+        do {
+            $state = $this->processState($pid);
+            if ($expected === $state) {
+                return $state;
+            }
+            usleep(1000);
+        } while (microtime(true) < $deadline);
+
+        return $state;
+    }
+
+    private function processState(int $pid): string
+    {
+        $stat = @file_get_contents('/proc/'.$pid.'/stat');
+        if (false === $stat) {
+            return '';
+        }
+        $end = strrpos($stat, ')');
+
+        return false === $end ? '' : substr($stat, $end + 2, 1);
     }
 
     private function runAsync(\Closure $operation): void
