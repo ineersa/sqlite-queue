@@ -33,6 +33,7 @@ final class Command extends BaseCommand
         $this
             ->addOption('database', null, InputOption::VALUE_REQUIRED, 'Absolute path to the private queue database file.')
             ->addOption('endpoint', null, InputOption::VALUE_REQUIRED, 'Absolute path to the private Unix socket file.')
+            ->addOption('trace-file', null, InputOption::VALUE_REQUIRED, 'Optional regular file that receives non-payload shutdown lifecycle lines for support and tests; created if absent.')
             ->setHelp('Readiness, framing bounds, ownership, failure handling, and client recovery are documented in docs/broker-protocol.md.');
     }
 
@@ -40,12 +41,18 @@ final class Command extends BaseCommand
     {
         $errors = $output instanceof ConsoleOutputInterface ? $output->getErrorOutput() : $output;
         $watchers = [];
+        $trace = null;
         try {
             $database = $input->getOption('database');
             $endpoint = $input->getOption('endpoint');
             if (!\is_string($database) || '' === $database || !\is_string($endpoint) || '' === $endpoint) {
                 throw new \InvalidArgumentException('Both --database and --endpoint are required.');
             }
+            $traceFile = $input->getOption('trace-file');
+            // The destination is validated and created before any broker resource is acquired, so an
+            // unusable one fails the command clearly instead of silently dropping shutdown evidence.
+            $trace = \is_string($traceFile) && '' !== $traceFile ? self::openTraceFile($traceFile) : null;
+            $diagnostic = null === $trace ? null : self::traceWriter($trace);
             if (!\function_exists('pcntl_signal') || !\function_exists('posix_geteuid')) {
                 throw new \RuntimeException('The broker requires the pcntl and posix extensions.');
             }
@@ -65,7 +72,7 @@ final class Command extends BaseCommand
             $broker = (new BrokerFactory($database, $endpoint, cancellation: $shutdown->getCancellation()))->listen();
             $code = $broker->run(function (array $event) use ($output): void {
                 $this->write($event, $output);
-            }, $shutdown->getCancellation());
+            }, $shutdown->getCancellation(), $diagnostic);
             $this->write(['event' => 'stopped', 'exit_code' => $code], $output);
 
             return $code;
@@ -77,6 +84,9 @@ final class Command extends BaseCommand
             foreach ($watchers as $watcher) {
                 EventLoop::cancel($watcher);
             }
+            if (\is_resource($trace)) {
+                @fclose($trace);
+            }
         }
     }
 
@@ -84,5 +94,49 @@ final class Command extends BaseCommand
     private function write(array $event, OutputInterface $output): void
     {
         $output->writeln(json_encode($event, \JSON_THROW_ON_ERROR), OutputInterface::OUTPUT_RAW);
+    }
+
+    /**
+     * Builds the optional non-payload trace sink: one JSON line per shutdown milestone, carrying the
+     * process id and a monotonic timestamp, so a stalled shutdown can be ordered against its signal.
+     *
+     * Writes are plain appends with no blocking lock: the broker must never wait on an external
+     * flock while shutting down. A write failure is swallowed, because the trace is an observation
+     * and must never arm the deadline, release the budget, or skip a cleanup step.
+     *
+     * @param resource $trace destination opened by {@see self::openTraceFile()}
+     *
+     * @return \Closure(array{event: string, pid: int, monotonic_ns: int}): void
+     */
+    private static function traceWriter($trace): \Closure
+    {
+        return static function (array $event) use ($trace): void {
+            try {
+                @fwrite($trace, json_encode($event, \JSON_THROW_ON_ERROR)."\n");
+            } catch (\Throwable) {
+            }
+        };
+    }
+
+    /**
+     * Validates and opens the optional trace destination as an empty append-only regular file.
+     *
+     * Only a regular file is accepted. Opening a FIFO would block until a reader appears, and a
+     * device would consume the evidence instead of recording it. The file is created before the
+     * broker acquires anything, so its existence proves the destination was usable.
+     *
+     * @return resource
+     */
+    private static function openTraceFile(string $path)
+    {
+        if (file_exists($path) && !is_file($path)) {
+            throw new \InvalidArgumentException('The trace file must be a writable regular file, not a '.var_export(@filetype($path), true).': '.$path);
+        }
+        $trace = @fopen($path, 'ab');
+        if (false === $trace) {
+            throw new \RuntimeException('The trace file could not be created for append: '.$path);
+        }
+
+        return $trace;
     }
 }

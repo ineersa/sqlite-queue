@@ -63,14 +63,20 @@ Send SIGTERM or SIGINT, or press Ctrl-C in the foreground terminal. Wait for pro
 
 The command registers a one-second event-loop timer to prevent an indefinite select wait when a signal arrives between the driver's signal check and its select call. This timer does not poll storage.
 
+The five-second budget is armed on the first shutdown request, inside `stop()` and before the server or any client socket closes, so the deadline covers every step that follows. Repeated requests, including the serving loop's own, share that one deadline and never re-arm it. The deadline is disarmed once every awaited step has returned; a shutdown that finishes inside the budget never fires it.
+
 Shutdown runs under one five-second budget shared by every step it waits for: the client drain, the engine and connection closes, the persistence pipe observation, and the child monitor. No step starts a fresh clock, so a stalled step cannot stretch the total. When the budget expires, the broker kills the owned persistence child directly through its process context instead of repeating the graceful connection close. That close cannot interrupt a worker that stopped answering, because the driver marks its connection closed before the close returns. The SQLite driver alone joins that context, so no second join can wedge the shutdown.
 
 Steps that take no cancellation, such as the engine close, run in their own fiber and are awaited with the same budget. A step abandoned at the deadline is left to finish or fail on its own, and its outcome is ignored. Ownership is released after the child is force-stopped, so no storage writer survives to hold the database. Every shutdown step still runs after an earlier failure, and the first failure is what the caller receives, with a nonzero exit.
 
 The budget bounds what the broker waits for, not the exact wall-clock duration of the exit. Signal delivery, process teardown, and reaping are scheduled by the operating system. The broker owns the persistence child it starts, not the shell launcher Amp creates around it: a launcher that is stopped rather than killed is left for its supervisor to reap.
 
-An embedded broker can retain pending close fibers and pipe watchers after the deadline if that launcher remains stopped. There is also an unresolved intermittent SIGTERM timeout in validation; see the Task 04 review record before relying on bounded signal-driven exit.
+An embedded broker can retain pending close fibers and pipe watchers after the deadline if that launcher remains stopped. There is also an unresolved intermittent SIGTERM timeout in validation: a wedged run recorded no shutdown milestone. That is consistent with the request never reaching `stop()`, but a failed trace write is not ruled out, so the cause stays open. Do not rely on bounded signal-driven exit until it is understood; see the Task 04 review record.
 
 If an endpoint remains after an abrupt exit, do not remove it merely because a connection attempt fails. Verify that no broker or other listener owns it before removing it, or choose a new endpoint. Startup refuses existing sockets, regular files, and symlinks.
+
+## Shutdown trace
+
+Pass `--trace-file=PATH` to record non-payload shutdown milestones as JSON lines: `shutdown-requested`, `deadline-armed`, `deadline-fired`, and `persistence-force-stop`, each with the process id and a monotonic timestamp. The destination must be a writable regular file; the command creates it empty before it acquires any broker resource and then appends to that same file. A FIFO, a device, or an unwritable path fails the command before startup, because a FIFO would block the open and a device would discard the evidence. The broker holds no lock on the file, and a write failure never affects arming, the budget, or cleanup. Without the option the broker writes nothing.
 
 See the [protocol reference](broker-protocol.md) for exact framing, deadlines, errors, and ownership requirements. See [AGENTS.md](../AGENTS.md) for validation commands and report locations.

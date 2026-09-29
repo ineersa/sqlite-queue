@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Broker;
 
 use Amp\Cancellation;
+use Amp\DeferredCancellation;
 use Amp\Parallel\Context\ContextFactory;
 use Amp\Parallel\Context\ProcessContext;
 use Amp\Parallel\Context\ProcessContextFactory;
@@ -41,15 +42,19 @@ final class PersistenceFactory implements ContextFactory
         // TMPDIR, and the configuration paths PHPRC and PHP_INI_SCAN_DIR that load shared
         // extensions such as sqlite3.
         $context = (new ProcessContextFactory())->start($script, $cancellation);
+        // Both pipe reads share one token, so the handle can stop them as a unit. Cancelling a read
+        // releases the readability watcher it holds, and a pending read would otherwise keep the
+        // event loop referenced forever when the pipes never reach EOF.
+        $drainCancellation = new DeferredCancellation();
         $drains = [];
         // Drain without logging: persistence diagnostics may contain SQL or data.
         foreach ([$context->getStdout(), $context->getStderr()] as $stream) {
-            $drains[] = async(static function () use ($stream): void {
-                while (null !== $stream->read()) {
+            $drains[] = async(static function () use ($stream, $drainCancellation): void {
+                while (null !== $stream->read($drainCancellation->getCancellation())) {
                 }
             });
         }
-        $this->created[] = new Persistence($context, $drains);
+        $this->created[] = new Persistence($context, $drains, $drainCancellation);
 
         return $context;
     }

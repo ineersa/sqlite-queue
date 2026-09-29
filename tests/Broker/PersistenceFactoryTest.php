@@ -4,22 +4,35 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Tests\Broker;
 
+use Amp\ByteStream\PendingReadError;
+use Amp\CancelledException;
 use Amp\TimeoutCancellation;
 use Ineersa\SqliteQueue\Broker\PersistenceFactory;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
 use PHPUnit\Framework\TestCase;
+use Revolt\EventLoop;
+use Revolt\EventLoop\CallbackType;
 
 use function Amp\async;
 
 final class PersistenceFactoryTest extends TestCase
 {
+    /** Path fragment that identifies this test's probe child in the process tree. */
+    private const PROBE_SCRIPT = 'persistence-probe.php';
+
     private ?PersistenceFactory $factory = null;
     private ?int $probePid = null;
+    private ?int $launcherPid = null;
 
     protected function tearDown(): void
     {
         try {
+            // A stopped launcher must never outlive the test that stopped it.
+            if (null !== $this->launcherPid && isset(ProcessTree::snapshot()[$this->launcherPid]) && \function_exists('posix_kill')) {
+                @posix_kill($this->launcherPid, \SIGCONT);
+                @posix_kill($this->launcherPid, \SIGKILL);
+            }
             // Never leave the probe child behind when an assertion fails mid-test.
             $this->factory?->forceStopAll();
             // Belt and suspenders: a failed force-stop must still not leak the probe.
@@ -30,6 +43,7 @@ final class PersistenceFactoryTest extends TestCase
         } finally {
             $this->factory = null;
             $this->probePid = null;
+            $this->launcherPid = null;
             parent::tearDown();
         }
     }
@@ -61,6 +75,71 @@ final class PersistenceFactoryTest extends TestCase
                 usleep(50_000);
             } while (microtime(true) < $deadline);
             $this->assertArrayNotHasKey($pid, ProcessTree::snapshot(), 'forceStopAll must leave no surviving child.');
+        })->await(new TimeoutCancellation(20));
+    }
+
+    public function testShutdownBudgetCancelsPipeReadsAndReleasesTheirWatchers(): void
+    {
+        if (!ProcessTree::available()) {
+            $this->markTestSkipped('The /proc filesystem is unavailable.');
+        }
+        async(function (): void {
+            $factory = new PersistenceFactory();
+            $this->factory = $factory;
+            $context = $factory->start([__DIR__.'/Fixtures/persistence-probe.php'], new TimeoutCancellation(10));
+            $this->assertSame('ready', $context->receive(new TimeoutCancellation(10)));
+            $persistence = $factory->persistence();
+            $this->probePid = $persistence->pid();
+
+            // The drain reads are queued tasks, so run the loop once to put both pipes under a
+            // watcher that keeps the loop alive.
+            $this->turnEventLoop();
+            $watched = $this->enabledReadableWatchers();
+            $this->assertCount(2, $watched, 'Both pipe reads must hold an enabled, referenced watcher before shutdown.');
+
+            $launcher = $this->launcherFor($persistence->pid());
+            if (null === $launcher) {
+                $this->fail('The probe child must run behind the shell launcher Amp creates for it.');
+            }
+            $this->launcherPid = $launcher;
+            $this->assertNotSame(0, posix_geteuid(), 'Stopping a foreign process would require root privileges.');
+            $this->assertSame(posix_geteuid(), fileowner('/proc/'.$launcher), 'The launcher must belong to this user before it is stopped.');
+            $this->assertTrue(posix_kill($launcher, \SIGSTOP), 'The test must stop only the launcher.');
+
+            try {
+                $this->waitForState($launcher, 'T');
+
+                // A stopped launcher holds the pipe write ends, so the pipes never reach EOF and
+                // only the shared budget can end the wait.
+                $expired = false;
+                try {
+                    $persistence->close(new TimeoutCancellation(0.5));
+                } catch (CancelledException) {
+                    $expired = true;
+                }
+                $this->assertTrue($expired, 'The shared budget must end a wait on pipes that stay open.');
+
+                // The cancellation callbacks run on the loop, so give them their turn before
+                // inspecting the watchers that the abandoned reads were holding.
+                $this->turnEventLoop();
+                $driver = EventLoop::getDriver();
+                foreach ($watched as $id) {
+                    $this->assertContains($id, $driver->getIdentifiers(), 'A cancelled pipe read must not be rebuilt.');
+                    $this->assertFalse($driver->isEnabled($id), 'A cancelled pipe read must release its readability watcher, or the loop cannot exit.');
+                }
+
+                // A settled read releases the stream's read slot; a pending one rejects a second read.
+                try {
+                    $context->getStdout()->read(new TimeoutCancellation(0.1));
+                    $this->fail('The probe read must end through its own cancellation, not with data or EOF.');
+                } catch (PendingReadError) {
+                    $this->fail('The cancelled pipe read must not stay pending after shutdown.');
+                } catch (CancelledException) {
+                    // The stream accepted a new read, so the abandoned drain read had settled.
+                }
+            } finally {
+                $this->resumeLauncher();
+            }
         })->await(new TimeoutCancellation(20));
     }
 
@@ -118,5 +197,83 @@ final class PersistenceFactoryTest extends TestCase
             }
             $scan->remove();
         }
+    }
+
+    /** Runs one turn of the event loop so queued tasks and stream watchers reach a steady state. */
+    private function turnEventLoop(): void
+    {
+        async(static function (): void {
+        })->await(new TimeoutCancellation(2));
+    }
+
+    /** @return list<string> Readable watchers that currently keep the loop alive. */
+    private function enabledReadableWatchers(): array
+    {
+        $driver = EventLoop::getDriver();
+        $identifiers = [];
+        foreach ($driver->getIdentifiers() as $id) {
+            if (CallbackType::Readable !== $driver->getType($id) || !$driver->isEnabled($id) || !$driver->isReferenced($id)) {
+                continue;
+            }
+            $identifiers[] = $id;
+        }
+
+        return $identifiers;
+    }
+
+    /** The shell Amp starts around the probe child, which holds the pipes this test keeps open. */
+    private function launcherFor(int $worker): ?int
+    {
+        foreach (ProcessTree::snapshot() as $pid => $process) {
+            if ($pid === $worker || getmypid() !== $process['ppid']) {
+                continue;
+            }
+            if (str_contains($process['cmd'], self::PROBE_SCRIPT)) {
+                return $pid;
+            }
+        }
+
+        return null;
+    }
+
+    private function waitForState(int $pid, string $state): void
+    {
+        $deadline = microtime(true) + 2;
+        do {
+            if ($state === $this->processState($pid)) {
+                return;
+            }
+            usleep(10_000);
+        } while (microtime(true) < $deadline);
+
+        $this->assertSame($state, $this->processState($pid), 'A stopped launcher must be observable before the pipes are observed.');
+    }
+
+    /** One-letter process state from /proc, or an empty string when the process is gone. */
+    private function processState(int $pid): string
+    {
+        $stat = @file_get_contents('/proc/'.$pid.'/stat');
+        if (!\is_string($stat)) {
+            return '';
+        }
+        $end = strrpos($stat, ')');
+        if (false === $end) {
+            return '';
+        }
+
+        return $stat[$end + 2] ?? '';
+    }
+
+    /** Resumes and kills the stopped launcher, which lives outside the factory's ownership. */
+    private function resumeLauncher(): void
+    {
+        if (null === $this->launcherPid) {
+            return;
+        }
+        if (\function_exists('posix_kill') && isset(ProcessTree::snapshot()[$this->launcherPid])) {
+            @posix_kill($this->launcherPid, \SIGCONT);
+            @posix_kill($this->launcherPid, \SIGKILL);
+        }
+        $this->launcherPid = null;
     }
 }

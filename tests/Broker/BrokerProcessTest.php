@@ -249,6 +249,53 @@ final class BrokerProcessTest extends TestCase
         $this->assertSame([], array_values(array_diff($started['launchers'], $owned['launchers'])), 'A refused startup left a worker launcher.');
     }
 
+    /**
+     * The optional trace destination is validated before the broker acquires anything, so an
+     * unusable one fails clearly instead of blocking (a FIFO) or discarding evidence (a device).
+     */
+    public function testInvalidTraceDestinationFailsBeforeTheBrokerAcquiresAnything(): void
+    {
+        if (!\function_exists('posix_mkfifo')) {
+            $this->markTestSkipped('The posix extension is unavailable.');
+        }
+        $fifo = $this->evidenceDirectory().'/refused-trace.fifo';
+        @unlink($fifo);
+        $this->assertTrue(posix_mkfifo($fifo, 0o600), 'The test needs a FIFO to prove it is refused rather than opened.');
+        $before = ProcessTree::ownedBy(getmypid());
+        try {
+            $destinations = ['device' => '/dev/null', 'fifo' => $fifo, 'directory' => $this->fixture->directory()];
+            foreach ($destinations as $kind => $destination) {
+                $database = $this->fixture->path();
+                $process = $this->spawn($database, $this->socket, $destination);
+                $this->processes[] = $process;
+                try {
+                    $exit = $process->join(new TimeoutCancellation(10));
+                } catch (CancelledException) {
+                    $process->kill();
+                    $this->fail('A rejected trace destination ('.$kind.') must fail instead of blocking: '.$destination);
+                }
+                $this->assertNotSame(0, $exit, 'A rejected trace destination ('.$kind.') must fail the command.');
+
+                $stderr = '';
+                while (null !== ($chunk = $process->getStderr()->read(new TimeoutCancellation(10)))) {
+                    $stderr .= $chunk;
+                }
+                $report = json_decode($stderr, true, 16, \JSON_THROW_ON_ERROR);
+                $this->assertIsArray($report);
+                $this->assertSame('failed', $report['event'] ?? null, 'A rejected trace destination ('.$kind.') must report a failure.');
+                $this->assertSame(\InvalidArgumentException::class, $report['error_type'] ?? null, 'A rejected trace destination ('.$kind.') must fail as invalid input.');
+                $this->assertFileDoesNotExist($database, 'A rejected trace destination ('.$kind.') must fail before the database exists.');
+                $this->assertFileDoesNotExist($this->socket, 'A rejected trace destination ('.$kind.') must fail before the endpoint binds.');
+                $this->assertSame([], glob($this->fixture->directory().'/*') ?: [], 'A rejected trace destination ('.$kind.') must not create broker files.');
+            }
+            $after = ProcessTree::ownedBy(getmypid());
+            $this->assertSame([], array_values(array_diff($after['workers'], $before['workers'])), 'A rejected trace destination must not start a persistence worker.');
+            $this->assertSame([], array_values(array_diff($after['launchers'], $before['launchers'])), 'A rejected trace destination must not start a worker launcher.');
+        } finally {
+            @unlink($fifo);
+        }
+    }
+
     public function testBrokerStopsWhenTheSignalArrivesInsideTheSelectWindow(): void
     {
         $database = $this->fixture->path();
@@ -284,7 +331,12 @@ final class BrokerProcessTest extends TestCase
     public function testStoppedPersistenceWorkerCannotWedgeShutdown(): void
     {
         $database = $this->fixture->path();
-        $broker = $this->startBroker($database, $this->socket);
+        $trace = $this->tracePath();
+        $broker = $this->startBroker($database, $this->socket, $trace);
+        // Positive barrier for the trace wiring: the destination is created before the broker serves,
+        // so a wedged run leaves a readable file whose contents separate "no milestone" from "not opened".
+        $this->assertFileExists($trace, 'The trace destination must exist before the broker serves.');
+        $this->assertSame('', (string) file_get_contents($trace), 'A serving broker must record no shutdown milestone.');
         $owned = $this->trackOwned($broker->getPid());
         $this->assertCount(1, $owned['workers'], 'The broker must own exactly one persistence worker.');
         $worker = $owned['workers'][0];
@@ -305,14 +357,22 @@ final class BrokerProcessTest extends TestCase
             $exit = $broker->join(new TimeoutCancellation(15));
         } catch (CancelledException $error) {
             // A join timeout still fails the test, but the broker, worker, and signal-mask
-            // states below distinguish a wedged shutdown from a lost shutdown signal.
-            $report = $this->captureWedgeEvidence($broker->getPid(), $worker);
-            $this->fail('Shutdown wedged past its 15s budget; process evidence at '.$report.': '.$error->getMessage());
+            // states below distinguish a wedged shutdown from a lost shutdown signal, and the
+            // trace shows which shutdown edges the broker reached. Both files are retained here.
+            $report = $this->captureWedgeEvidence($broker->getPid(), $worker, $trace);
+            $this->fail('Shutdown wedged past its 15s budget; process evidence at '.$report.' and trace at '.$trace.': '.$error->getMessage());
         }
         $this->assertNotSame(0, $exit, 'A stopped persistence worker must not stop the broker from exiting.');
+        $this->assertSame(
+            ['shutdown-requested', 'deadline-armed', 'deadline-fired', 'persistence-force-stop'],
+            $this->traceMilestones($trace),
+            'The broker must record every shutdown edge it reached.',
+        );
         $this->assertTrackedGone();
         $this->assertFileDoesNotExist($this->socket, 'Shutdown must release the endpoint without the worker responding.');
         $this->assertFileExists($database, 'Shutdown must preserve confirmed data.');
+        // The trace is support evidence for a wedge: a clean run keeps nothing.
+        @unlink($trace);
 
         $restarted = $this->startBroker($database, $this->socket);
         $this->trackOwned($restarted->getPid());
@@ -329,9 +389,9 @@ final class BrokerProcessTest extends TestCase
         $this->assertFileExists($database);
     }
 
-    private function startBroker(string $database, string $socket): Process
+    private function startBroker(string $database, string $socket, ?string $traceFile = null): Process
     {
-        $process = $this->spawn($database, $socket);
+        $process = $this->spawn($database, $socket, $traceFile);
         $line = (new BufferedReader($process->getStdout()))->readUntil("\n", new TimeoutCancellation(10), 65536);
         $ready = json_decode((string) $line, true, 16, \JSON_THROW_ON_ERROR);
         $this->assertIsArray($ready);
@@ -452,15 +512,20 @@ final class BrokerProcessTest extends TestCase
         $this->assertSame(0, $exit, $message);
     }
 
-    private function spawn(string $database, string $socket): Process
+    private function spawn(string $database, string $socket, ?string $traceFile = null): Process
     {
-        return Process::start([
+        $command = [
             \PHP_BINARY,
             \dirname(__DIR__, 2).'/bin/sqlite-queue',
             'broker',
             '--database='.$database,
             '--endpoint='.$socket,
-        ], null, ['PATH' => '/usr/bin:/bin', 'LANG' => 'C']);
+        ];
+        if (null !== $traceFile) {
+            $command[] = '--trace-file='.$traceFile;
+        }
+
+        return Process::start($command, null, ['PATH' => '/usr/bin:/bin', 'LANG' => 'C']);
     }
 
     private function client(): Client
@@ -524,7 +589,7 @@ final class BrokerProcessTest extends TestCase
      *
      * States and signal masks only; no payloads, no broker debug output.
      */
-    private function captureWedgeEvidence(int $brokerPid, int $worker): string
+    private function captureWedgeEvidence(int $brokerPid, int $worker, ?string $trace = null): string
     {
         $directory = \dirname(__DIR__, 2).'/var/qa/p1-wedge';
         if (!is_dir($directory) && !mkdir($directory, 0o700, true) && !is_dir($directory)) {
@@ -554,8 +619,58 @@ final class BrokerProcessTest extends TestCase
             $lines[] = "pid={$pid} state={$state} wchan=".trim((string) @file_get_contents('/proc/'.$pid.'/wchan')).' '.implode(' ', $masks).' syscall='.$syscall.' cmd='.$inTree;
         }
         $lines[] = 'socket-exists='.var_export(file_exists($this->socket), true);
+        if (null !== $trace && is_file($trace)) {
+            // Milestones only: the trace carries a pid and a monotonic timestamp per shutdown edge.
+            // The byte count makes an empty trace explicit: the destination was usable, yet no
+            // milestone was recorded, which a failed write would also produce.
+            $lines[] = 'trace='.$trace.' bytes='.(string) @filesize($trace);
+            foreach (explode("\n", trim((string) @file_get_contents($trace))) as $line) {
+                if ('' !== $line) {
+                    $lines[] = 'trace:'.$line;
+                }
+            }
+        }
         @file_put_contents($path, implode("\n", $lines)."\n");
 
         return $path;
+    }
+
+    /** Trace path for one P1 run; the file is retained only when the shutdown wedges. */
+    private function tracePath(): string
+    {
+        return $this->evidenceDirectory().'/trace-'.(int) getmypid().'-'.time().'.log';
+    }
+
+    /** Private scratch directory for support evidence; created on demand. */
+    private function evidenceDirectory(): string
+    {
+        $directory = \dirname(__DIR__, 2).'/var/qa/p1-wedge';
+        if (!is_dir($directory) && !mkdir($directory, 0o700, true) && !is_dir($directory)) {
+            throw new \RuntimeException('Cannot create the evidence directory '.$directory.'.');
+        }
+
+        return $directory;
+    }
+
+    /**
+     * Shutdown milestones in the order the broker recorded them.
+     *
+     * @return list<string>
+     */
+    private function traceMilestones(string $trace): array
+    {
+        $contents = @file_get_contents($trace);
+        if (!\is_string($contents)) {
+            return [];
+        }
+        $milestones = [];
+        foreach (explode("\n", trim($contents)) as $line) {
+            $entry = '' === $line ? null : json_decode($line, true, 8);
+            if (\is_array($entry) && \is_string($entry['event'] ?? null)) {
+                $milestones[] = $entry['event'];
+            }
+        }
+
+        return $milestones;
     }
 }

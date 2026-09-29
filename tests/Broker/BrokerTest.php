@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Tests\Broker;
 
 use Amp\CancelledException;
+use Amp\DeferredCancellation;
 use Amp\DeferredFuture;
 use Amp\Future;
 use Amp\Socket\Socket;
@@ -442,6 +443,105 @@ final class BrokerTest extends TestCase
         });
     }
 
+    /**
+     * The deadline must exist as soon as shutdown is requested, not once cleanup happens to reach
+     * its finally: a serving loop that never resumes would otherwise have no armed deadline at all.
+     */
+    public function testFirstStopRequestArmsTheShutdownDeadlineBeforeCleanup(): void
+    {
+        $this->runAsync(function (): void {
+            $events = [];
+            $this->startBroker(5000, null, static function (array $event) use (&$events): void {
+                $events[] = $event;
+            });
+            $this->assertSame([], $events, 'A serving broker must not hold a shutdown deadline.');
+
+            $broker = $this->broker ?? throw new \LogicException('Missing test broker.');
+            $future = $this->brokerFuture ?? throw new \LogicException('Missing broker future.');
+            $broker->stop();
+
+            // stop() is synchronous and the serving loop is suspended in accept(), so both events
+            // can only come from stop() itself: the deadline is armed before any cleanup step runs.
+            $this->assertSame(['shutdown-requested', 'deadline-armed'], array_column($events, 'event'));
+            $this->assertFalse($future->isComplete(), 'The serving loop must still be suspended when the deadline is armed.');
+            $this->assertSame((int) getmypid(), $events[0]['pid']);
+            $this->assertLessThanOrEqual($events[1]['monotonic_ns'], $events[0]['monotonic_ns']);
+
+            $this->assertSame(0, $future->await(new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS)));
+            $this->assertSame(['shutdown-requested', 'deadline-armed'], array_column($events, 'event'), 'A shutdown inside the budget must disarm the deadline before it fires.');
+            $this->assertFileDoesNotExist($this->endpoint);
+        });
+    }
+
+    /** A repeated stop request, including the serving loop's own, shares the one deadline. */
+    public function testRepeatedStopRequestsDoNotRearmTheShutdownDeadline(): void
+    {
+        $this->runAsync(function (): void {
+            $events = [];
+            $this->startBroker(5000, null, static function (array $event) use (&$events): void {
+                $events[] = $event;
+            });
+            $broker = $this->broker ?? throw new \LogicException('Missing test broker.');
+            $future = $this->brokerFuture ?? throw new \LogicException('Missing broker future.');
+
+            $broker->stop();
+            $broker->stop();
+            $broker->stop();
+
+            $this->assertSame(['shutdown-requested', 'deadline-armed'], array_column($events, 'event'));
+            $this->assertSame(0, $future->await(new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS)));
+            // The finally calls stop() again: still one request and one arm.
+            $this->assertSame(['shutdown-requested', 'deadline-armed'], array_column($events, 'event'));
+        });
+    }
+
+    /**
+     * A force-stop failure during escalation must not escape into the event loop, and it must not
+     * leave the budget unreleased either: it becomes the cancellation cause. Persistence is final,
+     * so the escalation helper is driven directly with a throwing step.
+     */
+    public function testDeadlineEscalationReleasesTheBudgetWhenTheForceStopFails(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker();
+            $broker = $this->broker ?? throw new \LogicException('Missing test broker.');
+            $deadline = new DeferredCancellation();
+            $failure = new \RuntimeException('Force-stop sentinel.');
+
+            (new \ReflectionMethod(Broker::class, 'releaseBudgetAfter'))->invoke($broker, $deadline, static function () use ($failure): void {
+                throw $failure;
+            });
+
+            $cancelled = null;
+            try {
+                $deadline->getCancellation()->throwIfRequested();
+            } catch (CancelledException $error) {
+                $cancelled = $error;
+            }
+            $this->assertInstanceOf(CancelledException::class, $cancelled, 'A failed force-stop must still release the budget.');
+            $this->assertSame($failure, $cancelled->getPrevious(), 'The escalation failure must become the cancellation cause.');
+        });
+    }
+
+    /** The trace is an observation: a failing observer must not arm, release, or skip cleanup. */
+    public function testFailingDiagnosticObserverDoesNotHoldUpShutdown(): void
+    {
+        $this->runAsync(function (): void {
+            $calls = 0;
+            $this->startBroker(5000, null, static function (array $event) use (&$calls): void {
+                ++$calls;
+                throw new \RuntimeException('Observer sentinel: '.$event['event']);
+            });
+            $broker = $this->broker ?? throw new \LogicException('Missing test broker.');
+            $future = $this->brokerFuture ?? throw new \LogicException('Missing broker future.');
+            $broker->stop();
+
+            $this->assertSame(2, $calls, 'A failing observer must still be notified for both shutdown milestones.');
+            $this->assertSame(0, $future->await(new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS)));
+            $this->assertFileDoesNotExist($this->endpoint);
+        });
+    }
+
     private function connectClient(float $timeout = 10): Client
     {
         $client = Client::connect($this->endpoint, $timeout);
@@ -500,7 +600,7 @@ final class BrokerTest extends TestCase
         async($operation)->await();
     }
 
-    private function startBroker(int $visibilityTimeout = 5000, ?\Closure $clock = null): void
+    private function startBroker(int $visibilityTimeout = 5000, ?\Closure $clock = null, ?\Closure $diagnostic = null): void
     {
         $database = $this->database ?? throw new \LogicException('Missing test database.');
         $this->endpoint = $database->path('queue.sock');
@@ -508,7 +608,7 @@ final class BrokerTest extends TestCase
         $ready = new DeferredFuture();
         $this->brokerFuture = async(fn (): int => $this->broker->run(static function (array $event) use ($ready): void {
             $ready->complete($event);
-        }));
+        }, null, $diagnostic));
         $event = $ready->getFuture()->await(new TimeoutCancellation(15));
         $this->assertSame('ready', $event['event']);
     }

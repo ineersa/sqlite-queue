@@ -35,6 +35,16 @@ final class Broker
     private bool $stopping = false;
     private bool $started = false;
     private bool $failed = false;
+    /**
+     * One deadline for the whole shutdown, created with the broker so no shutdown path can arm a
+     * second one. It is created here but armed on the first stop request: a serving broker must
+     * not hold a loop watcher, so the timer is genuinely absent until shutdown is requested.
+     */
+    private readonly DeferredCancellation $deadline;
+    /** Pending shutdown timer, or null before the first stop request and after the disarm. */
+    private ?string $shutdownTimer = null;
+    /** Optional non-payload lifecycle observer. Null, the default, writes nothing at all. */
+    private ?\Closure $diagnostic = null;
 
     /** Fully acquired by BrokerFactory; a constructed broker is ready to serve. */
     public function __construct(
@@ -44,18 +54,23 @@ final class Broker
         private readonly Persistence $persistence,
         private readonly Ownership $ownership,
     ) {
+        $this->deadline = new DeferredCancellation();
     }
 
     /**
-     * @param (\Closure(array<string, int|string>): void)|null $ready        optional observer notified once after the socket accepts work; process creation alone is not readiness
-     * @param ?Cancellation                                    $cancellation optional cooperative cancellation for the serving loop; startup cancellation belongs to BrokerFactory
+     * @param (\Closure(array<string, int|string>): void)|null                         $ready        optional observer notified once after the socket accepts work; process creation alone is not readiness
+     * @param ?Cancellation                                                            $cancellation optional cooperative cancellation for the serving loop; startup cancellation belongs to BrokerFactory
+     * @param (\Closure(array{event: string, pid: int, monotonic_ns: int}): void)|null $diagnostic   optional non-payload
+     *                                                                                               lifecycle observer for the CLI trace file and for tests; the default emits nothing. It is a separate
+     *                                                                                               observer rather than part of $ready, which is notified once and must not be completed twice.
      */
-    public function run(?\Closure $ready = null, ?Cancellation $cancellation = null): int
+    public function run(?\Closure $ready = null, ?Cancellation $cancellation = null, ?\Closure $diagnostic = null): int
     {
         if ($this->started) {
             throw new \LogicException('A broker instance can only run once.');
         }
         $this->started = true;
+        $this->diagnostic = $diagnostic;
         $subscription = $cancellation?->subscribe($this->stop(...));
         $monitor = async(function (): void {
             try {
@@ -95,24 +110,12 @@ final class Broker
                 $this->clients[$key] = ['socket' => $socket, 'session' => $session, 'future' => $future];
             }
         } finally {
+            // stop() arms the shared deadline on its first call, before it closes anything, so the
+            // budget already covers every step below and this path must never arm a second timer.
+            // The referenced timer keeps the loop alive until it fires or is disarmed, so no step
+            // is ever released by the loop running out of work instead of by this deadline.
             $this->stop();
-            // One deadline for the whole shutdown: every awaited step below waits on this same
-            // cancellation, so no step can start a fresh timer and stretch the budget. The
-            // budget covers the client drain too, where in-flight SQL may stall. The timer is
-            // referenced, so it keeps the loop alive until it fires: no step is ever released by
-            // the loop running out of work instead of by this deadline.
-            $deadline = new DeferredCancellation();
-            $timer = EventLoop::delay(self::SHUTDOWN_BUDGET_SECONDS, function () use ($deadline): void {
-                // Escalate before releasing the awaits, so the child is dead before any caller
-                // resumes and a step stuck on that child cannot hold the shutdown. Killing the
-                // owned child is the only action that releases a storage worker that stopped
-                // answering: the driver marks its connection closed before its graceful close
-                // returns, so repeating that close cannot interrupt such a worker.
-                $this->failed = true;
-                $this->persistence->forceStop();
-                $deadline->cancel(new \RuntimeException('Broker shutdown budget exhausted.'));
-            });
-            $budget = $deadline->getCancellation();
+            $budget = $this->deadline->getCancellation();
             $failure = null;
             try {
                 foreach ($this->clients as $client) {
@@ -134,7 +137,7 @@ final class Broker
             } catch (\Throwable $error) {
                 $failure ??= $error;
             }
-            EventLoop::cancel($timer);
+            $this->disarmShutdownDeadline();
             if (null !== $subscription) {
                 $cancellation?->unsubscribe($subscription);
             }
@@ -157,11 +160,82 @@ final class Broker
 
     public function stop(): void
     {
-        $this->stopping = true;
+        if (!$this->stopping) {
+            $this->stopping = true;
+            // The deadline is armed on the first shutdown request, before the server or a client
+            // socket closes, so the budget covers every step that follows. Later requests, including
+            // the serving loop's own stop() in its finally, share that one deadline and never rearm it.
+            $this->armShutdownDeadline();
+        }
         $this->server->close();
         foreach ($this->clients as $client) {
             $this->queue->closeSession($client['session']);
             $client['socket']->close();
+        }
+    }
+
+    /** Arms the single shutdown deadline; only the first stop request may reach this. */
+    private function armShutdownDeadline(): void
+    {
+        // The timer is installed before any observer runs, so an observation can never prevent arming.
+        $this->shutdownTimer = EventLoop::delay(self::SHUTDOWN_BUDGET_SECONDS, function (): void {
+            $this->failed = true;
+            $this->diagnose('deadline-fired');
+            // The kill is the only action that releases a storage worker that stopped answering:
+            // the driver marks its connection closed before its graceful close returns, so a
+            // repeated close cannot interrupt such a worker. Escalate before releasing the awaits,
+            // so the child is dead before any caller resumes.
+            $this->releaseBudgetAfter($this->deadline, $this->persistence->forceStop(...));
+        });
+        $this->diagnose('shutdown-requested');
+        $this->diagnose('deadline-armed');
+    }
+
+    /**
+     * Runs the shutdown escalation, then releases the budget exactly once.
+     *
+     * A force-stop failure must not escape into the event loop, and it must not leave the budget
+     * unreleased either: the failure becomes the cancellation cause, so the awaiters resume with
+     * the real reason instead of waiting for a deadline that already fired. Releasing the budget
+     * happens before the observation, so a broken observer cannot delay the awaiters.
+     *
+     * @param DeferredCancellation $deadline  the single shutdown budget to release
+     * @param \Closure(): void     $forceStop
+     */
+    private function releaseBudgetAfter(DeferredCancellation $deadline, \Closure $forceStop): void
+    {
+        $cause = new \RuntimeException('Broker shutdown budget exhausted.');
+        try {
+            $forceStop();
+        } catch (\Throwable $error) {
+            $cause = $error;
+        } finally {
+            $deadline->cancel($cause);
+            $this->diagnose('persistence-force-stop');
+        }
+    }
+
+    /** The deadline has served its purpose once every awaited shutdown step has returned. */
+    private function disarmShutdownDeadline(): void
+    {
+        if (null === $this->shutdownTimer) {
+            return;
+        }
+        EventLoop::cancel($this->shutdownTimer);
+        $this->shutdownTimer = null;
+    }
+
+    /** Reports one shutdown milestone to the optional observer; no payload, nothing when disabled. */
+    private function diagnose(string $milestone): void
+    {
+        $observer = $this->diagnostic;
+        if (null === $observer) {
+            return;
+        }
+        try {
+            $observer(['event' => $milestone, 'pid' => (int) getmypid(), 'monotonic_ns' => (int) hrtime(true)]);
+        } catch (\Throwable) {
+            // Observation only: a failing observer must never arm, release, or skip cleanup.
         }
     }
 
@@ -245,9 +319,10 @@ final class Broker
                         return;
                     } catch (\Throwable) {
                         $this->failed = true;
-                        $this->stopping = true;
-                        $this->server->close();
                         $this->writeError($socket, $expected, ErrorCode::InternalStorageFailure);
+                        // Same shutdown entry as every other path, so exactly one place arms the
+                        // shared deadline. The reply above is flushed before stop() closes sockets.
+                        $this->stop();
 
                         return;
                     }

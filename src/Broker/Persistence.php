@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Broker;
 
 use Amp\Cancellation;
+use Amp\DeferredCancellation;
 use Amp\Future;
 use Amp\Parallel\Context\ProcessContext;
 
@@ -13,6 +14,9 @@ use Amp\Parallel\Context\ProcessContext;
  *
  * Always constructed with a live process: creation belongs to PersistenceFactory,
  * which the SQLite connector drives through the ContextFactory contract.
+ *
+ * The handle owns the token that stops its pipe reads. Cancelling those reads releases
+ * the readability watchers they hold, which is what lets the broker process exit.
  */
 final class Persistence
 {
@@ -20,8 +24,11 @@ final class Persistence
      * @param ProcessContext<mixed, mixed, mixed> $context
      * @param list<Future<void>>                  $drains
      */
-    public function __construct(private readonly ProcessContext $context, private array $drains)
-    {
+    public function __construct(
+        private readonly ProcessContext $context,
+        private array $drains,
+        private readonly DeferredCancellation $drainCancellation,
+    ) {
     }
 
     public function pid(): int
@@ -67,6 +74,10 @@ final class Persistence
                 $drain->await($budget);
             }
         } finally {
+            // Cancel the pipe reads before dropping their futures. A read that stays pending holds
+            // an enabled, referenced readability watcher, and the event loop cannot exit while such
+            // a watcher remains, so releasing the pipes is what lets the broker process stop.
+            $this->drainCancellation->cancel();
             // A pipe still open past the budget is abandoned: nothing can act on its result
             // after shutdown, so its error must not reach the event loop handler.
             foreach ($this->drains as $drain) {
