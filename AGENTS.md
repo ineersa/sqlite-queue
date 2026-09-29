@@ -6,6 +6,21 @@ Before submitting changes, run `vendor/bin/castor cs:fix`, then `vendor/bin/cast
 
 Keep console output brief and machine-readable. Write diagnostics to report files instead of dumping them into the conversation. Tasks live in `.castor/`, imported by `castor.php`.
 
+## Code standards
+
+Apply these rules throughout the repository, including implementation, tooling, and tests.
+
+- Require dependencies through typed constructors. A constructed object must have everything it needs to operate.
+- Do not use nullable properties, nullable parameters, or default arguments without a concrete domain or API justification. Document non-obvious exceptions where they are declared.
+- Do not represent incomplete initialization with nulls, uninitialized properties, placeholder values, or repeated existence checks. Separate resource acquisition from the initialized runtime. Clean up acquired resources when startup fails.
+- Use backed enums for finite operation, status, and error-code sets. Use clear native types for everything else. Validate untrusted data with small readable checks near where it is used.
+- Prefer the smallest abstraction that fits. Use enums, constants, and direct validation when they suffice. Add request/response objects, codecs, or wrappers only for a concrete benefit, not as a default architecture.
+- Replace magic numbers and domain strings with descriptive constants, enums, or value objects. Name units and explain protocol limits. Ordinary arithmetic identities and literal wire-field names at the boundary do not need artificial wrappers.
+- Use explicit PHP types and the supported PHP 8.5 features where they express the model more accurately. Prefer immutable value objects. Do not substitute PHPDoc for available native types.
+- Split compound validation into readable checks with specific failures. Test each validation rule independently.
+- Use existing Symfony and Amp facilities instead of custom substitutes. Do not copy dependency internals, such as lock filename algorithms.
+- Review new and modified code against these rules before submission. Passing QA does not replace this review.
+
 ## Commands
 
 | Command | Scope |
@@ -16,6 +31,7 @@ Keep console output brief and machine-readable. Write diagnostics to report file
 | `vendor/bin/castor phpstan` | Analyze implementation and tooling code. Optional `--path=bench/src` overrides configured paths. |
 | `vendor/bin/castor test` | Run all correctness tests. Optional `--filter=TaskReportsTest` selects tests. |
 | `vendor/bin/castor test:driver` | Run driver tests, with optional `--filter`. |
+| `vendor/bin/castor test:broker` | Run protocol, client, and broker tests, with optional `--filter`. |
 | `vendor/bin/castor test:bench` | Run benchmark correctness tests, with optional `--filter`. |
 | `vendor/bin/castor qa` | Run validation, formatting checks, PHPStan, and tests in that order. No formatting edits. |
 | `vendor/bin/castor bench --smoke --workload=roundtrip` | Run a smoke benchmark. Omit `--smoke` for measured runs; omit `--workload` for all workloads. |

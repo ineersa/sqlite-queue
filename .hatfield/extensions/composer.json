@@ -1,0 +1,25 @@
+{
+    "repositories": [
+        {
+            "type": "path",
+            "url": "/home/ineersa/projects/agent-core/.hatfield/extensions/extension-api"
+        },
+        {
+            "type": "path",
+            "url": "/home/ineersa/projects/agent-core/.hatfield/extensions/observational-memory"
+        },
+        {
+            "type": "path",
+            "url": "/home/ineersa/projects/agent-core/.hatfield/extensions/jbcontext"
+        }
+    ],
+    "require": {
+        "ineersa/hatfield-ext-observational-memory": "@dev",
+        "ineersa/hatfield-ext-jbcontext": "@dev"
+    },
+    "minimum-stability": "dev",
+    "prefer-stable": true,
+    "config": {
+        "prepend-autoloader": false
+    }
+}

@@ -55,6 +55,12 @@ function test_bench(#[AsOption(description: 'PHPUnit test-name filter.')] ?strin
     return run_tests('test:bench', 'benchmark', $filter);
 }
 
+#[AsTask(name: 'test:broker', namespace: '', description: 'Run broker, protocol, and client tests; save JUnit XML and logs.')]
+function test_broker(#[AsOption(description: 'PHPUnit test-name filter.')] ?string $filter = null): int
+{
+    return run_tests('test:broker', 'broker', $filter);
+}
+
 #[AsTask(name: 'bench', namespace: '', description: 'Capture a benchmark; save the capture path and progress in the task log.')]
 function bench(
     #[AsOption(description: 'Run smoke workloads, not a performance capture.')] bool $smoke = false,

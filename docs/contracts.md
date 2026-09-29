@@ -20,7 +20,8 @@ Evidence for the driver behavior behind these contracts is in
 PHP 8.4.25 passed the driver suite while the constraint allowed it but is outside the supported
 range; the committed lock requires PHP >= 8.5, so the suite does not run there. PHP 8.6 and
 later are unverified. Symfony 7.4 resolves with the driver, and the package does not support
-it. The core engine, broker, and client run without Symfony installed; `symfony/messenger`
+it. The core engine and client run without Symfony installed; the broker requires
+`symfony/lock` and `symfony/filesystem` at runtime for exclusive ownership; `symfony/messenger`
 stays a development dependency until the adapter in Task 06 moves it to an optional runtime
 requirement.
 
@@ -171,9 +172,9 @@ reply never proves absence of the mutation.
 - Readiness follows successful ownership, schema initialization, database connection, and
   socket readiness, not process creation.
 
-Protocol error categories are invalid request, unsupported protocol version, invalid queue
-name, stale or foreign receipt, unknown delivery, broker shutting down, and internal storage
-failure. Task 04 fixes the exact error codes and names.
+Task 04 implements the immediate-operation subset. The [v1 protocol reference](broker-protocol.md)
+defines exact framing, limits, and error codes. Bounded notification waiting remains Task 05 work.
+Unknown deliveries and stale or foreign receipts share the `stale_receipt` code.
 
 ## Reference sources
 
@@ -192,6 +193,5 @@ sets `synchronous`, so neither establishes the cost of the FULL setting used her
 
 ## Decisions left open
 
-- Concrete frame, connection, and buffer limits: Task 04.
 - Messenger mapping details, including decode failure and worker idle integration: Task 06.
 - Measured cost of synchronous FULL against the baseline durability: Task 02 and Task 08.

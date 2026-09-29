@@ -1,0 +1,36 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+use Ineersa\SqliteQueue\Broker\Command;
+use Symfony\Component\Console\Application;
+use Symfony\Component\Console\Output\ConsoleOutput;
+
+$autoload = $_composer_autoload_path ?? dirname(__DIR__).'/vendor/autoload.php';
+$fail = static function (string $errorType, string $message): int {
+    fwrite(\STDERR, json_encode(['event' => 'failed', 'error_type' => $errorType, 'message' => $message], \JSON_THROW_ON_ERROR)."\n");
+
+    return 1;
+};
+
+if (!is_string($autoload) || !is_file($autoload)) {
+    exit($fail('RuntimeException', 'Composer autoload file not found. Run composer install in this checkout.'));
+}
+require $autoload;
+if (!class_exists(Application::class)) {
+    exit($fail('RuntimeException', 'The broker command line requires symfony/console. Install it, or use the Ineersa\SqliteQueue\Broker\Broker API directly.'));
+}
+
+$output = new ConsoleOutput();
+$output->setDecorated(false);
+$application = new Application('SQLite queue broker');
+$application->setCatchExceptions(false);
+$application->setAutoExit(false);
+$application->addCommand(new Command());
+
+try {
+    exit($application->run(null, $output));
+} catch (Throwable $error) {
+    exit($fail($error::class, 'The broker command line failed before the broker could report.'));
+}
