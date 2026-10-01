@@ -16,6 +16,8 @@ use Ineersa\SqliteQueue\Client;
 use Ineersa\SqliteQueue\Exception\InvalidReceiptException;
 use Ineersa\SqliteQueue\Exception\TransportException;
 use Ineersa\SqliteQueue\Protocol\Frame;
+use Ineersa\SqliteQueue\Tests\Broker\Fixtures\GatingServerSocket;
+use Ineersa\SqliteQueue\Tests\Broker\Fixtures\WriteGate;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -100,35 +102,62 @@ final class BrokerTest extends TestCase
     public function testSlowRawPeerDoesNotBlockStorageOrOtherClients(): void
     {
         $this->runAsync(function (): void {
-            $this->startBroker();
+            $gate = new WriteGate();
+            // Gate every accepted socket. Only oversized response frames enter the barrier;
+            // unrelated clients keep using small confirmations that stay ungated.
+            $this->startBrokerWithGatedServer($gate, Frame::MAX_PAYLOAD);
             $publisher = $this->connectClient();
             $publisher->send('jobs', str_repeat('p', Frame::MAX_PAYLOAD));
 
             $peer = $this->rawPeer();
-            Frame::write($peer, (new Frame(['v' => Frame::VERSION, 'id' => 0, 'op' => 'hello']))->encode(), new TimeoutCancellation(5));
-            $this->assertNotNull(Frame::read($peer, new TimeoutCancellation(5)));
-            Frame::write($peer, (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'receive', 'queue' => 'jobs']))->encode(), new TimeoutCancellation(5));
+            try {
+                Frame::write($peer, (new Frame(['v' => Frame::VERSION, 'id' => 0, 'op' => 'hello']))->encode(), new TimeoutCancellation(5));
+                $this->assertNotNull(Frame::read($peer, new TimeoutCancellation(5)));
+                Frame::write($peer, (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'receive', 'queue' => 'jobs']))->encode(), new TimeoutCancellation(5));
 
-            $prefix = '';
-            $deadline = new TimeoutCancellation(2);
-            while (\strlen($prefix) < 4) {
-                $chunk = $peer->read($deadline, 4 - \strlen($prefix));
-                $this->assertNotNull($chunk, 'The broker must start writing the large reply.');
-                $prefix .= $chunk;
+                $bytes = $gate->entered()->await(new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS));
+                $this->assertGreaterThan(Frame::MAX_PAYLOAD, $bytes, 'The gated write must be the oversized receive reply.');
+                $this->assertFalse($gate->isReleased(), 'Production write timeout must not release the test gate.');
+
+                $other = $this->connectClient();
+                $id = $other->send('jobs', 'unrelated');
+                $delivery = $other->receive('jobs');
+                $this->assertNotNull($delivery);
+                $this->assertSame($id, $delivery->id);
+                $this->assertSame('unrelated', $delivery->body);
+                $other->acknowledge($delivery->receipt);
+                $this->assertFalse($gate->isReleased(), 'Unrelated clients must finish while the gated reply is still pending.');
+            } finally {
+                $gate->release();
+                $peer->close();
             }
-            $this->assertGreaterThan(Frame::MAX_PAYLOAD, (int) unpack('Nlength', $prefix)['length']);
+        });
+    }
 
-            // Finish before the slow peer's five-second write deadline can free storage.
-            $progress = new TimeoutCancellation(2);
-            $other = $this->connectClient(2);
-            $id = $other->send('jobs', 'unrelated', cancellation: $progress);
-            $delivery = $other->receive('jobs', $progress);
-            $this->assertNotNull($delivery);
-            $this->assertSame($id, $delivery->id);
-            $this->assertSame('unrelated', $delivery->body);
-            $other->acknowledge($delivery->receipt, $progress);
-
-            $peer->close();
+    public function testGatedWriterNeedsExplicitReleaseAfterSocketClose(): void
+    {
+        $this->runAsync(function (): void {
+            [$inner, $peer] = \Amp\Socket\createSocketPair();
+            $gate = new WriteGate();
+            $socket = new Fixtures\GatingSocket($inner, $gate, 0);
+            $writing = async(static fn () => $socket->write('blocked'));
+            try {
+                $this->assertSame(7, $gate->entered()->await(new TimeoutCancellation(10)));
+                $socket->close(); // The same action taken by production write cancellation.
+                $this->assertFalse($writing->isComplete());
+                $gate->release();
+                try {
+                    $writing->await(new TimeoutCancellation(10));
+                    $this->fail('A released write must observe the closed socket.');
+                } catch (\Amp\ByteStream\ClosedException $error) {
+                    $this->assertSame('Gated write released after the socket closed.', $error->getMessage());
+                }
+            } finally {
+                $gate->release();
+                $writing->ignore();
+                $socket->close();
+                $peer->close();
+            }
         });
     }
 
@@ -617,6 +646,30 @@ final class BrokerTest extends TestCase
         $database = $this->database ?? throw new \LogicException('Missing test database.');
         $this->endpoint = $database->path('queue.sock');
         $this->broker = (new BrokerFactory($database->path(), $this->endpoint, $visibilityTimeout, $clock))->create();
+        $ready = new DeferredFuture();
+        $this->brokerFuture = async(fn (): int => $this->broker->run(static function (array $event) use ($ready): void {
+            $ready->complete($event);
+        }));
+        $event = $ready->getFuture()->await(new TimeoutCancellation(15));
+        $this->assertSame('ready', $event['event']);
+    }
+
+    /**
+     * Rebuilds a factory-created broker with a gating server so one oversized response write
+     * stays pending until WriteGate::release(). No production hooks.
+     */
+    private function startBrokerWithGatedServer(WriteGate $gate, int $thresholdBytes): void
+    {
+        $database = $this->database ?? throw new \LogicException('Missing test database.');
+        $this->endpoint = $database->path('queue.sock');
+        $original = (new BrokerFactory($database->path(), $this->endpoint, clock: fn (): int => $this->now))->create();
+        $constructor = (new \ReflectionClass(Broker::class))->getConstructor() ?? throw new \LogicException('Missing Broker constructor.');
+        $arguments = [];
+        foreach ($constructor->getParameters() as $parameter) {
+            $arguments[] = (new \ReflectionProperty(Broker::class, $parameter->getName()))->getValue($original);
+        }
+        $arguments[0] = new GatingServerSocket($arguments[0], $gate, $thresholdBytes);
+        $this->broker = (new \ReflectionClass(Broker::class))->newInstanceArgs($arguments);
         $ready = new DeferredFuture();
         $this->brokerFuture = async(fn (): int => $this->broker->run(static function (array $event) use ($ready): void {
             $ready->complete($event);

@@ -69,10 +69,15 @@ final class Queue
 
         return $this->storage->exclusive(function () use ($queue, $ownerId, $cancellation): ?DeliveryDTO {
             $this->assertActive($cancellation);
-            $now = $this->now();
-            $expires = $this->deadline($this->visibilityTimeout, $now);
             $token = bin2hex(random_bytes(self::RESERVATION_TOKEN_BYTES));
-            $claimed = $this->storage->claim($queue->value, $ownerId, $this->epoch, $token, $now, $expires);
+            $claimed = $this->storage->claim(
+                $queue->value,
+                $ownerId,
+                $this->epoch,
+                $token,
+                $this->now(...),
+                fn (int $now): int => $this->deadline($this->visibilityTimeout, $now),
+            );
             // A disconnect may have occurred while waiting for persistence.
             $this->assertActive($cancellation);
             if (null === $claimed) {
@@ -114,7 +119,7 @@ final class Queue
                 $parts[2],
                 $ownerId,
                 $this->epoch,
-                $this->now(),
+                $this->now(...),
                 function () use ($cancellation): void {
                     $this->assertActive($cancellation);
                 },

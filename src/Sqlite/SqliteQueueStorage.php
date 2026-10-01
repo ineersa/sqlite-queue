@@ -153,15 +153,22 @@ final class SqliteQueueStorage
     /**
      * Atomically select, reserve, and read one eligible message. Empty and zero-row claims roll back.
      *
+     * Policy runs after transaction acquisition, which can suspend independently of the local mutex.
+     *
+     * @param \Closure(): int    $clock
+     * @param \Closure(int): int $reservationDeadline receives the sampled transaction-time clock
+     *
      * @return ?array{id: int, body: string, headers: string, available_at: int, reserved_until: int}
      *
      * @throws \LogicException when called outside {@see exclusive()}
      */
-    public function claim(string $queue, string $ownerId, string $epoch, string $token, int $now, int $expires): ?array
+    public function claim(string $queue, string $ownerId, string $epoch, string $token, \Closure $clock, \Closure $reservationDeadline): ?array
     {
         $this->assertOwned();
         /** @var array{id: int, body: string, headers: string, available_at: int, reserved_until: int}|null $claimed */
-        $claimed = $this->transaction(static function (SqliteTransaction $transaction) use ($queue, $ownerId, $epoch, $token, $now, $expires) {
+        $claimed = $this->transaction(static function (SqliteTransaction $transaction) use ($queue, $ownerId, $epoch, $token, $clock, $reservationDeadline) {
+            $now = $clock();
+            $expires = $reservationDeadline($now);
             $select = $transaction->execute(
                 'SELECT id FROM queue_messages WHERE queue = ? AND available_at <= ?
                  AND (reserved_until IS NULL OR reserved_until <= ?) ORDER BY id LIMIT 1',
@@ -207,17 +214,19 @@ final class SqliteQueueStorage
      * `$beforeCommit` runs after a successful DELETE and before commit so a disconnect can roll
      * the settlement back. It is required on every call.
      *
+     * @param \Closure(): int  $clock        sampled after transaction acquisition to fence expiry at the write boundary
      * @param \Closure(): void $beforeCommit
      *
      * @return bool true when exactly one fenced row was deleted
      *
      * @throws \LogicException when called outside {@see exclusive()}
      */
-    public function settle(int $id, string $token, string $ownerId, string $epoch, int $now, \Closure $beforeCommit): bool
+    public function settle(int $id, string $token, string $ownerId, string $epoch, \Closure $clock, \Closure $beforeCommit): bool
     {
         $this->assertOwned();
         /** @var bool $settled */
-        $settled = $this->transaction(static function (SqliteTransaction $transaction) use ($id, $token, $ownerId, $epoch, $now, $beforeCommit): bool {
+        $settled = $this->transaction(static function (SqliteTransaction $transaction) use ($id, $token, $ownerId, $epoch, $clock, $beforeCommit): bool {
+            $now = $clock();
             $result = $transaction->execute(
                 'DELETE FROM queue_messages WHERE id = ? AND reservation_token = ? AND owner_id = ? AND broker_epoch = ? AND reserved_until > ?',
                 [$id, $token, $ownerId, $epoch, $now],
@@ -238,6 +247,9 @@ final class SqliteQueueStorage
     /** Wait for current operation ownership, then release the persistence worker. */
     public function close(): void
     {
+        if (true === $this->owned->get()) {
+            throw new \LogicException('Queue storage cannot close from its owning fiber.');
+        }
         $lock = $this->mutex->acquire();
         try {
             $this->failClosed();

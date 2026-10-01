@@ -25,7 +25,11 @@ Authority: user-approved decisions in `.hatfield/discussions/broker-responsibili
 
 ## Validation
 
-`vendor/bin/castor cs:fix` and `vendor/bin/castor qa` pass on PHP 8.5.10. PHPUnit reports 190 tests and 1,047 assertions. Independent review found no blockers. The engine regression tests preserve transaction and disconnect guarantees, and new checks reject storage ownership borrowed by another fiber or acquired recursively. Storage-failure coverage asserts EOF without an error frame. Deadline and pipe-drain tests trigger cancellation explicitly rather than measure elapsed time.
+Initial validation at `50bcd11` passed 190 tests and 1,047 assertions. Subsequent review found stale claim/settlement timestamps and a remaining timing-dependent slow-reader test, addressed below.
+
+After the review fixes, `vendor/bin/castor cs:fix` and `vendor/bin/castor qa` pass on PHP 8.5.10 with 195 tests and 1,078 assertions. Independent follow-up review found no blockers.
+
+Claim and settlement now invoke Queue policy after SQLite transaction acquisition returns. Three controlled-clock regressions fail against `50bcd11` and pass with the fix: receive visibility, acknowledgement crossing expiry, and rejection crossing expiry. The slow-reader test uses a gated writer and a controlled queue clock. A separate test proves socket closure cannot release the gate. Storage also rejects `close()` from its owning fiber instead of waiting on its own mutex.
 
 The changes target a new PR against merged `main`. Public PHP names and engine construction change without compatibility aliases. Protocol v1 framing is unchanged; the unused storage-failure error code is removed.
 

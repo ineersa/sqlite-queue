@@ -504,6 +504,81 @@ final class QueueTest extends DriverTestCase
         }
     }
 
+    public function testReceiveSamplesVisibilityAfterTransactionAcquisition(): void
+    {
+        $entered = new DeferredFuture();
+        $release = new DeferredFuture();
+        $armed = false;
+        $queue = $this->open(50, $this->pauseAt('begin', $entered, $release, $armed));
+        $name = $this->queueName();
+        $id = $queue->send($name, 'visible after acquisition');
+        $owner = $this->owner();
+        $armed = true;
+        $receiving = async(static fn () => $queue->receive($name, $owner));
+        try {
+            $entered->getFuture()->await(new TimeoutCancellation(10));
+            $this->now += 100;
+        } finally {
+            $release->complete();
+        }
+        $delivery = $receiving->await(new TimeoutCancellation(10));
+        $this->assertNotNull($delivery);
+        $this->assertSame($id, $delivery->id);
+        $this->assertSame($this->now + 50, $delivery->reservedUntil);
+        $nextOwner = $this->owner();
+        $this->assertNull($queue->receive($name, $nextOwner), 'The transaction wait must not consume visibility.');
+        $this->now = $delivery->reservedUntil;
+        $redelivery = $queue->receive($name, $nextOwner);
+        $this->assertNotNull($redelivery);
+        $this->assertSame($id, $redelivery->id);
+        $this->assertNotSame($delivery->receipt, $redelivery->receipt);
+    }
+
+    #[DataProvider('settlements')]
+    public function testSettlementCrossingExpiryDuringTransactionAcquisitionKeepsTheMessage(string $operation): void
+    {
+        $entered = new DeferredFuture();
+        $release = new DeferredFuture();
+        $armed = false;
+        $queue = $this->open(50, $this->pauseAt('begin', $entered, $release, $armed));
+        $name = $this->queueName();
+        $owner = $this->owner();
+        $queue->send($name, 'must survive expiry');
+        $delivery = $queue->receive($name, $owner);
+        $this->assertNotNull($delivery);
+        $this->now = $delivery->reservedUntil - 1;
+        $armed = true;
+        $settling = async(fn () => $this->mutate($queue, $owner, $delivery->receipt, $operation));
+        try {
+            $entered->getFuture()->await(new TimeoutCancellation(10));
+            $this->now = $delivery->reservedUntil + 1;
+        } finally {
+            $release->complete();
+        }
+        $this->invalid(static fn () => $settling->await(new TimeoutCancellation(10)));
+        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
+        $redelivery = $queue->receive($name, $this->owner());
+        $this->assertNotNull($redelivery);
+        $this->assertSame($delivery->id, $redelivery->id);
+        $this->assertSame('must survive expiry', $redelivery->body);
+        $this->assertNotSame($delivery->receipt, $redelivery->receipt);
+    }
+
+    public function testStorageCloseRejectsTheOwningFiberAndPreservesUsability(): void
+    {
+        $queue = $this->open();
+        $storage = $this->latestStorage();
+        try {
+            $storage->exclusive($storage->close(...));
+            $this->fail('Closing from the owning fiber must not wait on its own mutex.');
+        } catch (\LogicException $error) {
+            $this->assertSame('Queue storage cannot close from its owning fiber.', $error->getMessage());
+        }
+        $queue->send($this->queueName(), 'still usable');
+        $this->assertSame('still usable', $queue->receive($this->queueName(), $this->owner())->body);
+        $storage->close();
+    }
+
     public function testStorageOwnershipCannotBeBorrowedByAnotherFiber(): void
     {
         $queue = $this->open();
@@ -645,6 +720,9 @@ final class QueueTest extends DriverTestCase
         return $this->forward(SqliteConnection::class, $real, [
             'beginTransaction' => function () use ($real, $pause, $boundary) {
                 $transaction = $real->beginTransaction();
+                if ('begin' === $boundary) {
+                    $pause();
+                }
 
                 return $this->forward(SqliteTransaction::class, $transaction, [
                     'commit' => static function () use ($transaction, $pause, $boundary): void {

@@ -37,9 +37,9 @@ The database directory must exist. Queue names are independent of the database p
 
 `new Queue(SqliteQueueStorage $storage, int $visibilityTimeout = 5000, ?Closure $clock = null)` is message policy only. It does not open, configure, or close storage. Invalid visibility fails without closing the caller-owned storage dependency.
 
-The optional clock is a `Closure(): int` returning nonnegative Unix wall-clock milliseconds. The default samples `floor(microtime(true) * 1000)`. Queue samples the clock only after storage has acquired operation ownership, so delayed-send and visibility deadlines wait behind earlier operations. No monotonic deadline is persisted. Delays and visibility timeouts must fit the signed integer timestamp range. Visibility must be positive; delay may be zero but not negative.
+The optional clock is a `Closure(): int` returning nonnegative Unix wall-clock milliseconds. The default samples `floor(microtime(true) * 1000)`. Send samples availability after storage acquires local operation ownership. Claim and settlement policy callbacks run after SQLite transaction acquisition returns, so a wait for `BEGIN` cannot consume visibility or let a newly expired receipt settle using an old timestamp. Queue supplies the clock and deadline calculation; storage invokes them inside the transaction. No monotonic deadline is persisted. Delays and visibility timeouts must fit the signed integer timestamp range. Visibility must be positive; delay may be zero but not negative.
 
-Always close storage in `finally`. `SqliteQueueStorage::close()` waits for operation ownership and closes the persistence connection. It is idempotent. Closed storage rejects subsequent operations. Engines cannot be cloned.
+Always close storage in `finally`, outside its `exclusive()` callback. `SqliteQueueStorage::close()` rejects the owning fiber with `LogicException` rather than waiting for its own mutex. Other callers wait for operation ownership before closing the connection. Close is idempotent, and closed storage rejects subsequent operations. Engines cannot be cloned.
 
 ## API
 
