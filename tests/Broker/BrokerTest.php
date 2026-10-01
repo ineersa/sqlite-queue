@@ -144,6 +144,7 @@ final class BrokerTest extends TestCase
             try {
                 $this->assertSame(7, $gate->entered()->await(new TimeoutCancellation(10)));
                 $socket->close(); // The same action taken by production write cancellation.
+                $this->assertFalse($gate->isReleased());
                 $this->assertFalse($writing->isComplete());
                 $gate->release();
                 try {
