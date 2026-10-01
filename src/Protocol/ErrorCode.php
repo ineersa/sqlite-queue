@@ -12,5 +12,4 @@ enum ErrorCode: string
     case StaleReceipt = 'stale_receipt';
     case InvalidQueueName = 'invalid_queue_name';
     case BrokerShuttingDown = 'broker_shutting_down';
-    case InternalStorageFailure = 'internal_storage_failure';
 }

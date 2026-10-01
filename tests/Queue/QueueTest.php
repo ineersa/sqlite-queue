@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Tests\Queue;
 
+use Amp\DeferredCancellation;
 use Amp\DeferredFuture;
 use Amp\TimeoutCancellation;
 use Fabpot\Amp\Sqlite\SqliteConfig;
@@ -14,11 +15,13 @@ use Fabpot\Amp\Sqlite\SqliteJournalMode;
 use Fabpot\Amp\Sqlite\SqliteQueryError;
 use Fabpot\Amp\Sqlite\SqliteSynchronousMode;
 use Fabpot\Amp\Sqlite\SqliteTransaction;
-use Ineersa\SqliteQueue\Delivery;
-use Ineersa\SqliteQueue\InvalidReceipt;
+use Ineersa\SqliteQueue\DTO\DeliveryDTO;
+use Ineersa\SqliteQueue\Exception\InvalidReceiptException;
 use Ineersa\SqliteQueue\Queue;
+use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\Tests\Driver\DriverTestCase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
+use Ineersa\SqliteQueue\ValueObject\QueueName;
 use PHPUnit\Framework\Attributes\DataProvider;
 
 use function Amp\async;
@@ -26,14 +29,14 @@ use function Amp\async;
 final class QueueTest extends DriverTestCase
 {
     private int $now = 1_700_000_000_000;
-    /** @var list<Queue> */
-    private array $queues = [];
+    /** @var list<SqliteQueueStorage> */
+    private array $storages = [];
 
     protected function tearDown(): void
     {
         try {
-            foreach ($this->queues as $queue) {
-                $queue->close();
+            foreach ($this->storages as $storage) {
+                $storage->close();
             }
         } finally {
             parent::tearDown();
@@ -43,18 +46,18 @@ final class QueueTest extends DriverTestCase
     public function testBinaryEmptyPayloadsAndNamedQueues(): void
     {
         $queue = $this->open();
-        $session = $queue->openSession();
-        $id = $queue->send('alpha', "\0\xffbody\0", "\xff\0headers");
-        $otherId = $queue->send('beta', '', '');
-        $delivery = $queue->receive('alpha', $session);
-        $this->assertInstanceOf(Delivery::class, $delivery);
+        $session = $this->owner();
+        $id = $queue->send($this->queueName('alpha'), "\0\xffbody\0", "\xff\0headers");
+        $otherId = $queue->send($this->queueName('beta'), '', '');
+        $delivery = $queue->receive($this->queueName('alpha'), $session);
+        $this->assertInstanceOf(DeliveryDTO::class, $delivery);
         $this->assertSame($id, $delivery->id);
         $this->assertSame("\0\xffbody\0", $delivery->body);
         $this->assertSame("\xff\0headers", $delivery->headers);
         $this->assertSame($this->now + 5000, $delivery->reservedUntil);
-        $this->assertNull($queue->receive('alpha', $session));
+        $this->assertNull($queue->receive($this->queueName('alpha'), $session));
         $queue->acknowledge($delivery->receipt, $session);
-        $other = $queue->receive('beta', $session);
+        $other = $queue->receive($this->queueName('beta'), $session);
         $this->assertSame($otherId, $other->id);
         $this->assertSame('', $other->body);
         $this->assertSame('', $other->headers);
@@ -66,87 +69,89 @@ final class QueueTest extends DriverTestCase
     public function testDelayedOrderingAndRestartPreserveOriginalDeadlines(): void
     {
         $queue = $this->open();
-        $delayed = $queue->send('jobs', 'delayed', delay: 250);
-        $ready = $queue->send('jobs', 'ready');
-        $queue->send('elsewhere', 'independent');
-        $session = $queue->openSession();
-        $this->assertSame($ready, $queue->receive('jobs', $session)->id);
-        $this->assertNull($queue->receive('jobs', $session));
-        $queue->close();
+        $delayed = $queue->send($this->queueName('jobs'), 'delayed', delay: 250);
+        $ready = $queue->send($this->queueName('jobs'), 'ready');
+        $queue->send($this->queueName('elsewhere'), 'independent');
+        $session = $this->owner();
+        $this->assertSame($ready, $queue->receive($this->queueName('jobs'), $session)->id);
+        $this->assertNull($queue->receive($this->queueName('jobs'), $session));
+        $this->latestStorage()->close();
         $this->now += 249;
         $queue = $this->open();
-        $session = $queue->openSession();
-        $this->assertNull($queue->receive('jobs', $session));
-        $this->assertSame('independent', $queue->receive('elsewhere', $session)->body);
+        $session = $this->owner();
+        $this->assertNull($queue->receive($this->queueName('jobs'), $session));
+        $this->assertSame('independent', $queue->receive($this->queueName('elsewhere'), $session)->body);
         ++$this->now;
-        $delivery = $queue->receive('jobs', $session);
+        $delivery = $queue->receive($this->queueName('jobs'), $session);
         $this->assertSame($delayed, $delivery->id);
         $this->assertSame(1_700_000_000_250, $delivery->availableAt);
         $queue->acknowledge($delivery->receipt, $session);
-        $queue->send('overdue', 'persisted', delay: 1);
-        $queue->close();
+        $queue->send($this->queueName('overdue'), 'persisted', delay: 1);
+        $this->latestStorage()->close();
         $this->now += 1000;
         $queue = $this->open();
-        $this->assertSame('persisted', $queue->receive('overdue', $queue->openSession())->body);
+        $this->assertSame('persisted', $queue->receive($this->queueName('overdue'), $this->owner())->body);
     }
 
     public function testEligibleMessagesUseInsertionOrderNotDeadlineOrder(): void
     {
         $queue = $this->open();
-        $first = $queue->send('jobs', 'first', delay: 200);
-        $second = $queue->send('jobs', 'second', delay: 100);
+        $first = $queue->send($this->queueName('jobs'), 'first', delay: 200);
+        $second = $queue->send($this->queueName('jobs'), 'second', delay: 100);
         $this->now += 200;
-        $session = $queue->openSession();
-        $this->assertSame($first, $queue->receive('jobs', $session)->id);
-        $this->assertSame($second, $queue->receive('jobs', $session)->id);
+        $session = $this->owner();
+        $this->assertSame($first, $queue->receive($this->queueName('jobs'), $session)->id);
+        $this->assertSame($second, $queue->receive($this->queueName('jobs'), $session)->id);
     }
 
     public function testStaleForeignDisconnectedAndPreviousEpochReceipts(): void
     {
         $queue = $this->open(50);
-        $queue->send('jobs', 'message');
-        $owner = $queue->openSession();
-        $foreign = $queue->openSession();
-        $first = $queue->receive('jobs', $owner);
+        $queue->send($this->queueName('jobs'), 'message');
+        $owner = $this->owner();
+        $foreign = $this->owner();
+        $first = $queue->receive($this->queueName('jobs'), $owner);
         $this->invalid(static fn () => $queue->acknowledge($first->receipt, $foreign));
         $this->invalid(static fn () => $queue->reject($first->receipt, $foreign));
         $this->now += 49;
-        $this->assertNull($queue->receive('jobs', $foreign));
+        $this->assertNull($queue->receive($this->queueName('jobs'), $foreign));
         ++$this->now;
         $this->invalid(static fn () => $queue->acknowledge($first->receipt, $owner));
-        $next = $queue->receive('jobs', $foreign);
+        $next = $queue->receive($this->queueName('jobs'), $foreign);
         $this->assertSame($first->id, $next->id);
         $this->assertNotSame($first->receipt, $next->receipt);
         $this->invalid(static fn () => $queue->reject($first->receipt, $owner));
-        $queue->closeSession($foreign);
-        $this->invalid(static fn () => $queue->acknowledge($next->receipt, $foreign));
-        $this->assertNull($queue->receive('jobs', $owner));
-        $queue->close();
+        $disconnected = $this->lifetime();
+        $disconnected->cancel();
+        $this->invalid(static fn () => $queue->acknowledge($next->receipt, $foreign, $disconnected->getCancellation()));
+        $this->assertNull($queue->receive($this->queueName('jobs'), $owner));
+        $this->latestStorage()->close();
         $queue = $this->open(50);
-        $newOwner = $queue->openSession();
+        $newOwner = $this->owner();
         $this->invalid(static fn () => $queue->reject($next->receipt, $newOwner));
-        $this->assertNull($queue->receive('jobs', $newOwner));
+        $this->assertNull($queue->receive($this->queueName('jobs'), $newOwner));
         $this->now += 50;
-        $last = $queue->receive('jobs', $newOwner);
+        $last = $queue->receive($this->queueName('jobs'), $newOwner);
         $queue->acknowledge($last->receipt, $newOwner);
         $this->invalid(static fn () => $queue->acknowledge($last->receipt, $newOwner));
-        $newId = $queue->send('jobs', 'new identity');
+        $newId = $queue->send($this->queueName('jobs'), 'new identity');
         $this->assertGreaterThan($first->id, $newId);
         $this->invalid(static fn () => $queue->reject($last->receipt, $newOwner));
-        $this->assertSame($newId, $queue->receive('jobs', $newOwner)->id);
+        $this->assertSame($newId, $queue->receive($this->queueName('jobs'), $newOwner)->id);
     }
 
     public function testConcurrentReceiversAcrossConnectionsCannotShareDelivery(): void
     {
         $first = $this->open();
         $second = $this->open();
-        $first->send('jobs', 'one');
-        $sessions = [$first->openSession(), $second->openSession()];
+        $first->send($this->queueName('jobs'), 'one');
+        $sessions = [$this->owner(), $this->owner()];
         $futures = [];
         for ($i = 0; $i < 8; ++$i) {
             $engine = 0 === $i % 2 ? $first : $second;
             $session = $sessions[$i % 2];
-            $futures[] = async(static fn () => $engine->receive('jobs', $session));
+            $name = $this->queueName('jobs');
+            $futures[] = async(static fn () => $engine->receive($name, $session));
         }
         $deliveries = array_filter(array_map(static fn ($future) => $future->await(), $futures));
         $this->assertCount(1, $deliveries);
@@ -181,7 +186,7 @@ final class QueueTest extends DriverTestCase
             },
         ]);
         $queue = $this->open(connection: $connection);
-        $session = $queue->openSession();
+        $session = $this->owner();
         $receipt = $this->prepareOperation($queue, $session, $operation);
         $before = $this->scalar('SELECT count(*) FROM queue_messages');
         $this->exec('CREATE TABLE parent_guard (id INTEGER PRIMARY KEY); CREATE TABLE child_guard (id INTEGER REFERENCES parent_guard(id) DEFERRABLE INITIALLY DEFERRED);');
@@ -195,9 +200,9 @@ final class QueueTest extends DriverTestCase
         }
         $result = $this->mutate($queue, $session, $receipt, $operation);
         if ('receive' === $operation) {
-            $this->assertInstanceOf(Delivery::class, $result);
+            $this->assertInstanceOf(DeliveryDTO::class, $result);
         }
-        $this->assertGreaterThan(0, $queue->send('recovered', 'usable after rollback'));
+        $this->assertGreaterThan(0, $queue->send($this->queueName('recovered'), 'usable after rollback'));
     }
 
     #[DataProvider('mutations')]
@@ -226,7 +231,7 @@ final class QueueTest extends DriverTestCase
             },
         ]);
         $queue = $this->open(connection: $connection);
-        $session = $queue->openSession();
+        $session = $this->owner();
         $receipt = $this->prepareOperation($queue, $session, $operation);
         $before = $this->scalar('SELECT count(*) FROM queue_messages');
         $armed = true;
@@ -241,10 +246,11 @@ final class QueueTest extends DriverTestCase
             }
             $started = new DeferredFuture();
             $beforeBegins = $begins;
-            $competitor = async(static function () use ($queue, $started): int {
+            $other = $this->queueName('other');
+            $competitor = async(static function () use ($queue, $started, $other): int {
                 $started->complete();
 
-                return $queue->send('other', 'must wait for whole transaction');
+                return $queue->send($other, 'must wait for whole transaction');
             });
             $started->getFuture()->await(new TimeoutCancellation(5));
             $this->assertFalse($competitor->isComplete());
@@ -263,28 +269,31 @@ final class QueueTest extends DriverTestCase
         $release = new DeferredFuture();
         $armed = false;
         $queue = $this->open(50, $this->pauseAt('commit', $entered, $release, $armed));
-        $queue->send('jobs', 'reserved');
-        $session = $queue->openSession();
+        $queue->send($this->queueName('jobs'), 'reserved');
+        $session = $this->owner();
+        $lifetime = $this->lifetime();
         $expiry = $this->now + 50;
         $armed = true;
-        $receive = async(static fn () => $queue->receive('jobs', $session));
+        $name = $this->queueName('jobs');
+        $cancellation = $lifetime->getCancellation();
+        $receive = async(static fn () => $queue->receive($name, $session, $cancellation));
         try {
             $entered->getFuture()->await(new TimeoutCancellation(5));
             $this->assertFalse($receive->isComplete());
             $this->assertNull($this->scalar('SELECT reservation_token FROM queue_messages'));
             $this->now += 10;
-            $queue->closeSession($session);
+            $lifetime->cancel();
         } finally {
             $release->complete();
             $this->invalid(static fn () => $receive->await(new TimeoutCancellation(5)));
         }
         $this->assertSame($expiry, $this->scalar('SELECT reserved_until FROM queue_messages'));
         $this->assertNotNull($this->scalar('SELECT reservation_token FROM queue_messages'));
-        $replacement = $queue->openSession();
+        $replacement = $this->owner();
         $this->now = $expiry - 1;
-        $this->assertNull($queue->receive('jobs', $replacement));
+        $this->assertNull($queue->receive($this->queueName('jobs'), $replacement));
         $this->now = $expiry;
-        $this->assertSame('reserved', $queue->receive('jobs', $replacement)->body);
+        $this->assertSame('reserved', $queue->receive($this->queueName('jobs'), $replacement)->body);
     }
 
     public static function settlements(): iterable
@@ -300,17 +309,18 @@ final class QueueTest extends DriverTestCase
         $release = new DeferredFuture();
         $armed = false;
         $queue = $this->open(50, $this->pauseAt('delete', $entered, $release, $armed));
-        $session = $queue->openSession();
+        $session = $this->owner();
+        $lifetime = $this->lifetime();
         $receipt = $this->prepareOperation($queue, $session, $operation);
         $token = $this->scalar('SELECT reservation_token FROM queue_messages');
         $expiry = $this->scalar('SELECT reserved_until FROM queue_messages');
         $armed = true;
-        $settle = async(fn () => $this->mutate($queue, $session, $receipt, $operation));
+        $settle = async(fn () => $this->mutate($queue, $session, $receipt, $operation, $lifetime->getCancellation()));
         try {
             $entered->getFuture()->await(new TimeoutCancellation(5));
             $this->assertFalse($settle->isComplete());
             $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
-            $queue->closeSession($session);
+            $lifetime->cancel();
         } finally {
             $release->complete();
             $this->invalid(static fn () => $settle->await(new TimeoutCancellation(5)));
@@ -318,10 +328,10 @@ final class QueueTest extends DriverTestCase
         $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
         $this->assertSame($token, $this->scalar('SELECT reservation_token FROM queue_messages'));
         $this->assertSame($expiry, $this->scalar('SELECT reserved_until FROM queue_messages'));
-        $replacement = $queue->openSession();
-        $this->assertNull($queue->receive('jobs', $replacement));
+        $replacement = $this->owner();
+        $this->assertNull($queue->receive($this->queueName('jobs'), $replacement));
         $this->now = $expiry;
-        $this->assertSame('payload', $queue->receive('jobs', $replacement)->body);
+        $this->assertSame('payload', $queue->receive($this->queueName('jobs'), $replacement)->body);
     }
 
     public function testCloseWaitsForInFlightSendAndPreservesItsCommit(): void
@@ -332,15 +342,17 @@ final class QueueTest extends DriverTestCase
         $connection = $this->pauseAt('commit', $entered, $release, $armed);
         $queue = $this->open(connection: $connection);
         $armed = true;
-        $send = async(static fn () => $queue->send('jobs', 'durable before close'));
+        $name = $this->queueName('jobs');
+        $send = async(static fn () => $queue->send($name, 'durable before close'));
         $close = null;
         try {
             $entered->getFuture()->await(new TimeoutCancellation(5));
             $this->assertFalse($send->isComplete());
             $started = new DeferredFuture();
-            $close = async(static function () use ($queue, $started): void {
+            $storage = $this->latestStorage();
+            $close = async(static function () use ($storage, $started): void {
                 $started->complete();
-                $queue->close();
+                $storage->close();
             });
             $started->getFuture()->await(new TimeoutCancellation(5));
             $this->assertFalse($close->isComplete());
@@ -353,13 +365,13 @@ final class QueueTest extends DriverTestCase
         }
         $this->assertTrue($connection->isClosed());
         try {
-            $queue->send('jobs', 'after close');
+            $queue->send($this->queueName('jobs'), 'after close');
             $this->fail('Closed engine accepted a send.');
         } catch (\RuntimeException $error) {
             $this->assertStringContainsString('closed', $error->getMessage());
         }
         $reopened = $this->open();
-        $delivery = $reopened->receive('jobs', $reopened->openSession());
+        $delivery = $reopened->receive($this->queueName('jobs'), $this->owner());
         $this->assertSame($id, $delivery->id);
         $this->assertSame('durable before close', $delivery->body);
     }
@@ -367,19 +379,19 @@ final class QueueTest extends DriverTestCase
     public function testZeroRowClaimRollsBack(): void
     {
         $queue = $this->open();
-        $queue->send('jobs', 'one');
+        $queue->send($this->queueName('jobs'), 'one');
         $this->exec('CREATE TRIGGER lose_claim BEFORE UPDATE ON queue_messages BEGIN SELECT RAISE(IGNORE); END;');
-        $session = $queue->openSession();
-        $this->assertNull($queue->receive('jobs', $session));
+        $session = $this->owner();
+        $this->assertNull($queue->receive($this->queueName('jobs'), $session));
         $this->assertNull($this->scalar('SELECT reservation_token FROM queue_messages'));
         $this->exec('DROP TRIGGER lose_claim');
-        $this->assertSame('one', $queue->receive('jobs', $session)->body);
+        $this->assertSame('one', $queue->receive($this->queueName('jobs'), $session)->body);
     }
 
     public function testPersistenceWorkerDeathFailsWithoutLeavingOwnershipStuck(): void
     {
         $queue = $this->open();
-        $queue->send('jobs', 'confirmed');
+        $queue->send($this->queueName('jobs'), 'confirmed');
         $workers = ProcessTree::ownedBy(getmypid())['workers'];
         $this->assertCount(1, $workers);
         $pid = $workers[0];
@@ -387,13 +399,13 @@ final class QueueTest extends DriverTestCase
         $this->assertSame(posix_geteuid(), fileowner('/proc/'.$pid));
         $this->assertTrue(posix_kill($pid, \SIGKILL));
         try {
-            $queue->send('jobs', 'unconfirmed');
+            $queue->send($this->queueName('jobs'), 'unconfirmed');
             $this->fail('Dead persistence worker must surface as an error.');
         } catch (SqliteConnectionException) {
             $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
         }
         $this->expectException(\RuntimeException::class);
-        $queue->send('jobs', 'closed');
+        $queue->send($this->queueName('jobs'), 'closed');
     }
 
     public function testValidationAndClose(): void
@@ -401,37 +413,37 @@ final class QueueTest extends DriverTestCase
         $queue = $this->open();
         foreach (['', '../db', 'a/b', "nul\0", str_repeat('x', 256)] as $name) {
             try {
-                $queue->send($name, 'body');
+                new QueueName($name);
                 $this->fail('Invalid queue name accepted.');
             } catch (\InvalidArgumentException) {
             }
         }
         foreach ([-1, \PHP_INT_MAX] as $delay) {
             try {
-                $queue->send('jobs', 'body', delay: $delay);
+                $queue->send($this->queueName('jobs'), 'body', delay: $delay);
                 $this->fail('Invalid delay accepted.');
             } catch (\InvalidArgumentException) {
             }
         }
         $this->assertSame(0, $this->scalar('SELECT count(*) FROM queue_messages'));
-        $queue->close();
-        $queue->close();
+        $this->latestStorage()->close();
+        $this->latestStorage()->close();
         $this->expectException(\RuntimeException::class);
-        $queue->send('jobs', 'closed');
+        $queue->send($this->queueName('jobs'), 'closed');
     }
 
     public function testDatabaseFullLeavesConfirmedDataAndFailedOrUsableOwnership(): void
     {
         $connection = $this->connection();
         $queue = $this->open(connection: $connection);
-        $queue->send('jobs', 'confirmed');
+        $queue->send($this->queueName('jobs'), 'confirmed');
         $pages = $connection->query('PRAGMA page_count');
         $count = $pages->fetchRow()['page_count'];
         $pages->close();
         $connection->query('PRAGMA max_page_count='.$count)->close();
         $failure = null;
         try {
-            $queue->send('jobs', str_repeat('x', 1_000_000));
+            $queue->send($this->queueName('jobs'), str_repeat('x', 1_000_000));
         } catch (\Throwable $error) {
             $failure = $error;
         }
@@ -443,37 +455,38 @@ final class QueueTest extends DriverTestCase
         $this->assertStringContainsString('full', strtolower($cause->getMessage()));
         $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
         // A follow-up must either work or fail explicitly, never remain queued behind a lost lock.
-        $followup = async(static fn () => $queue->send('other', 'small'));
+        $name = $this->queueName('other');
+        $followup = async(static fn () => $queue->send($name, 'small'));
         try {
             $followup->await(new TimeoutCancellation(5));
         } catch (\RuntimeException $error) {
             $this->assertStringContainsString('closed', $error->getMessage());
         }
-        $queue->close();
+        $this->latestStorage()->close();
         $reopened = $this->open();
-        $this->assertSame('confirmed', $reopened->receive('jobs', $reopened->openSession())->body);
+        $this->assertSame('confirmed', $reopened->receive($this->queueName('jobs'), $this->owner())->body);
     }
 
     public function testInitializationFailureClosesTransferredConnection(): void
     {
         $connection = (new SqliteConnector())->connect(new SqliteConfig($this->database->path()));
         try {
-            new Queue($connection);
+            SqliteQueueStorage::fromConnection($connection);
             $this->fail('NORMAL durability must not be accepted.');
         } catch (\InvalidArgumentException) {
             $this->assertTrue($connection->isClosed());
         } finally {
             $connection->close();
         }
-        $this->assertGreaterThan(0, $this->open()->send('jobs', 'recovered'));
+        $this->assertGreaterThan(0, $this->open()->send($this->queueName(), 'recovered'));
     }
 
     public function testSelectionUsesQueueIndexWithoutTemporaryOrdering(): void
     {
         $queue = $this->open();
-        $queue->send('jobs', 'ready');
-        $queue->send('jobs', 'future', delay: 100);
-        $queue->receive('jobs', $queue->openSession());
+        $queue->send($this->queueName('jobs'), 'ready');
+        $queue->send($this->queueName('jobs'), 'future', delay: 100);
+        $queue->receive($this->queueName('jobs'), $this->owner());
         $database = new \SQLite3($this->database->path());
         try {
             $result = $database->query("EXPLAIN QUERY PLAN SELECT id FROM queue_messages WHERE queue = 'jobs' AND available_at <= 1700000000000 AND (reserved_until IS NULL OR reserved_until <= 1700000000000) ORDER BY id LIMIT 1");
@@ -491,14 +504,149 @@ final class QueueTest extends DriverTestCase
         }
     }
 
+    public function testReceiveSamplesVisibilityAfterTransactionAcquisition(): void
+    {
+        $entered = new DeferredFuture();
+        $release = new DeferredFuture();
+        $armed = false;
+        $queue = $this->open(50, $this->pauseAt('begin', $entered, $release, $armed));
+        $name = $this->queueName();
+        $id = $queue->send($name, 'visible after acquisition');
+        $owner = $this->owner();
+        $armed = true;
+        $receiving = async(static fn () => $queue->receive($name, $owner));
+        try {
+            $entered->getFuture()->await(new TimeoutCancellation(10));
+            $this->now += 100;
+        } finally {
+            $release->complete();
+        }
+        $delivery = $receiving->await(new TimeoutCancellation(10));
+        $this->assertNotNull($delivery);
+        $this->assertSame($id, $delivery->id);
+        $this->assertSame($this->now + 50, $delivery->reservedUntil);
+        $nextOwner = $this->owner();
+        $this->assertNull($queue->receive($name, $nextOwner), 'The transaction wait must not consume visibility.');
+        $this->now = $delivery->reservedUntil;
+        $redelivery = $queue->receive($name, $nextOwner);
+        $this->assertNotNull($redelivery);
+        $this->assertSame($id, $redelivery->id);
+        $this->assertNotSame($delivery->receipt, $redelivery->receipt);
+    }
+
+    #[DataProvider('settlements')]
+    public function testSettlementCrossingExpiryDuringTransactionAcquisitionKeepsTheMessage(string $operation): void
+    {
+        $entered = new DeferredFuture();
+        $release = new DeferredFuture();
+        $armed = false;
+        $queue = $this->open(50, $this->pauseAt('begin', $entered, $release, $armed));
+        $name = $this->queueName();
+        $owner = $this->owner();
+        $queue->send($name, 'must survive expiry');
+        $delivery = $queue->receive($name, $owner);
+        $this->assertNotNull($delivery);
+        $this->now = $delivery->reservedUntil - 1;
+        $armed = true;
+        $settling = async(fn () => $this->mutate($queue, $owner, $delivery->receipt, $operation));
+        try {
+            $entered->getFuture()->await(new TimeoutCancellation(10));
+            $this->now = $delivery->reservedUntil + 1;
+        } finally {
+            $release->complete();
+        }
+        $this->invalid(static fn () => $settling->await(new TimeoutCancellation(10)));
+        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
+        $redelivery = $queue->receive($name, $this->owner());
+        $this->assertNotNull($redelivery);
+        $this->assertSame($delivery->id, $redelivery->id);
+        $this->assertSame('must survive expiry', $redelivery->body);
+        $this->assertNotSame($delivery->receipt, $redelivery->receipt);
+    }
+
+    public function testStorageCloseRejectsTheOwningFiberAndPreservesUsability(): void
+    {
+        $queue = $this->open();
+        $storage = $this->latestStorage();
+        try {
+            $storage->exclusive($storage->close(...));
+            $this->fail('Closing from the owning fiber must not wait on its own mutex.');
+        } catch (\LogicException $error) {
+            $this->assertSame('Queue storage cannot close from its owning fiber.', $error->getMessage());
+        }
+        $queue->send($this->queueName(), 'still usable');
+        $this->assertSame('still usable', $queue->receive($this->queueName(), $this->owner())->body);
+        $storage->close();
+    }
+
+    public function testStorageOwnershipCannotBeBorrowedByAnotherFiber(): void
+    {
+        $queue = $this->open();
+        $storage = $this->latestStorage();
+        $entered = new DeferredFuture();
+        $release = new DeferredFuture();
+        $owner = async(static fn () => $storage->exclusive(static function () use ($storage, $entered, $release): void {
+            $entered->complete();
+            $release->getFuture()->await(new TimeoutCancellation(10));
+            $storage->insert('jobs', 'owned operation', '', 0);
+        }));
+        $entered->getFuture()->await(new TimeoutCancellation(10));
+        try {
+            try {
+                $storage->insert('jobs', 'foreign operation', '', 0);
+                $this->fail('Another fiber must not borrow storage ownership.');
+            } catch (\LogicException $error) {
+                $this->assertStringContainsString('require exclusive()', $error->getMessage());
+            }
+        } finally {
+            $release->complete();
+            $owner->await(new TimeoutCancellation(10));
+        }
+        $this->assertSame('owned operation', $queue->receive($this->queueName(), $this->owner())->body);
+        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
+    }
+
+    public function testRecursiveStorageOwnershipFailsWithoutWaiting(): void
+    {
+        $this->open();
+        $storage = $this->latestStorage();
+        $this->expectException(\LogicException::class);
+        $this->expectExceptionMessage('cannot be acquired recursively');
+        $storage->exclusive(static fn () => $storage->exclusive(static fn () => null));
+    }
+
+    private function owner(): string
+    {
+        return bin2hex(random_bytes(32));
+    }
+
+    private function lifetime(): DeferredCancellation
+    {
+        return new DeferredCancellation();
+    }
+
+    private function queueName(string $queue = 'jobs'): QueueName
+    {
+        return new QueueName($queue);
+    }
+
     private function open(int $visibility = 5000, ?SqliteConnection $connection = null): Queue
     {
-        $queue = null === $connection
-            ? Queue::open($this->database->path(), $visibility, fn (): int => $this->now)
-            : new Queue($connection, $visibility, fn (): int => $this->now);
-        $this->queues[] = $queue;
+        $storage = null === $connection
+            ? SqliteQueueStorage::open($this->database->path())
+            : SqliteQueueStorage::fromConnection($connection);
+        $this->storages[] = $storage;
 
-        return $queue;
+        return new Queue($storage, $visibility, fn (): int => $this->now);
+    }
+
+    private function latestStorage(): SqliteQueueStorage
+    {
+        if ([] === $this->storages) {
+            throw new \LogicException('No storage opened by this test.');
+        }
+
+        return $this->storages[array_key_last($this->storages)];
     }
 
     private function connection(): SqliteConnection
@@ -532,28 +680,28 @@ final class QueueTest extends DriverTestCase
         try {
             $operation();
             $this->fail('A stale or foreign receipt was accepted.');
-        } catch (InvalidReceipt) {
+        } catch (InvalidReceiptException) {
             $this->addToAssertionCount(1);
         }
     }
 
-    private function prepareOperation(Queue $queue, string $session, string $operation): ?string
+    private function prepareOperation(Queue $queue, string $ownerId, string $operation): ?string
     {
         if ('send' === $operation) {
             return null;
         }
-        $queue->send('jobs', 'payload');
+        $queue->send($this->queueName(), 'payload');
 
-        return 'receive' === $operation ? null : $queue->receive('jobs', $session)->receipt;
+        return 'receive' === $operation ? null : $queue->receive($this->queueName(), $ownerId)->receipt;
     }
 
-    private function mutate(Queue $queue, string $session, ?string $receipt, string $operation): mixed
+    private function mutate(Queue $queue, string $ownerId, ?string $receipt, string $operation, ?\Amp\Cancellation $cancellation = null): mixed
     {
         return match ($operation) {
-            'send' => $queue->send('jobs', 'payload'),
-            'receive' => $queue->receive('jobs', $session),
-            'acknowledge' => $queue->acknowledge($receipt, $session),
-            'reject' => $queue->reject($receipt, $session),
+            'send' => $queue->send($this->queueName(), 'payload', cancellation: $cancellation),
+            'receive' => $queue->receive($this->queueName(), $ownerId, $cancellation),
+            'acknowledge' => $queue->acknowledge($receipt, $ownerId, $cancellation),
+            'reject' => $queue->reject($receipt, $ownerId, $cancellation),
         };
     }
 
@@ -572,6 +720,9 @@ final class QueueTest extends DriverTestCase
         return $this->forward(SqliteConnection::class, $real, [
             'beginTransaction' => function () use ($real, $pause, $boundary) {
                 $transaction = $real->beginTransaction();
+                if ('begin' === $boundary) {
+                    $pause();
+                }
 
                 return $this->forward(SqliteTransaction::class, $transaction, [
                     'commit' => static function () use ($transaction, $pause, $boundary): void {

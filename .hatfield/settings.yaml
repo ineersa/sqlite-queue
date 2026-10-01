@@ -6,7 +6,7 @@ tools:
     code_mode:
         enabled: false
 logging:
-    level: warning
+    level: info
     max_files: 2
 extensions:
     enabled:

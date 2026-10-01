@@ -2,9 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Ineersa\SqliteQueue;
-
-use Ineersa\SqliteQueue\Protocol\ErrorCode;
+namespace Ineersa\SqliteQueue\Protocol;
 
 final class ProtocolException extends \RuntimeException
 {

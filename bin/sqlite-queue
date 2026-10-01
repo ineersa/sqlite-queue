@@ -3,7 +3,7 @@
 
 declare(strict_types=1);
 
-use Ineersa\SqliteQueue\Broker\Command;
+use Ineersa\SqliteQueue\Command\BrokerCommand;
 use Symfony\Component\Console\Application;
 use Symfony\Component\Console\Output\ConsoleOutput;
 
@@ -27,7 +27,7 @@ $output->setDecorated(false);
 $application = new Application('SQLite queue broker');
 $application->setCatchExceptions(false);
 $application->setAutoExit(false);
-$application->addCommand(new Command());
+$application->addCommand(new BrokerCommand());
 
 try {
     exit($application->run(null, $output));

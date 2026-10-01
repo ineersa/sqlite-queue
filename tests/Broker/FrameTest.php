@@ -7,7 +7,7 @@ namespace Ineersa\SqliteQueue\Tests\Broker;
 use Amp\DeferredCancellation;
 use Amp\TimeoutCancellation;
 use Ineersa\SqliteQueue\Protocol\Frame;
-use Ineersa\SqliteQueue\ProtocolException;
+use Ineersa\SqliteQueue\Protocol\ProtocolException;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 

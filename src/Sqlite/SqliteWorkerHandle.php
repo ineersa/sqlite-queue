@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Ineersa\SqliteQueue\Broker;
+namespace Ineersa\SqliteQueue\Sqlite;
 
 use Amp\Cancellation;
 use Amp\DeferredCancellation;
@@ -10,15 +10,21 @@ use Amp\Future;
 use Amp\Parallel\Context\ProcessContext;
 
 /**
- * Observable handle for the driver's persistence child.
+ * Observable handle for the same SQLite worker the vendor connector starts.
  *
- * Always constructed with a live process: creation belongs to PersistenceFactory,
- * which the SQLite connector drives through the ContextFactory contract.
+ * Vendor SqliteConnector calls SqliteWorkerContextFactory, which delegates to Amp and retains
+ * this handle to that same worker. The driver alone owns joining the process context. This
+ * handle supplies independent observation and termination because the locked driver's idle
+ * graceful close has no timeout, marks the connection closed before awaiting, and cannot be
+ * interrupted by repeating close(). Temporary integration workaround until the driver offers
+ * a bounded close/abort API; not a replacement SQL driver.
+ *
+ * Always constructed with a live process: creation belongs to SqliteWorkerContextFactory.
  *
  * The handle owns the token that stops its pipe reads. Cancelling those reads releases
  * the readability watchers they hold, which is what lets the broker process exit.
  */
-final class Persistence
+final class SqliteWorkerHandle
 {
     /**
      * @param ProcessContext<mixed, mixed, mixed> $context

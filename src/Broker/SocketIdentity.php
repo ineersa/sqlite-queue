@@ -9,7 +9,7 @@ namespace Ineersa\SqliteQueue\Broker;
  *
  * An inode number is only unique within its filesystem, so the device id is part of the
  * identity. The broker removes the endpoint on shutdown only while both still match what
- * recordSocket() observed, which keeps a restart or another process from losing its path.
+ * fromEndpoint() observed, which keeps a restart or another process from losing its path.
  */
 final readonly class SocketIdentity
 {
@@ -18,7 +18,7 @@ final readonly class SocketIdentity
     /** File-type value identifying a Unix socket within the masked mode bits. */
     private const int SOCKET_TYPE = 0o140000;
 
-    public function __construct(
+    private function __construct(
         public int $filesystemDeviceId,
         public int $inode,
     ) {

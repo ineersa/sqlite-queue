@@ -11,13 +11,18 @@ use Amp\Future;
 use Amp\Socket\ServerSocket;
 use Amp\Socket\Socket;
 use Amp\TimeoutCancellation;
-use Ineersa\SqliteQueue\InvalidReceipt;
+use Ineersa\SqliteQueue\Exception\InvalidReceiptException;
+use Ineersa\SqliteQueue\Protocol\ControlField;
 use Ineersa\SqliteQueue\Protocol\ErrorCode;
 use Ineersa\SqliteQueue\Protocol\Frame;
 use Ineersa\SqliteQueue\Protocol\Operation;
-use Ineersa\SqliteQueue\ProtocolException;
+use Ineersa\SqliteQueue\Protocol\ProtocolException;
 use Ineersa\SqliteQueue\Queue;
+use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
+use Ineersa\SqliteQueue\Sqlite\SqliteWorkerHandle;
+use Ineersa\SqliteQueue\ValueObject\QueueName;
 use Revolt\EventLoop;
+use Symfony\Component\Filesystem\Filesystem;
 
 use function Amp\async;
 
@@ -27,9 +32,10 @@ final class Broker
     private const int IDLE_READ_TIMEOUT = 5;
     private const int OPERATION_TIMEOUT = 30;
     private const int WRITE_TIMEOUT = 5;
+    private const int OWNER_ID_BYTES = 32;
     /** Total budget for one shutdown, in seconds. Every awaited shutdown step shares this deadline. */
     private const int SHUTDOWN_BUDGET_SECONDS = 5;
-    /** @var array<int, array{socket: Socket, session: string, future: Future<void>}> */
+    /** @var array<int, array{socket: Socket, ownerId: string, lifetime: DeferredCancellation, future: Future<void>}> */
     private array $clients = [];
     private bool $stopping = false;
     private bool $started = false;
@@ -42,47 +48,35 @@ final class Broker
     private readonly DeferredCancellation $deadline;
     /** Pending shutdown timer, or null before the first stop request and after the disarm. */
     private ?string $shutdownTimer = null;
-    /**
-     * In-memory shutdown milestones with timestamps captured at the event. The optional observer
-     * is invoked only after cleanup and ownership release, so diagnostic I/O cannot block stop.
-     *
-     * @var list<array{event: string, pid: int, monotonic_ns: int}>
-     */
-    private array $milestones = [];
-    /** Optional non-payload lifecycle observer. Null, the default, receives nothing at all. */
-    private ?\Closure $diagnostic = null;
 
     /** Fully acquired by BrokerFactory; a constructed broker is ready to serve. */
     public function __construct(
         private readonly ServerSocket $server,
         private readonly Queue $queue,
-        private readonly Persistence $persistence,
-        private readonly Ownership $ownership,
+        private readonly SqliteQueueStorage $storage,
+        private readonly SqliteWorkerHandle $worker,
+        private readonly BrokerLifetimeLocks $locks,
+        private readonly SocketIdentity $socketIdentity,
     ) {
         $this->deadline = new DeferredCancellation();
     }
 
     /**
-     * @param (\Closure(array<string, int|string>): void)|null                         $ready        optional observer notified once after the socket accepts work; process creation alone is not readiness
-     * @param ?Cancellation                                                            $cancellation optional cooperative cancellation for the serving loop; startup cancellation belongs to BrokerFactory
-     * @param (\Closure(array{event: string, pid: int, monotonic_ns: int}): void)|null $diagnostic   optional non-payload
-     *                                                                                               lifecycle observer for the CLI trace file and for tests; the default emits nothing. It is a separate
-     *                                                                                               observer rather than part of $ready, which is notified once and must not be completed twice.
+     * @param (\Closure(array<string, int|string>): void)|null $ready        optional observer notified once after the socket accepts work; process creation alone is not readiness
+     * @param ?Cancellation                                    $cancellation optional cooperative cancellation for the serving loop; startup cancellation belongs to BrokerFactory
      */
-    public function run(?\Closure $ready = null, ?Cancellation $cancellation = null, ?\Closure $diagnostic = null): int
+    public function run(?\Closure $ready = null, ?Cancellation $cancellation = null): int
     {
         if ($this->started) {
             throw new \LogicException('A broker instance can only run once.');
         }
         $this->started = true;
-        $this->diagnostic = $diagnostic;
         $subscription = $cancellation?->subscribe(function (): void {
-            $this->diagnose('cancellation-delivered');
             $this->stop();
         });
         $monitor = async(function (): void {
             try {
-                $this->persistence->awaitExit();
+                $this->worker->awaitExit();
             } catch (\Throwable) {
                 // A failed result channel also signals child death. Never log worker content.
             }
@@ -94,28 +88,29 @@ final class Broker
         try {
             $cancellation?->throwIfRequested();
             if (!$this->stopping) {
-                $ready?->__invoke(['event' => 'ready', 'pid' => getmypid(), 'persistence_pid' => $this->persistence->pid(), 'database' => $this->ownership->database, 'endpoint' => $this->ownership->endpoint]);
+                $ready?->__invoke(['event' => 'ready', 'pid' => getmypid(), 'persistence_pid' => $this->worker->pid(), 'database' => $this->locks->database, 'endpoint' => $this->locks->endpoint]);
             }
             while (!$this->stopping && null !== ($socket = $this->server->accept())) {
                 if (\count($this->clients) >= self::MAX_CONNECTIONS) {
                     $socket->close();
                     continue;
                 }
-                $session = $this->queue->openSession();
+                $ownerId = bin2hex(random_bytes(self::OWNER_ID_BYTES));
+                $lifetime = new DeferredCancellation();
                 $key = spl_object_id($socket);
-                $future = async(function () use ($socket, $session, $key): void {
+                $future = async(function () use ($socket, $ownerId, $lifetime, $key): void {
                     try {
-                        $this->serve($socket, $session);
+                        $this->serve($socket, $ownerId, $lifetime->getCancellation());
                     } finally {
                         $socket->close();
-                        $this->queue->closeSession($session);
+                        $lifetime->cancel();
                         unset($this->clients[$key]);
                     }
                 })->catch(function (): void {
                     $this->failed = true;
                     $this->stop();
                 });
-                $this->clients[$key] = ['socket' => $socket, 'session' => $session, 'future' => $future];
+                $this->clients[$key] = ['socket' => $socket, 'ownerId' => $ownerId, 'lifetime' => $lifetime, 'future' => $future];
             }
         } finally {
             // stop() arms the shared deadline on its first call, before it closes anything, so the
@@ -125,12 +120,12 @@ final class Broker
             $this->stop();
             $budget = $this->deadline->getCancellation();
             $failure = null;
-            try {
-                foreach ($this->clients as $client) {
+            foreach ($this->clients as $client) {
+                try {
                     $client['future']->await($budget);
+                } catch (\Throwable $error) {
+                    $failure ??= $error;
                 }
-            } catch (\Throwable $error) {
-                $failure = $error;
             }
             // Every step runs: an earlier failure must not leave the persistence child alive.
             foreach ($this->shutdown($budget) as $step) {
@@ -149,19 +144,15 @@ final class Broker
             if (null !== $subscription) {
                 $cancellation?->unsubscribe($subscription);
             }
-            // Ownership release is collected like every other step: a late release failure
-            // must not mask the earlier error that actually failed the shutdown. It is not
-            // budgeted, because the child is already force-stopped and the release must happen
-            // before another broker may take the database or the endpoint.
+            // Identity-checked socket removal and lock release are collected like every other
+            // step: a late failure must not mask the earlier error that actually failed the
+            // shutdown. They are not budgeted, because the child is already force-stopped and
+            // the release must happen before another broker may take the database or endpoint.
             try {
-                $this->ownership->close();
+                $this->releaseEndpointAndLocks();
             } catch (\Throwable $error) {
                 $failure ??= $error;
             }
-            // Flush only after cleanup and ownership release. A hung observer cannot delay stop,
-            // escalation, or resource release, and an empty on-disk file during a hang no longer
-            // identifies which in-memory stage was last reached.
-            $this->flushDiagnostics();
             if (null !== $failure) {
                 throw $failure;
             }
@@ -181,7 +172,7 @@ final class Broker
         }
         $this->server->close();
         foreach ($this->clients as $client) {
-            $this->queue->closeSession($client['session']);
+            $client['lifetime']->cancel();
             $client['socket']->close();
         }
     }
@@ -189,18 +180,14 @@ final class Broker
     /** Arms the single shutdown deadline; only the first stop request may reach this. */
     private function armShutdownDeadline(): void
     {
-        // The timer is installed before any milestone is recorded, so recording cannot prevent arming.
         $this->shutdownTimer = EventLoop::delay(self::SHUTDOWN_BUDGET_SECONDS, function (): void {
             $this->failed = true;
-            $this->diagnose('deadline-fired');
             // The kill is the only action that releases a storage worker that stopped answering:
             // the driver marks its connection closed before its graceful close returns, so a
             // repeated close cannot interrupt such a worker. Escalate before releasing the awaits,
             // so the child is dead before any caller resumes.
-            $this->releaseBudgetAfter($this->deadline, $this->persistence->forceStop(...));
+            $this->releaseBudgetAfter($this->deadline, $this->worker->forceStop(...));
         });
-        $this->diagnose('shutdown-requested');
-        $this->diagnose('deadline-armed');
     }
 
     /**
@@ -208,9 +195,7 @@ final class Broker
      *
      * A force-stop failure must not escape into the event loop, and it must not leave the budget
      * unreleased either: the failure becomes the cancellation cause, so the awaiters resume with
-     * the real reason instead of waiting for a deadline that already fired. Releasing the budget
-     * happens before the milestone is recorded, so recording cannot delay the awaiters. The
-     * optional observer still runs only after ownership release.
+     * the real reason instead of waiting for a deadline that already fired.
      *
      * @param DeferredCancellation $deadline  the single shutdown budget to release
      * @param \Closure(): void     $forceStop
@@ -224,7 +209,6 @@ final class Broker
             $cause = $error;
         } finally {
             $deadline->cancel($cause);
-            $this->diagnose('persistence-force-stop');
         }
     }
 
@@ -238,41 +222,41 @@ final class Broker
         $this->shutdownTimer = null;
     }
 
-    /** Reports one shutdown milestone to the optional observer; no payload, nothing when disabled. */
-    private function diagnose(string $milestone): void
-    {
-        // Memory only during shutdown. Flushing the optional observer happens after ownership release.
-        $this->milestones[] = ['event' => $milestone, 'pid' => (int) getmypid(), 'monotonic_ns' => (int) hrtime(true)];
-    }
-
-    /** Delivers buffered milestones after cleanup. Observer failures cannot undo completed work. */
-    private function flushDiagnostics(): void
-    {
-        $observer = $this->diagnostic;
-        $events = $this->milestones;
-        $this->milestones = [];
-        $this->diagnostic = null;
-        if (null === $observer) {
-            return;
-        }
-        foreach ($events as $event) {
-            try {
-                $observer($event);
-            } catch (\Throwable) {
-            }
-        }
-    }
-
     /** @return list<\Closure(): void> Storage steps whose failure must not skip later steps. */
     private function shutdown(Cancellation $budget): array
     {
         return [
-            $this->queue->close(...),
-            // Queue owns the SQLite connection. Persistence remains the independent force-stop path.
+            $this->storage->close(...),
+            // Storage owns the SQLite connection. SqliteWorkerHandle remains the independent force-stop path.
             function () use ($budget): void {
-                $this->persistence->close($budget);
+                $this->worker->close($budget);
             },
         ];
+    }
+
+    /**
+     * Removes this broker's socket inode when it still matches, then releases the lifetime locks.
+     *
+     * A failed socket removal must not skip lock release.
+     */
+    private function releaseEndpointAndLocks(): void
+    {
+        $failure = null;
+        if ($this->socketIdentity->matches($this->locks->endpoint)) {
+            try {
+                (new Filesystem())->remove($this->locks->endpoint);
+            } catch (\Throwable $error) {
+                $failure = $error;
+            }
+        }
+        try {
+            $this->locks->close();
+        } catch (\Throwable $error) {
+            $failure ??= $error;
+        }
+        if (null !== $failure) {
+            throw $failure;
+        }
     }
 
     /**
@@ -296,7 +280,7 @@ final class Broker
         }
     }
 
-    private function serve(Socket $socket, string $session): void
+    private function serve(Socket $socket, string $ownerId, Cancellation $lifetime): void
     {
         $expected = 0;
         try {
@@ -309,22 +293,16 @@ final class Broker
                 try {
                     $operation = $this->validateRequest($request, $expected);
                 } catch (ProtocolException $error) {
-                    // Answer decode errors where they are caught: the reply below ends this
-                    // session unless the queue name alone was bad.
                     $this->writeError($socket, $expected, $error->errorCode);
-                    if (ErrorCode::InvalidQueueName !== $error->errorCode) {
-                        return;
-                    }
-                    // A bad queue name stays recoverable: the session survives and the sequence advances.
-                    ++$expected;
-                    continue;
+
+                    return;
                 }
                 if (0 === $expected) {
                     $response = new Frame(['v' => Frame::VERSION, 'id' => 0, 'ok' => true, 'result' => ['max_payload' => Frame::MAX_PAYLOAD]]);
                 } else {
                     try {
-                        $response = $this->dispatch($request, $operation, $session, $expected);
-                    } catch (InvalidReceipt) {
+                        $response = $this->dispatch($request, $operation, $ownerId, $lifetime, $expected);
+                    } catch (InvalidReceiptException) {
                         $response = self::error($expected, ErrorCode::StaleReceipt);
                     } catch (ProtocolException $error) {
                         if (ErrorCode::InvalidQueueName === $error->errorCode) {
@@ -370,21 +348,22 @@ final class Broker
     private function validateRequest(Frame $request, int $expected): Operation
     {
         $control = $request->control;
-        if (($control['v'] ?? null) !== Frame::VERSION) {
+        if (($control[ControlField::Version->value] ?? null) !== Frame::VERSION) {
             throw new ProtocolException(ErrorCode::UnsupportedProtocolVersion, 'Unsupported protocol version.');
         }
-        $name = $control['op'] ?? null;
+        $name = $control[ControlField::Operation->value] ?? null;
         $operation = \is_string($name) ? Operation::tryFrom($name) : null;
-        if (($control['id'] ?? null) !== $expected || null === $operation) {
+        if (($control[ControlField::Id->value] ?? null) !== $expected || null === $operation) {
             throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid request sequence or operation.');
         }
-        $fields = match ($operation) {
-            Operation::Hello => [],
-            Operation::Send => ['queue', 'delay'],
-            Operation::Receive => ['queue'],
-            Operation::Acknowledge, Operation::Reject => ['receipt'],
-        };
-        if ([] !== array_diff(array_keys($control), ['v', 'id', 'op', 'body_length', 'headers_length', ...$fields])) {
+        $common = [
+            ControlField::Version->value,
+            ControlField::Id->value,
+            ControlField::Operation->value,
+            ControlField::BodyLength->value,
+            ControlField::HeadersLength->value,
+        ];
+        if ([] !== array_diff(array_keys($control), [...$common, ...$operation->allowedFields()])) {
             throw new ProtocolException(ErrorCode::InvalidRequest, 'Unsupported control field.');
         }
         if (0 === $expected && (Operation::Hello !== $operation || '' !== $request->body || '' !== $request->headers)) {
@@ -397,24 +376,24 @@ final class Broker
         return $operation;
     }
 
-    private function dispatch(Frame $request, Operation $operation, string $session, int $id): Frame
+    private function dispatch(Frame $request, Operation $operation, string $ownerId, Cancellation $lifetime, int $id): Frame
     {
         if (Operation::Send === $operation) {
-            return $this->store($request, $id);
+            return $this->store($request, $lifetime, $id);
         }
         if (Operation::Receive === $operation) {
-            return $this->claim($request, $session, $id);
+            return $this->claim($request, $ownerId, $lifetime, $id);
         }
         if (Operation::Acknowledge === $operation || Operation::Reject === $operation) {
-            return $this->settle($request, $operation, $session, $id);
+            return $this->settle($request, $operation, $ownerId, $lifetime, $id);
         }
         throw new ProtocolException(ErrorCode::InvalidRequest, 'Unsupported operation.');
     }
 
-    private function store(Frame $request, int $id): Frame
+    private function store(Frame $request, Cancellation $lifetime, int $id): Frame
     {
-        $name = $this->queueName($request->control['queue'] ?? null);
-        $delay = $request->control['delay'] ?? null;
+        $name = $this->queueName($request->control[ControlField::Queue->value] ?? null);
+        $delay = $request->control[ControlField::Delay->value] ?? null;
         if (!\is_int($delay)) {
             throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid delay.');
         }
@@ -422,50 +401,58 @@ final class Broker
             throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid delay.');
         }
 
-        return self::ok($id, $this->queue->send($name, $request->body, $request->headers, $delay));
+        return self::ok($id, $this->queue->send($name, $request->body, $request->headers, $delay, $lifetime));
     }
 
-    private function claim(Frame $request, string $session, int $id): Frame
+    private function claim(Frame $request, string $ownerId, Cancellation $lifetime, int $id): Frame
     {
         $this->assertNoPayload($request);
-        $name = $this->queueName($request->control['queue'] ?? null);
-        $delivery = $this->queue->receive($name, $session);
+        $name = $this->queueName($request->control[ControlField::Queue->value] ?? null);
+        $delivery = $this->queue->receive($name, $ownerId, $lifetime);
         if (null === $delivery) {
             return self::ok($id, null);
         }
 
-        return new Frame(['v' => Frame::VERSION, 'id' => $id, 'ok' => true, 'result' => [
-            'id' => $delivery->id, 'queue' => $delivery->queue, 'receipt' => $delivery->receipt,
-            'available_at' => $delivery->availableAt, 'reserved_until' => $delivery->reservedUntil,
-        ]], $delivery->body, $delivery->headers);
+        return new Frame([
+            ControlField::Version->value => Frame::VERSION,
+            ControlField::Id->value => $id,
+            ControlField::Ok->value => true,
+            ControlField::Result->value => [
+                ControlField::Id->value => $delivery->id,
+                ControlField::Queue->value => $delivery->queue,
+                ControlField::Receipt->value => $delivery->receipt,
+                ControlField::AvailableAt->value => $delivery->availableAt,
+                ControlField::ReservedUntil->value => $delivery->reservedUntil,
+            ],
+        ], $delivery->body, $delivery->headers);
     }
 
-    private function settle(Frame $request, Operation $operation, string $session, int $id): Frame
+    private function settle(Frame $request, Operation $operation, string $ownerId, Cancellation $lifetime, int $id): Frame
     {
         $this->assertNoPayload($request);
-        $receipt = $request->control['receipt'] ?? null;
+        $receipt = $request->control[ControlField::Receipt->value] ?? null;
         if (!\is_string($receipt)) {
             throw new ProtocolException(ErrorCode::InvalidRequest, 'Missing receipt.');
         }
         if (Operation::Acknowledge === $operation) {
-            $this->queue->acknowledge($receipt, $session);
+            $this->queue->acknowledge($receipt, $ownerId, $lifetime);
         } else {
-            $this->queue->reject($receipt, $session);
+            $this->queue->reject($receipt, $ownerId, $lifetime);
         }
 
         return self::ok($id, null);
     }
 
-    private function queueName(mixed $name): string
+    private function queueName(mixed $name): QueueName
     {
         if (!\is_string($name)) {
             throw new ProtocolException(ErrorCode::InvalidQueueName, 'Invalid queue name.');
         }
-        if (1 !== preg_match(Queue::NAME_PATTERN, $name)) {
+        try {
+            return new QueueName($name);
+        } catch (\InvalidArgumentException) {
             throw new ProtocolException(ErrorCode::InvalidQueueName, 'Invalid queue name.');
         }
-
-        return $name;
     }
 
     private function assertNoPayload(Frame $request): void
@@ -477,12 +464,22 @@ final class Broker
 
     private static function ok(int $id, ?int $result): Frame
     {
-        return new Frame(['v' => Frame::VERSION, 'id' => $id, 'ok' => true, 'result' => $result]);
+        return new Frame([
+            ControlField::Version->value => Frame::VERSION,
+            ControlField::Id->value => $id,
+            ControlField::Ok->value => true,
+            ControlField::Result->value => $result,
+        ]);
     }
 
     private static function error(int $id, ErrorCode $code): Frame
     {
-        return new Frame(['v' => Frame::VERSION, 'id' => $id, 'ok' => false, 'error' => ['code' => $code->value]]);
+        return new Frame([
+            ControlField::Version->value => Frame::VERSION,
+            ControlField::Id->value => $id,
+            ControlField::Ok->value => false,
+            ControlField::Error->value => [ControlField::Code->value => $code->value],
+        ]);
     }
 
     /** Best-effort error reply: a malformed or disconnected peer may be unable to receive it. */

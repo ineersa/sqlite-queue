@@ -7,7 +7,7 @@ namespace Ineersa\SqliteQueue\Tests\Broker\Fixtures;
 use Amp\Sync\Channel;
 
 /*
- * Minimal worker for PersistenceFactoryTest.
+ * Minimal worker for SqliteWorkerContextFactoryTest.
  *
  * Reports readiness over the parent channel and then blocks until the parent kills it.
  */

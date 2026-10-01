@@ -4,11 +4,12 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Tests\Driver;
 
+use Amp\DeferredFuture;
+use Amp\TimeoutCancellation;
 use Fabpot\Amp\Sqlite\SqliteConfig;
 use Fabpot\Amp\Sqlite\SqliteConnector;
 
 use function Amp\async;
-use function Amp\delay;
 
 /**
  * The queue engine must serialize complete storage operations. These checks show that the
@@ -33,16 +34,17 @@ final class OperationSerializationTest extends DriverTestCase
                 $transaction = $connection->beginTransaction();
                 $transaction->execute('INSERT INTO item (label) VALUES (?)', ['pending']);
 
-                $startedAt = microtime(true);
-                $concurrent = async(static function () use ($connection, $startedAt): array {
+                $entered = new DeferredFuture();
+                $concurrent = async(static function () use ($connection, $entered): int {
+                    $entered->complete();
                     $result = $connection->query('SELECT count(*) c FROM item');
                     $row = $result->fetchRow();
                     $result->close();
 
-                    return [microtime(true) - $startedAt, $row['c']];
+                    return $row['c'];
                 });
 
-                delay(0.1);
+                $entered->getFuture()->await(new TimeoutCancellation(10));
 
                 self::assertFalse(
                     $concurrent->isComplete(),
@@ -51,10 +53,9 @@ final class OperationSerializationTest extends DriverTestCase
 
                 $transaction->rollback();
 
-                [$elapsed, $count] = $concurrent->await();
+                $count = $concurrent->await(new TimeoutCancellation(10));
                 $concurrent = null;
 
-                self::assertGreaterThanOrEqual(0.1, $elapsed);
                 self::assertSame(1, $count, 'The concurrent operation observed an uncommitted row.');
             } finally {
                 if (null !== $concurrent) {

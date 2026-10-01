@@ -18,7 +18,7 @@ declare(strict_types=1);
  * Arguments: <log> <database> <endpoint>
  */
 
-use Ineersa\SqliteQueue\Broker\Command;
+use Ineersa\SqliteQueue\Command\BrokerCommand;
 use Revolt\EventLoop;
 use Revolt\EventLoop\Driver\StreamSelectDriver;
 use Symfony\Component\Console\Application;
@@ -193,7 +193,7 @@ SignalWindowStream::install($log);
 $application = new Application('SQLite queue broker');
 $application->setCatchExceptions(false);
 $application->setAutoExit(false);
-$application->addCommand(new Command());
+$application->addCommand(new BrokerCommand());
 $input = new ArrayInput(['command' => 'broker', '--database' => $database, '--endpoint' => $endpoint]);
 
 try {

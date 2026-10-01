@@ -12,6 +12,10 @@ use Fabpot\Amp\Sqlite\SqliteJournalMode;
 use Fabpot\Amp\Sqlite\SqliteSynchronousMode;
 use Fabpot\Amp\Sqlite\SqliteTransactionMode;
 use Ineersa\SqliteQueue\Queue;
+use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
+use Ineersa\SqliteQueue\Sqlite\SqliteWorkerContextFactory;
+use Symfony\Component\Filesystem\Exception\IOException;
+use Symfony\Component\Filesystem\Filesystem;
 
 use function Amp\Socket\listen;
 
@@ -19,13 +23,13 @@ use function Amp\Socket\listen;
  * Acquires every resource a Broker needs, then hands over a fully initialized service.
  *
  * Steps release in reverse order when a later step fails, so a partial startup never
- * keeps ownership, a socket, or a persistence child. Failed steps are best-effort:
+ * keeps lifetime locks, a socket, or a SQLite worker. Failed steps are best-effort:
  * the original failure is what the caller receives.
  */
 final class BrokerFactory
 {
     private const int BUSY_TIMEOUT_MS = 5000;
-    /** Budget for observing the persistence pipes while a failed startup releases resources, in seconds. */
+    /** Budget for observing the SQLite worker pipes while a failed startup releases resources, in seconds. */
     private const int RELEASE_BUDGET_SECONDS = 5;
 
     /**
@@ -42,7 +46,7 @@ final class BrokerFactory
     ) {
     }
 
-    public function listen(): Broker
+    public function create(): Broker
     {
         // Capability check before acquisition: private path validation calls posix_geteuid(),
         // and a disabled extension would otherwise surface as an undefined-function Error
@@ -52,44 +56,59 @@ final class BrokerFactory
         }
         /** @var list<callable(): void> */
         $release = [];
-        $persistenceFactory = new PersistenceFactory();
+        $filesystem = new Filesystem();
+        $workerFactory = new SqliteWorkerContextFactory();
         try {
-            $ownership = new Ownership($this->database, $this->endpoint);
-            $release[] = $ownership->close(...);
-            $config = (new SqliteConfig($ownership->database))
+            $locks = new BrokerLifetimeLocks($this->database, $this->endpoint);
+            $release[] = $locks->close(...);
+            $this->prepareDatabaseFile($locks->database, $filesystem);
+            clearstatcache(true, $locks->endpoint);
+            if ($filesystem->exists($locks->endpoint) || is_link($locks->endpoint)) {
+                throw new \RuntimeException('Endpoint already exists; it will not be removed without verified ownership.');
+            }
+            $config = (new SqliteConfig($locks->database))
                 ->withJournalMode(SqliteJournalMode::Wal)
                 ->withSynchronousMode(SqliteSynchronousMode::Full)
                 ->withTransactionMode(SqliteTransactionMode::Immediate)
                 ->withBusyTimeout(self::BUSY_TIMEOUT_MS);
-            $connection = (new SqliteConnector($persistenceFactory))->connect($config, $this->cancellation);
-            $persistence = $persistenceFactory->persistence();
+            $connection = (new SqliteConnector($workerFactory))->connect($config, $this->cancellation);
+            $worker = $workerFactory->worker();
             // Pushed before the connection so cleanup still closes the connection first.
-            $release[] = static function () use ($persistence): void {
-                $persistence->close(new TimeoutCancellation(self::RELEASE_BUDGET_SECONDS));
+            $release[] = static function () use ($worker): void {
+                $worker->close(new TimeoutCancellation(self::RELEASE_BUDGET_SECONDS));
             };
             $release[] = $connection->close(...);
-            // Queue closes the transferred connection when its own initialization fails.
-            $queue = new Queue($connection, $this->visibilityTimeout, $this->clock);
-            // After Queue construction succeeds, it owns the connection. Replace the direct
-            // connection close with Queue::close so a later startup failure does not close twice.
+            // Storage becomes the sole connection owner after construction succeeds.
+            $storage = SqliteQueueStorage::fromConnection($connection);
             array_pop($release);
-            $release[] = $queue->close(...);
+            $release[] = $storage->close(...);
+            $queue = new Queue($storage, $this->visibilityTimeout, $this->clock);
             $mask = umask(0077);
             try {
-                $server = listen('unix://'.$ownership->endpoint);
+                $server = listen('unix://'.$locks->endpoint);
             } finally {
                 umask($mask);
             }
             $release[] = $server->close(...);
-            $ownership->recordSocket();
+            $socketIdentity = SocketIdentity::fromEndpoint($locks->endpoint);
+            $release[] = static function () use ($socketIdentity, $locks, $filesystem): void {
+                if ($socketIdentity->matches($locks->endpoint)) {
+                    $filesystem->remove($locks->endpoint);
+                }
+            };
+            try {
+                $filesystem->chmod($locks->endpoint, 0600);
+            } catch (IOException $error) {
+                throw new \RuntimeException('Cannot make socket private.', 0, $error);
+            }
 
-            return new Broker($server, $queue, $persistence, $ownership);
+            return new Broker($server, $queue, $storage, $worker, $locks, $socketIdentity);
         } catch (\Throwable $error) {
             // Kill any spawned child before graceful releases: connect() may fail after the
-            // connector starts the worker but before the handle is assigned, and a wedged
+            // connector starts the worker but before the handle is assigned, and a stuck
             // worker would block the connection close below.
             try {
-                $persistenceFactory->forceStopAll();
+                $workerFactory->forceStopAll();
             } catch (\Throwable) {
                 // Best-effort: the original failure is what the caller receives.
             }
@@ -100,6 +119,36 @@ final class BrokerFactory
                 }
             }
             throw $error;
+        }
+    }
+
+    private function prepareDatabaseFile(string $path, Filesystem $filesystem): void
+    {
+        clearstatcache(true, $path);
+        if (is_link($path)) {
+            throw new \RuntimeException('Database path must be a regular file, not a symlink.');
+        }
+        if (!$filesystem->exists($path)) {
+            $mask = umask(0077);
+            try {
+                $filesystem->touch($path);
+            } catch (IOException $error) {
+                throw new \RuntimeException('Cannot open database file.', 0, $error);
+            } finally {
+                umask($mask);
+            }
+            try {
+                $filesystem->chmod($path, 0600);
+            } catch (IOException $error) {
+                throw new \RuntimeException('Cannot open database file.', 0, $error);
+            }
+            clearstatcache(true, $path);
+        }
+        // Native stat has no Symfony equivalent; checking here keeps the hardlink, owner,
+        // and mode defenses on the database file that this broker will actually use.
+        $stat = stat($path);
+        if (false === $stat || !is_file($path) || $stat['uid'] !== posix_geteuid() || 0 !== ($stat['mode'] & 0077) || 1 !== $stat['nlink']) {
+            throw new \RuntimeException('Database unavailable or file is not private and singly linked.');
         }
     }
 }

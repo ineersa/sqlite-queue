@@ -6,8 +6,9 @@ namespace Ineersa\SqliteQueue\Tests\Broker;
 
 use Amp\ByteStream\PendingReadError;
 use Amp\CancelledException;
+use Amp\DeferredCancellation;
 use Amp\TimeoutCancellation;
-use Ineersa\SqliteQueue\Broker\PersistenceFactory;
+use Ineersa\SqliteQueue\Sqlite\SqliteWorkerContextFactory;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
 use PHPUnit\Framework\TestCase;
@@ -16,12 +17,12 @@ use Revolt\EventLoop\CallbackType;
 
 use function Amp\async;
 
-final class PersistenceFactoryTest extends TestCase
+final class SqliteWorkerContextFactoryTest extends TestCase
 {
     /** Path fragment that identifies this test's probe child in the process tree. */
     private const PROBE_SCRIPT = 'persistence-probe.php';
 
-    private ?PersistenceFactory $factory = null;
+    private ?SqliteWorkerContextFactory $factory = null;
     private ?int $probePid = null;
     private ?int $launcherPid = null;
 
@@ -54,14 +55,14 @@ final class PersistenceFactoryTest extends TestCase
             $this->markTestSkipped('The /proc filesystem is unavailable.');
         }
         async(function (): void {
-            $factory = new PersistenceFactory();
+            $factory = new SqliteWorkerContextFactory();
             $this->factory = $factory;
             $context = $factory->start([__DIR__.'/Fixtures/persistence-probe.php'], new TimeoutCancellation(10));
             // Readiness comes from the child itself, not from a sleep: a child that dies
             // naturally can never send this.
             $this->assertSame('ready', $context->receive(new TimeoutCancellation(10)));
             $this->assertCount(1, $factory->created());
-            $pid = $factory->persistence()->pid();
+            $pid = $factory->worker()->pid();
             $this->probePid = $pid;
             $this->assertArrayHasKey($pid, ProcessTree::snapshot(), 'The spawned child must be observable before the kill.');
 
@@ -84,12 +85,12 @@ final class PersistenceFactoryTest extends TestCase
             $this->markTestSkipped('The /proc filesystem is unavailable.');
         }
         async(function (): void {
-            $factory = new PersistenceFactory();
+            $factory = new SqliteWorkerContextFactory();
             $this->factory = $factory;
             $context = $factory->start([__DIR__.'/Fixtures/persistence-probe.php'], new TimeoutCancellation(10));
             $this->assertSame('ready', $context->receive(new TimeoutCancellation(10)));
-            $persistence = $factory->persistence();
-            $this->probePid = $persistence->pid();
+            $worker = $factory->worker();
+            $this->probePid = $worker->pid();
 
             // The drain reads are queued tasks, so run the loop once to put both pipes under a
             // watcher that keeps the loop alive.
@@ -97,7 +98,7 @@ final class PersistenceFactoryTest extends TestCase
             $watched = $this->enabledReadableWatchers();
             $this->assertCount(2, $watched, 'Both pipe reads must hold an enabled, referenced watcher before shutdown.');
 
-            $launcher = $this->launcherFor($persistence->pid());
+            $launcher = $this->launcherFor($worker->pid());
             if (null === $launcher) {
                 $this->fail('The probe child must run behind the shell launcher Amp creates for it.');
             }
@@ -111,9 +112,14 @@ final class PersistenceFactoryTest extends TestCase
 
                 // A stopped launcher holds the pipe write ends, so the pipes never reach EOF and
                 // only the shared budget can end the wait.
+                $budget = new DeferredCancellation();
+                $closing = async(static fn () => $worker->close($budget->getCancellation()));
+                $this->turnEventLoop();
+                $this->assertFalse($closing->isComplete(), 'Open pipe writers must keep close pending.');
+                $budget->cancel();
                 $expired = false;
                 try {
-                    $persistence->close(new TimeoutCancellation(0.5));
+                    $closing->await(new TimeoutCancellation(10));
                 } catch (CancelledException) {
                     $expired = true;
                 }
@@ -129,8 +135,12 @@ final class PersistenceFactoryTest extends TestCase
                 }
 
                 // A settled read releases the stream's read slot; a pending one rejects a second read.
+                $readCancellation = new DeferredCancellation();
+                $read = async(static fn () => $context->getStdout()->read($readCancellation->getCancellation()));
+                $this->turnEventLoop();
+                $readCancellation->cancel();
                 try {
-                    $context->getStdout()->read(new TimeoutCancellation(0.1));
+                    $read->await(new TimeoutCancellation(10));
                     $this->fail('The probe read must end through its own cancellation, not with data or EOF.');
                 } catch (PendingReadError) {
                     $this->fail('The cancelled pipe read must not stay pending after shutdown.');
@@ -168,7 +178,7 @@ final class PersistenceFactoryTest extends TestCase
             putenv('PHP_INI_SCAN_DIR='.(\is_string($existingScan) && '' !== $existingScan ? $existingScan.':' : ':').$scan->directory());
 
             async(function () use ($marker, $directive, $markerValue, $configValue, $temporary): void {
-                $factory = new PersistenceFactory();
+                $factory = new SqliteWorkerContextFactory();
                 $this->factory = $factory;
                 $context = $factory->start(
                     [__DIR__.'/Fixtures/persistence-env-probe.php', $marker, $directive],
