@@ -301,8 +301,9 @@ final class Client
 
     private function brokerRejection(ErrorCode $code): \Throwable
     {
-        if (ErrorCode::StaleReceipt === $code) {
-            return new InvalidReceiptException('Broker rejected a stale or foreign receipt.');
+        $receiptError = $code->receiptException();
+        if (null !== $receiptError) {
+            return $receiptError;
         }
         if (ErrorCode::InvalidQueueName === $code) {
             return new \InvalidArgumentException('Broker rejected the queue name.');

@@ -77,6 +77,8 @@ final class SqliteQueueStorage
         }
     }
 
+    // A shallow clone would share the owned connection and mutex but copy lifecycle state.
+    // Prevent that unsafe sharing; independent storage instances are still allowed.
     private function __clone(): void
     {
     }
@@ -92,13 +94,7 @@ final class SqliteQueueStorage
             ->withSynchronousMode(SqliteSynchronousMode::Full)
             ->withTransactionMode(SqliteTransactionMode::Immediate);
 
-        return self::fromConnection((new SqliteConnector())->connect($config, $cancellation));
-    }
-
-    /** Transfer an existing WAL/FULL connection into storage ownership. */
-    public static function fromConnection(SqliteConnection $connection): self
-    {
-        return new self($connection);
+        return new self((new SqliteConnector())->connect($config, $cancellation));
     }
 
     /**
@@ -214,18 +210,19 @@ final class SqliteQueueStorage
      * `$beforeCommit` runs after a successful DELETE and before commit so a disconnect can roll
      * the settlement back. It is required on every call.
      *
+     * Failure precedence is no active reservation, owner, epoch, token, then expiry.
+     * Diagnosis uses the same write transaction and sampled clock as DELETE.
+     *
      * @param \Closure(): int  $clock        sampled after transaction acquisition to fence expiry at the write boundary
      * @param \Closure(): void $beforeCommit
      *
-     * @return bool true when exactly one fenced row was deleted
-     *
      * @throws \LogicException when called outside {@see exclusive()}
      */
-    public function settle(int $id, string $token, string $ownerId, string $epoch, \Closure $clock, \Closure $beforeCommit): bool
+    public function settle(int $id, string $token, string $ownerId, string $epoch, \Closure $clock, \Closure $beforeCommit): SettlementResultEnum
     {
         $this->assertOwned();
-        /** @var bool $settled */
-        $settled = $this->transaction(static function (SqliteTransaction $transaction) use ($id, $token, $ownerId, $epoch, $clock, $beforeCommit): bool {
+        /** @var SettlementResultEnum $settled */
+        $settled = $this->transaction(function (SqliteTransaction $transaction) use ($id, $token, $ownerId, $epoch, $clock, $beforeCommit): SettlementResultEnum {
             $now = $clock();
             $result = $transaction->execute(
                 'DELETE FROM queue_messages WHERE id = ? AND reservation_token = ? AND owner_id = ? AND broker_epoch = ? AND reserved_until > ?',
@@ -233,12 +230,15 @@ final class SqliteQueueStorage
             );
             $changed = $result->getRowCount();
             $result->close();
+            if (0 === $changed) {
+                return $this->settlementFailure($transaction, $id, $token, $ownerId, $epoch, $now);
+            }
             if (1 !== $changed) {
-                return false;
+                throw new \RuntimeException('Settlement DELETE did not affect exactly one reservation.');
             }
             $beforeCommit();
 
-            return true;
+            return SettlementResultEnum::Settled;
         });
 
         return $settled;
@@ -284,6 +284,45 @@ final class SqliteQueueStorage
             }
             throw $error;
         }
+    }
+
+    private function settlementFailure(SqliteTransaction $transaction, int $id, string $token, string $ownerId, string $epoch, int $now): SettlementResultEnum
+    {
+        $result = $transaction->execute(
+            'SELECT owner_id, broker_epoch, reservation_token, reserved_until FROM queue_messages WHERE id = ?',
+            [$id],
+        );
+        $row = $result->fetchRow();
+        $result->close();
+        if (null === $row || null === $row['reserved_until']) {
+            return SettlementResultEnum::NoActiveReservation;
+        }
+        if (!\is_string($row['owner_id'])) {
+            throw new \RuntimeException('Stored reservation owner must be a string.');
+        }
+        if (!\is_string($row['broker_epoch'])) {
+            throw new \RuntimeException('Stored reservation epoch must be a string.');
+        }
+        if (!\is_string($row['reservation_token'])) {
+            throw new \RuntimeException('Stored reservation token must be a string.');
+        }
+        if (!\is_int($row['reserved_until'])) {
+            throw new \RuntimeException('Stored reservation expiry must be an integer.');
+        }
+        if ($ownerId !== $row['owner_id']) {
+            return SettlementResultEnum::OwnerMismatch;
+        }
+        if ($epoch !== $row['broker_epoch']) {
+            return SettlementResultEnum::EpochMismatch;
+        }
+        if ($token !== $row['reservation_token']) {
+            return SettlementResultEnum::TokenMismatch;
+        }
+        if ($row['reserved_until'] <= $now) {
+            return SettlementResultEnum::Expired;
+        }
+
+        throw new \RuntimeException('Settlement DELETE failed despite a matching active reservation.');
     }
 
     private function assertOwned(): void

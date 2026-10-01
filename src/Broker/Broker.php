@@ -11,6 +11,7 @@ use Amp\Future;
 use Amp\Socket\ServerSocket;
 use Amp\Socket\Socket;
 use Amp\TimeoutCancellation;
+use Ineersa\SqliteQueue\Exception\ClientContextClosedException;
 use Ineersa\SqliteQueue\Exception\InvalidReceiptException;
 use Ineersa\SqliteQueue\Protocol\ControlField;
 use Ineersa\SqliteQueue\Protocol\ErrorCode;
@@ -88,7 +89,7 @@ final class Broker
         try {
             $cancellation?->throwIfRequested();
             if (!$this->stopping) {
-                $ready?->__invoke(['event' => 'ready', 'pid' => getmypid(), 'persistence_pid' => $this->worker->pid(), 'database' => $this->locks->database, 'endpoint' => $this->locks->endpoint]);
+                $ready?->__invoke(['event' => BrokerEventEnum::Ready->value, 'pid' => getmypid(), 'persistence_pid' => $this->worker->pid(), 'database' => $this->locks->database, 'endpoint' => $this->locks->endpoint]);
             }
             while (!$this->stopping && null !== ($socket = $this->server->accept())) {
                 if (\count($this->clients) >= self::MAX_CONNECTIONS) {
@@ -302,8 +303,11 @@ final class Broker
                 } else {
                     try {
                         $response = $this->dispatch($request, $operation, $ownerId, $lifetime, $expected);
-                    } catch (InvalidReceiptException) {
-                        $response = self::error($expected, ErrorCode::StaleReceipt);
+                    } catch (ClientContextClosedException) {
+                        // Disconnect and shutdown cancellation end the session, not the broker.
+                        return;
+                    } catch (InvalidReceiptException $error) {
+                        $response = self::error($expected, ErrorCode::fromReceiptException($error));
                     } catch (ProtocolException $error) {
                         if (ErrorCode::InvalidQueueName === $error->errorCode) {
                             // A bad queue name stays recoverable: the session survives and the sequence advances.

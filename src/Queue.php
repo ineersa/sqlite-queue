@@ -8,7 +8,14 @@ use Amp\Cancellation;
 use Amp\CancelledException;
 use Amp\NullCancellation;
 use Ineersa\SqliteQueue\DTO\DeliveryDTO;
-use Ineersa\SqliteQueue\Exception\InvalidReceiptException;
+use Ineersa\SqliteQueue\Exception\ClientContextClosedException;
+use Ineersa\SqliteQueue\Exception\ExpiredReceiptException;
+use Ineersa\SqliteQueue\Exception\MalformedReceiptException;
+use Ineersa\SqliteQueue\Exception\NoActiveReservationException;
+use Ineersa\SqliteQueue\Exception\ReceiptEpochMismatchException;
+use Ineersa\SqliteQueue\Exception\ReceiptOwnerMismatchException;
+use Ineersa\SqliteQueue\Exception\ReceiptTokenMismatchException;
+use Ineersa\SqliteQueue\Sqlite\SettlementResultEnum;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 
@@ -109,13 +116,17 @@ final class Queue
     private function settle(string $receipt, string $ownerId, ?Cancellation $cancellation): void
     {
         if (1 !== preg_match('/\A([1-9][0-9]*):([a-f0-9]{64})\z/D', $receipt, $parts)) {
-            throw new InvalidReceiptException('Invalid delivery receipt.');
+            throw new MalformedReceiptException();
+        }
+        $id = filter_var($parts[1], \FILTER_VALIDATE_INT);
+        if (false === $id) {
+            throw new MalformedReceiptException();
         }
         $cancellation ??= new NullCancellation();
-        $this->storage->exclusive(function () use ($parts, $ownerId, $cancellation): void {
+        $this->storage->exclusive(function () use ($id, $parts, $ownerId, $cancellation): void {
             $this->assertActive($cancellation);
             $settled = $this->storage->settle(
-                (int) $parts[1],
+                $id,
                 $parts[2],
                 $ownerId,
                 $this->epoch,
@@ -124,9 +135,14 @@ final class Queue
                     $this->assertActive($cancellation);
                 },
             );
-            if (!$settled) {
-                throw new InvalidReceiptException('Expired, unknown, or foreign delivery receipt.');
-            }
+            match ($settled) {
+                SettlementResultEnum::Settled => null,
+                SettlementResultEnum::NoActiveReservation => throw new NoActiveReservationException(),
+                SettlementResultEnum::OwnerMismatch => throw new ReceiptOwnerMismatchException(),
+                SettlementResultEnum::EpochMismatch => throw new ReceiptEpochMismatchException(),
+                SettlementResultEnum::TokenMismatch => throw new ReceiptTokenMismatchException(),
+                SettlementResultEnum::Expired => throw new ExpiredReceiptException(),
+            };
         });
     }
 
@@ -140,7 +156,7 @@ final class Queue
         try {
             $cancellation->throwIfRequested();
         } catch (CancelledException $error) {
-            throw new InvalidReceiptException('Unknown or disconnected client context.', previous: $error);
+            throw new ClientContextClosedException('The client connection lifetime was cancelled.', previous: $error);
         }
     }
 

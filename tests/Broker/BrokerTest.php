@@ -15,12 +15,14 @@ use Ineersa\SqliteQueue\Broker\BrokerFactory;
 use Ineersa\SqliteQueue\Client;
 use Ineersa\SqliteQueue\Exception\InvalidReceiptException;
 use Ineersa\SqliteQueue\Exception\TransportException;
+use Ineersa\SqliteQueue\Protocol\ErrorCode;
 use Ineersa\SqliteQueue\Protocol\Frame;
 use Ineersa\SqliteQueue\Tests\Broker\Fixtures\GatingServerSocket;
 use Ineersa\SqliteQueue\Tests\Broker\Fixtures\WriteGate;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\DataProviderExternal;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
 
@@ -204,6 +206,103 @@ final class BrokerTest extends TestCase
             }
             $other->acknowledge($redelivered->receipt);
             $this->assertNull($other->receive('jobs'));
+        });
+    }
+
+    #[DataProviderExternal(ClientTest::class, 'receiptRejections')]
+    public function testSpecificReceiptRejectionsPreserveTheSession(ErrorCode $code, InvalidReceiptException $expected): void
+    {
+        $this->runAsync(function () use ($code, $expected): void {
+            $this->startBroker(50, fn (): int => $this->now);
+            $owner = $this->connectClient();
+            $owner->send('jobs', 'reserved');
+            $delivery = $owner->receive('jobs');
+            $this->assertNotNull($delivery);
+            $actor = $owner;
+            $receipt = $delivery->receipt;
+            switch ($code) {
+                case ErrorCode::MalformedReceipt:
+                    $receipt = 'malformed';
+                    break;
+                case ErrorCode::NoActiveReservation:
+                    $owner->acknowledge($receipt);
+                    break;
+                case ErrorCode::ReceiptOwnerMismatch:
+                    $actor = $this->connectClient();
+                    break;
+                case ErrorCode::ReceiptEpochMismatch:
+                    // Change only the persisted epoch so the current connection still owns the row.
+                    $database = new \SQLite3($this->database->path());
+                    try {
+                        $this->assertTrue($database->exec("UPDATE queue_messages SET broker_epoch = 'previous-epoch'"));
+                    } finally {
+                        $database->close();
+                    }
+                    break;
+                case ErrorCode::ReceiptTokenMismatch:
+                    [$id, $token] = explode(':', $receipt);
+                    $receipt = $id.':'.('0' === $token[0] ? '1' : '0').substr($token, 1);
+                    break;
+                case ErrorCode::ExpiredReceipt:
+                    $this->now = $delivery->reservedUntil;
+                    break;
+                default:
+                    $this->fail('Expected a receipt error code.');
+            }
+            foreach ([$actor->acknowledge(...), $actor->reject(...)] as $settle) {
+                try {
+                    $settle($receipt);
+                    $this->fail('The broker accepted an invalid receipt.');
+                } catch (InvalidReceiptException $error) {
+                    $this->assertSame($expected::class, $error::class);
+                    $this->assertSame($expected->getMessage(), $error->getMessage());
+                }
+            }
+            $id = $actor->send('other', 'still usable');
+            $next = $actor->receive('other');
+            $this->assertNotNull($next);
+            $this->assertSame($id, $next->id);
+            $actor->acknowledge($next->receipt);
+        });
+    }
+
+    public function testShutdownDuringClaimDoesNotTreatContextCancellationAsStorageFailure(): void
+    {
+        $this->runAsync(function (): void {
+            $entered = new DeferredFuture();
+            $release = new DeferredFuture();
+            $armed = false;
+            $this->startBroker(50, function () use ($entered, $release, &$armed): int {
+                if ($armed) {
+                    $armed = false;
+                    $entered->complete();
+                    $release->getFuture()->await(new TimeoutCancellation(10));
+                }
+
+                return $this->now;
+            });
+            $client = $this->connectClient();
+            $client->send('jobs', 'reserved');
+            $armed = true;
+            $receiving = async(static fn () => $client->receive('jobs'));
+            try {
+                $entered->getFuture()->await(new TimeoutCancellation(10));
+                $this->broker->stop();
+            } finally {
+                $release->complete();
+            }
+            try {
+                $receiving->await(new TimeoutCancellation(10));
+                $this->fail('Shutdown must invalidate the in-flight client exchange.');
+            } catch (TransportException) {
+                $this->assertSame(0, $this->brokerFuture->await(new TimeoutCancellation(10)));
+            }
+            $database = new \SQLite3($this->database->path());
+            try {
+                $this->assertSame($this->now + 50, $database->querySingle('SELECT reserved_until FROM queue_messages'));
+            } finally {
+                $database->close();
+            }
         });
     }
 

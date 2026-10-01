@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Command;
 
 use Amp\DeferredCancellation;
+use Ineersa\SqliteQueue\Broker\BrokerEventEnum;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
 use Revolt\EventLoop;
 use Symfony\Component\Console\Attribute\AsCommand;
@@ -67,11 +68,11 @@ final class BrokerCommand extends BaseCommand
             $code = $broker->run(function (array $event) use ($output): void {
                 $this->write($event, $output);
             }, $shutdown->getCancellation());
-            $this->write(['event' => BrokerEvent::Stopped->value, 'exit_code' => $code], $output);
+            $this->write(['event' => BrokerEventEnum::Stopped->value, 'exit_code' => $code], $output);
 
             return $code;
         } catch (\Throwable $error) {
-            $this->write(['event' => BrokerEvent::Failed->value, 'error_type' => $error::class], $errors);
+            $this->write(['event' => BrokerEventEnum::Failed->value, 'error_type' => $error::class], $errors);
 
             return self::FAILURE;
         } finally {

@@ -11,7 +11,13 @@ use Amp\Socket\ServerSocket;
 use Amp\Socket\Socket;
 use Amp\TimeoutCancellation;
 use Ineersa\SqliteQueue\Client;
+use Ineersa\SqliteQueue\Exception\ExpiredReceiptException;
 use Ineersa\SqliteQueue\Exception\InvalidReceiptException;
+use Ineersa\SqliteQueue\Exception\MalformedReceiptException;
+use Ineersa\SqliteQueue\Exception\NoActiveReservationException;
+use Ineersa\SqliteQueue\Exception\ReceiptEpochMismatchException;
+use Ineersa\SqliteQueue\Exception\ReceiptOwnerMismatchException;
+use Ineersa\SqliteQueue\Exception\ReceiptTokenMismatchException;
 use Ineersa\SqliteQueue\Exception\TransportException;
 use Ineersa\SqliteQueue\Protocol\ErrorCode;
 use Ineersa\SqliteQueue\Protocol\Frame;
@@ -163,8 +169,8 @@ final class ClientTest extends TestCase
         yield 'unknown error code' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => false, 'error' => ['code' => 'nope']]))->encode(), 'Failure response error.code is not a known protocol error.'];
         yield 'removed internal storage failure' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => false, 'error' => ['code' => 'internal_storage_failure']]))->encode(), 'Failure response error.code is not a known protocol error.'];
         yield 'missing error' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => false]))->encode(), 'Failure response must include an error object.'];
-        yield 'failure with body' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => false, 'error' => ['code' => 'stale_receipt']], 'b'))->encode(), 'Failure response must not include a payload.'];
-        yield 'failure with result' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => false, 'result' => null, 'error' => ['code' => 'stale_receipt']]))->encode(), 'Failure response must not include result.'];
+        yield 'failure with body' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => false, 'error' => ['code' => ErrorCode::ExpiredReceipt->value]], 'b'))->encode(), 'Failure response must not include a payload.'];
+        yield 'failure with result' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => false, 'result' => null, 'error' => ['code' => ErrorCode::ExpiredReceipt->value]]))->encode(), 'Failure response must not include result.'];
         yield 'sent id zero' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true, 'result' => 0]))->encode(), 'SEND result must be a positive integer.'];
         yield 'sent id string' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true, 'result' => '7']))->encode(), 'SEND result must be an integer.'];
         yield 'sent with body' => [(new Frame(['v' => 1, 'id' => 1, 'ok' => true, 'result' => 7], 'b'))->encode(), 'SEND must not include a payload.'];
@@ -362,16 +368,27 @@ final class ClientTest extends TestCase
         $this->assertConnectFails($result, $body, $headers, $reason);
     }
 
-    public function testStaleReceiptKeepsTheClientUsable(): void
+    public static function receiptRejections(): iterable
+    {
+        yield 'malformed' => [ErrorCode::MalformedReceipt, new MalformedReceiptException()];
+        yield 'no reservation' => [ErrorCode::NoActiveReservation, new NoActiveReservationException()];
+        yield 'owner mismatch' => [ErrorCode::ReceiptOwnerMismatch, new ReceiptOwnerMismatchException()];
+        yield 'epoch mismatch' => [ErrorCode::ReceiptEpochMismatch, new ReceiptEpochMismatchException()];
+        yield 'token mismatch' => [ErrorCode::ReceiptTokenMismatch, new ReceiptTokenMismatchException()];
+        yield 'expired' => [ErrorCode::ExpiredReceipt, new ExpiredReceiptException()];
+    }
+
+    #[DataProvider('receiptRejections')]
+    public function testReceiptRejectionKeepsTheClientUsable(ErrorCode $code, InvalidReceiptException $expected): void
     {
         $seen = [];
-        $endpoint = $this->serve(static function (Socket $socket) use (&$seen): void {
+        $endpoint = $this->serve(static function (Socket $socket) use (&$seen, $code): void {
             Frame::read($socket, new TimeoutCancellation(3));
             $socket->write(self::helloReply());
             while (null !== ($request = Frame::read($socket, new TimeoutCancellation(3)))) {
                 $seen[] = $request->control['id'];
                 if (1 === $request->control['id']) {
-                    $socket->write((new Frame(['v' => Frame::VERSION, 'id' => 1, 'ok' => false, 'error' => ['code' => ErrorCode::StaleReceipt->value]]))->encode());
+                    $socket->write((new Frame(['v' => Frame::VERSION, 'id' => 1, 'ok' => false, 'error' => ['code' => $code->value]]))->encode());
                     continue;
                 }
                 $socket->write((new Frame(['v' => Frame::VERSION, 'id' => $request->control['id'], 'ok' => true, 'result' => 9]))->encode());
@@ -380,9 +397,12 @@ final class ClientTest extends TestCase
         $client = Client::connect($endpoint);
         $this->clients[] = $client;
         try {
-            $client->acknowledge('stale');
-            $this->fail('A stale receipt must be rejected.');
-        } catch (InvalidReceiptException) {
+            $client->acknowledge('receipt');
+            $this->fail('The receipt must be rejected.');
+        } catch (InvalidReceiptException $error) {
+            $this->assertSame($expected::class, $error::class);
+            $this->assertSame($expected->getMessage(), $error->getMessage());
+            $this->assertSame($code, ErrorCode::fromReceiptException($error));
         }
         $this->assertSame(9, $client->send('jobs', 'next'));
         $this->assertSame([1, 2], $seen);

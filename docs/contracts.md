@@ -174,7 +174,9 @@ reply never proves absence of the mutation.
 
 Task 04 implements the immediate-operation subset. The [v1 protocol reference](broker-protocol.md)
 defines exact framing, limits, and error codes. Bounded notification waiting remains Task 05 work.
-Unknown deliveries and stale or foreign receipts share the `stale_receipt` code.
+Receipt errors distinguish malformed input, no active reservation, owner mismatch, epoch mismatch,
+token mismatch, and expiry. They leave the client session usable. The protocol reference defines
+their wire codes and deterministic precedence when several reservation predicates fail.
 
 ## Reference sources
 

@@ -16,7 +16,14 @@ use Fabpot\Amp\Sqlite\SqliteQueryError;
 use Fabpot\Amp\Sqlite\SqliteSynchronousMode;
 use Fabpot\Amp\Sqlite\SqliteTransaction;
 use Ineersa\SqliteQueue\DTO\DeliveryDTO;
+use Ineersa\SqliteQueue\Exception\ClientContextClosedException;
+use Ineersa\SqliteQueue\Exception\ExpiredReceiptException;
 use Ineersa\SqliteQueue\Exception\InvalidReceiptException;
+use Ineersa\SqliteQueue\Exception\MalformedReceiptException;
+use Ineersa\SqliteQueue\Exception\NoActiveReservationException;
+use Ineersa\SqliteQueue\Exception\ReceiptEpochMismatchException;
+use Ineersa\SqliteQueue\Exception\ReceiptOwnerMismatchException;
+use Ineersa\SqliteQueue\Exception\ReceiptTokenMismatchException;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\Tests\Driver\DriverTestCase;
@@ -123,7 +130,7 @@ final class QueueTest extends DriverTestCase
         $this->invalid(static fn () => $queue->reject($first->receipt, $owner));
         $disconnected = $this->lifetime();
         $disconnected->cancel();
-        $this->invalid(static fn () => $queue->acknowledge($next->receipt, $foreign, $disconnected->getCancellation()));
+        $this->contextClosed(static fn () => $queue->acknowledge($next->receipt, $foreign, $disconnected->getCancellation()));
         $this->assertNull($queue->receive($this->queueName('jobs'), $owner));
         $this->latestStorage()->close();
         $queue = $this->open(50);
@@ -138,6 +145,170 @@ final class QueueTest extends DriverTestCase
         $this->assertGreaterThan($first->id, $newId);
         $this->invalid(static fn () => $queue->reject($last->receipt, $newOwner));
         $this->assertSame($newId, $queue->receive($this->queueName('jobs'), $newOwner)->id);
+    }
+
+    public static function malformedReceipts(): iterable
+    {
+        $token = str_repeat('a', 64);
+        yield 'empty' => [''];
+        yield 'missing delimiter' => ['1'.$token];
+        yield 'zero ID' => ['0:'.$token];
+        yield 'negative ID' => ['-1:'.$token];
+        yield 'leading zero' => ['01:'.$token];
+        yield 'overflow ID' => [\PHP_INT_MAX.'0:'.$token];
+        yield 'short token' => ['1:'.substr($token, 1)];
+        yield 'long token' => ['1:'.$token.'a'];
+        yield 'uppercase token' => ['1:'.strtoupper($token)];
+        yield 'nonhex token' => ['1:'.str_repeat('g', 64)];
+        yield 'trailing newline' => ['1:'.$token."\n"];
+    }
+
+    #[DataProvider('malformedReceipts')]
+    public function testMalformedReceiptsAreNotReservationMismatches(string $receipt): void
+    {
+        $queue = $this->open();
+        $owner = $this->owner();
+        $this->receiptFailure(static fn () => $queue->acknowledge($receipt, $owner), new MalformedReceiptException());
+        $this->receiptFailure(static fn () => $queue->reject($receipt, $owner), new MalformedReceiptException());
+        $id = $queue->send($this->queueName(), 'still usable');
+        $this->assertSame($id, $queue->receive($this->queueName(), $owner)->id);
+    }
+
+    #[DataProvider('settlements')]
+    public function testMissingMessageHasNoActiveReservation(string $operation): void
+    {
+        $queue = $this->open();
+        $receipt = '1:'.str_repeat('a', 64);
+        $this->receiptFailure(fn () => $this->mutate($queue, $this->owner(), $receipt, $operation), new NoActiveReservationException());
+        $this->assertSame(0, $this->scalar('SELECT count(*) FROM queue_messages'));
+    }
+
+    #[DataProvider('settlements')]
+    public function testUnreservedMessageHasNoActiveReservation(string $operation): void
+    {
+        $queue = $this->open();
+        $id = $queue->send($this->queueName(), 'unreserved');
+        $this->receiptFailure(fn () => $this->mutate($queue, $this->owner(), $id.':'.str_repeat('a', 64), $operation), new NoActiveReservationException());
+        $this->assertSame($id, $queue->receive($this->queueName(), $this->owner())->id);
+    }
+
+    #[DataProvider('settlements')]
+    public function testReceiptOwnerMismatchIsSpecific(string $operation): void
+    {
+        $queue = $this->open();
+        $owner = $this->owner();
+        $receipt = $this->prepareOperation($queue, $owner, $operation);
+        $this->receiptFailure(fn () => $this->mutate($queue, $this->owner(), $receipt, $operation), new ReceiptOwnerMismatchException());
+        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
+        $this->mutate($queue, $owner, $receipt, $operation);
+    }
+
+    #[DataProvider('settlements')]
+    public function testReceiptEpochMismatchIsSpecific(string $operation): void
+    {
+        $queue = $this->open();
+        $owner = $this->owner();
+        $receipt = $this->prepareOperation($queue, $owner, $operation);
+        $replacement = new Queue($this->latestStorage(), clock: fn (): int => $this->now);
+        $this->receiptFailure(fn () => $this->mutate($replacement, $owner, $receipt, $operation), new ReceiptEpochMismatchException());
+        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
+        $this->mutate($queue, $owner, $receipt, $operation);
+    }
+
+    #[DataProvider('settlements')]
+    public function testReceiptTokenMismatchIsSpecific(string $operation): void
+    {
+        $queue = $this->open();
+        $owner = $this->owner();
+        $receipt = $this->prepareOperation($queue, $owner, $operation);
+        $wrong = $this->differentToken($receipt);
+        $this->receiptFailure(fn () => $this->mutate($queue, $owner, $wrong, $operation), new ReceiptTokenMismatchException());
+        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
+        $this->mutate($queue, $owner, $receipt, $operation);
+    }
+
+    #[DataProvider('settlements')]
+    public function testReceiptExpiryIsSpecific(string $operation): void
+    {
+        $queue = $this->open(50);
+        $owner = $this->owner();
+        $receipt = $this->prepareOperation($queue, $owner, $operation);
+        $this->now = $this->scalar('SELECT reserved_until FROM queue_messages');
+        $this->receiptFailure(fn () => $this->mutate($queue, $owner, $receipt, $operation), new ExpiredReceiptException());
+        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
+        $this->assertNotSame($receipt, $queue->receive($this->queueName(), $owner)->receipt);
+    }
+
+    public function testReceiptFailurePrecedence(): void
+    {
+        $queue = $this->open(50);
+        $owner = $this->owner();
+        $receipt = $this->prepareOperation($queue, $owner, 'acknowledge');
+        $wrong = $this->differentToken($receipt);
+        $this->now = $this->scalar('SELECT reserved_until FROM queue_messages');
+        $replacement = new Queue($this->latestStorage(), clock: fn (): int => $this->now);
+        $this->receiptFailure(fn () => $replacement->acknowledge($wrong, $this->owner()), new ReceiptOwnerMismatchException());
+        $this->receiptFailure(static fn () => $replacement->acknowledge($wrong, $owner), new ReceiptEpochMismatchException());
+        $this->receiptFailure(static fn () => $queue->acknowledge($wrong, $owner), new ReceiptTokenMismatchException());
+        $this->receiptFailure(static fn () => $queue->acknowledge($receipt, $owner), new ExpiredReceiptException());
+        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
+    }
+
+    public function testIgnoredMatchingDeleteIsAStorageFailure(): void
+    {
+        $queue = $this->open();
+        $owner = $this->owner();
+        $receipt = $this->prepareOperation($queue, $owner, 'acknowledge');
+        $this->exec('CREATE TRIGGER ignore_settlement BEFORE DELETE ON queue_messages BEGIN SELECT RAISE(IGNORE); END');
+        try {
+            $queue->acknowledge($receipt, $owner);
+            $this->fail('A matching reservation was not deleted.');
+        } catch (\RuntimeException $error) {
+            $this->assertNotInstanceOf(InvalidReceiptException::class, $error);
+            $this->assertSame('Settlement DELETE failed despite a matching active reservation.', $error->getMessage());
+        }
+        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
+        $this->exec('DROP TRIGGER ignore_settlement');
+        $queue->acknowledge($receipt, $owner);
+        $this->assertSame(0, $this->scalar('SELECT count(*) FROM queue_messages'));
+    }
+
+    public static function invalidStoredReservations(): iterable
+    {
+        yield 'owner' => ["UPDATE queue_messages SET owner_id = X'00'", 'Stored reservation owner must be a string.'];
+        yield 'epoch' => ["UPDATE queue_messages SET broker_epoch = X'00'", 'Stored reservation epoch must be a string.'];
+        yield 'token' => ["UPDATE queue_messages SET reservation_token = X'00'", 'Stored reservation token must be a string.'];
+        yield 'expiry' => ['UPDATE queue_messages SET reserved_until = 1.5', 'Stored reservation expiry must be an integer.'];
+    }
+
+    #[DataProvider('invalidStoredReservations')]
+    public function testInvalidStoredReservationIsNotReportedAsAReceiptMismatch(string $sql, string $message): void
+    {
+        $queue = $this->open();
+        $owner = $this->owner();
+        $receipt = $this->prepareOperation($queue, $owner, 'acknowledge');
+        $this->exec($sql);
+        try {
+            $queue->acknowledge($receipt, $owner);
+            $this->fail('Invalid stored reservation was accepted.');
+        } catch (\RuntimeException $error) {
+            $this->assertNotInstanceOf(InvalidReceiptException::class, $error);
+            $this->assertSame($message, $error->getMessage());
+        }
+        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
+    }
+
+    #[DataProvider('mutations')]
+    public function testCancelledContextIsNotAReceiptFailure(string $operation): void
+    {
+        $queue = $this->open();
+        $owner = $this->owner();
+        $receipt = $this->prepareOperation($queue, $owner, $operation);
+        $count = $this->scalar('SELECT count(*) FROM queue_messages');
+        $lifetime = $this->lifetime();
+        $lifetime->cancel();
+        $this->contextClosed(fn () => $this->mutate($queue, $owner, $receipt, $operation, $lifetime->getCancellation()));
+        $this->assertSame($count, $this->scalar('SELECT count(*) FROM queue_messages'));
     }
 
     public function testConcurrentReceiversAcrossConnectionsCannotShareDelivery(): void
@@ -285,7 +456,7 @@ final class QueueTest extends DriverTestCase
             $lifetime->cancel();
         } finally {
             $release->complete();
-            $this->invalid(static fn () => $receive->await(new TimeoutCancellation(5)));
+            $this->contextClosed(static fn () => $receive->await(new TimeoutCancellation(5)));
         }
         $this->assertSame($expiry, $this->scalar('SELECT reserved_until FROM queue_messages'));
         $this->assertNotNull($this->scalar('SELECT reservation_token FROM queue_messages'));
@@ -323,7 +494,7 @@ final class QueueTest extends DriverTestCase
             $lifetime->cancel();
         } finally {
             $release->complete();
-            $this->invalid(static fn () => $settle->await(new TimeoutCancellation(5)));
+            $this->contextClosed(static fn () => $settle->await(new TimeoutCancellation(5)));
         }
         $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
         $this->assertSame($token, $this->scalar('SELECT reservation_token FROM queue_messages'));
@@ -471,7 +642,7 @@ final class QueueTest extends DriverTestCase
     {
         $connection = (new SqliteConnector())->connect(new SqliteConfig($this->database->path()));
         try {
-            SqliteQueueStorage::fromConnection($connection);
+            new SqliteQueueStorage($connection);
             $this->fail('NORMAL durability must not be accepted.');
         } catch (\InvalidArgumentException) {
             $this->assertTrue($connection->isClosed());
@@ -634,7 +805,7 @@ final class QueueTest extends DriverTestCase
     {
         $storage = null === $connection
             ? SqliteQueueStorage::open($this->database->path())
-            : SqliteQueueStorage::fromConnection($connection);
+            : new SqliteQueueStorage($connection);
         $this->storages[] = $storage;
 
         return new Queue($storage, $visibility, fn (): int => $this->now);
@@ -682,6 +853,34 @@ final class QueueTest extends DriverTestCase
             $this->fail('A stale or foreign receipt was accepted.');
         } catch (InvalidReceiptException) {
             $this->addToAssertionCount(1);
+        }
+    }
+
+    private function contextClosed(\Closure $operation): void
+    {
+        try {
+            $operation();
+            $this->fail('Cancelled client context was accepted.');
+        } catch (ClientContextClosedException $error) {
+            $this->assertInstanceOf(\Amp\CancelledException::class, $error->getPrevious());
+        }
+    }
+
+    private function differentToken(string $receipt): string
+    {
+        [$id, $token] = explode(':', $receipt);
+
+        return $id.':'.('0' === $token[0] ? '1' : '0').substr($token, 1);
+    }
+
+    private function receiptFailure(\Closure $operation, InvalidReceiptException $expected): void
+    {
+        try {
+            $operation();
+            $this->fail('Invalid receipt was accepted.');
+        } catch (InvalidReceiptException $error) {
+            $this->assertSame($expected::class, $error::class);
+            $this->assertSame($expected->getMessage(), $error->getMessage());
         }
     }
 

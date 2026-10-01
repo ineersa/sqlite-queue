@@ -16,9 +16,24 @@ The first request is `{"v":1,"id":0,"op":"hello"}`. The response confirms v1 and
 
 Operations are `send` with `queue` and nonnegative millisecond `delay`, `receive` with `queue`, and `acknowledge` or `reject` with `receipt`. Send uses the raw payload blocks and returns the insertion ID. Receive returns null or delivery metadata with raw payload blocks. Delivery metadata contains `id`, `queue`, `receipt`, `available_at`, and `reserved_until`. Both timestamps use Unix milliseconds. Settlement returns null. Closing the socket ends a session. Unknown operations and control fields are rejected, including WAIT and `wait_ms`.
 
-Errors are `invalid_request`, `unsupported_protocol_version`, `frame_too_large`, `invalid_queue_name`, `stale_receipt`, and `broker_shutting_down`. Malformed traffic ends the connection after a bounded error response when framing permits one. Storage failures are treated conservatively as uncertain outcomes, terminate service, and never trigger replay. Default diagnostics contain error categories, not payloads or driver exception text.
+General errors are `invalid_request`, `unsupported_protocol_version`, `frame_too_large`, `invalid_queue_name`, and `broker_shutting_down`. Receipt errors are listed below. Malformed traffic ends the connection after a bounded error response when framing permits one. Storage failures are treated conservatively as uncertain outcomes, terminate service, and never trigger replay. Default diagnostics contain error categories, not payloads or driver exception text.
 
-`stale_receipt` also covers unknown deliveries and foreign receipts. Invalid queue names and stale receipts leave the session usable. Other protocol errors end it. At the connection limit, the broker closes the new socket without a handshake. Shutdown and storage failure can close sockets before an error response is delivered.
+Invalid queue names and receipt rejections leave the session usable. Other protocol errors end it. At the connection limit, the broker closes the new socket without a handshake. Shutdown and storage failure can close sockets before an error response is delivered.
+
+### Receipt errors
+
+Each receipt error maps to a concrete exception under `Exception`. All six extend `InvalidReceiptException` and leave the client usable.
+
+| Wire code | Exception | Established failure |
+| --- | --- | --- |
+| `malformed_receipt` | `MalformedReceiptException` | Invalid receipt syntax or message ID outside the supported positive integer range. |
+| `no_active_reservation` | `NoActiveReservationException` | The message is absent or unreserved. |
+| `receipt_owner_mismatch` | `ReceiptOwnerMismatchException` | The reservation belongs to another client connection. |
+| `receipt_epoch_mismatch` | `ReceiptEpochMismatchException` | The reservation belongs to another Queue epoch. |
+| `receipt_token_mismatch` | `ReceiptTokenMismatchException` | The supplied token differs from the current reservation token. |
+| `expired_receipt` | `ExpiredReceiptException` | The reservation deadline is at or before the sampled transaction time. |
+
+Syntax is checked before storage access. After a zero-row conditional DELETE, storage diagnoses failures in table order inside the same immediate transaction. It uses the same clock sample as DELETE. When several fields mismatch, the first failure wins. Missing rows have no history to distinguish never-created from already-settled messages. The former generic `stale_receipt` code is removed from this unreleased protocol.
 
 ## Ownership and readiness
 
@@ -30,7 +45,7 @@ Startup refuses every existing endpoint, including a leftover socket. It does no
 
 Readiness is a JSON `ready` event on stdout after lifetime locks, storage initialization, and socket binding succeed. The broker owns client-session lifetime and cancels those contexts on disconnect or shutdown. Queue and storage retain delivery owner identifiers, not a registry of live sessions. Shutdown stops accepting, closes clients, drains or fails storage work, and closes the worker before releasing the socket and locks. SIGINT and SIGTERM request shutdown. The package does not detach or manage an application service.
 
-The command registers a one-second event-loop timer to prevent an indefinite select wait when a signal arrives between the driver's signal check and its select call. This does not poll storage or guarantee progress if the event loop is stalled. Production output contains ready, stopped, and failed events, without a trace-file option. Normal SIGTERM shutdown and SIGKILL worker failure/recovery are release requirements. The deliberately SIGSTOPped-worker scenario is excluded by scope decision; its historical intermittent hang remains unexplained.
+The command registers a one-second event-loop timer to prevent an indefinite select wait when a signal arrives between the driver's signal check and its select call. This does not poll storage or guarantee progress if the event loop is stalled. Production output contains ready, stopped, and failed events from the shared `Broker\BrokerEventEnum`, without a trace-file option. Normal SIGTERM shutdown and SIGKILL worker failure/recovery are release requirements. The deliberately SIGSTOPped-worker scenario is excluded by scope decision; its historical intermittent hang remains unexplained.
 
 The readiness event includes `pid`, `persistence_pid`, `database`, and `endpoint`. Amp may also create a shell launcher. The broker detects idle SQLite-worker exit through EOF on the child's output pipes. It drains those pipes without logging their contents. The readiness field `persistence_pid` remains the wire key for that worker PID. The SQLite driver alone joins its process context; the broker never joins it a second time. Normal stop exits 0; storage or startup failure exits nonzero.
 
@@ -40,9 +55,9 @@ The budget bounds what the broker waits for, not the exact wall-clock duration o
 
 ## Client recovery
 
-`Client` connects once and performs no automatic reconnect or retry. A transport error means the caller must discard it. An absent confirmation does not establish whether send, claim, or settlement committed. Constructing a new client is explicit and does not reuse the old session or receipts. Malformed remote responses raise `ProtocolException` with the violated field, invalidate the client, and never replay. Known stale-receipt and invalid-queue responses keep the session usable. A receipt cannot move to a different connection.
+`Client` connects once and performs no automatic reconnect or retry. A transport error means the caller must discard it. An absent confirmation does not establish whether send, claim, or settlement committed. SQLite can commit before its result reaches the broker or before the broker's confirmation reaches the client. A connection failure in either interval leaves the caller unable to distinguish a committed operation from a failure before commit. Constructing a new client is explicit and does not reuse the old session or receipts. Malformed remote responses raise `ProtocolException` with the violated field, invalidate the client, and never replay. Known receipt rejections and invalid-queue responses keep the session usable. A receipt cannot move to a different connection.
 
-The default client timeout is ten seconds per exchange and for connection establishment. Concurrent calls on the same client raise `LogicException` rather than queueing more requests. A frame rejected locally before writing, including unencodable UTF-8 control, does not consume a request ID and leaves the client open. `TransportException` invalidates the client for EOF, timeout, cancellation, and socket I/O failure. A known queue-name error raises `InvalidArgumentException`, and a stale receipt raises `InvalidReceiptException`.
+The default client timeout is ten seconds per exchange and for connection establishment. Concurrent calls on the same client raise `LogicException` rather than queueing more requests. A frame rejected locally before writing, including unencodable UTF-8 control, does not consume a request ID and leaves the client open. `TransportException` invalidates the client for EOF, timeout, cancellation, and socket I/O failure. A known queue-name error raises `InvalidArgumentException`. Receipt rejections raise the specific exceptions listed above.
 
 Operations and error codes are backed string enums (`Operation`, `ErrorCode`). Control field names live in `ControlField`, and `Operation::allowedFields()` owns the request allow lists. The client and broker build and check `Frame` control arrays directly, with small validation next to each use. `ProtocolException` carries a typed `ErrorCode`. Delivery timestamps are signed Unix-millisecond integers, mapped without added semantics. The wire format is unchanged v1, and the no-replay rule still holds: an uncertain outcome never triggers an automatic retry.
 

@@ -79,7 +79,7 @@ final class BrokerFactory
             };
             $release[] = $connection->close(...);
             // Storage becomes the sole connection owner after construction succeeds.
-            $storage = SqliteQueueStorage::fromConnection($connection);
+            $storage = new SqliteQueueStorage($connection);
             array_pop($release);
             $release[] = $storage->close(...);
             $queue = new Queue($storage, $this->visibilityTimeout, $this->clock);

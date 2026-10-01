@@ -21,6 +21,16 @@ Task 04 provides immediate receive. Notification waiting and the Messenger adapt
 
 The executable uses Symfony Console `^8.0`. Development installation includes it. In a consuming project without development dependencies, install `symfony/console:^8.0` to use `vendor/bin/sqlite-queue`. The broker requires `symfony/lock:^8.0` and `symfony/filesystem:^8.0` at runtime for exclusive ownership. The `Queue` and `Client` APIs need no Symfony packages, and no Symfony application boot is involved anywhere.
 
+## Run under a supervisor in production
+
+1. Run the foreground command under systemd, supervisord, Docker, PM2, or another external supervisor. Do not daemonize it or put it in the background inside the managed command.
+2. Configure restart after failure and wait for the `ready` event before admitting clients. The broker exits nonzero on fatal storage or worker failure instead of replacing SQLite connections inside the running process.
+3. Send SIGTERM for graceful shutdown. Allow more than the broker's five-second cleanup budget before forced termination.
+4. Configure the supervisor to clean up the whole process tree, including the SQLite worker and any Amp shell launcher, before starting a replacement broker.
+5. Make client applications reconnect explicitly after failure. Do not replay unconfirmed operations automatically or reuse receipts from an old connection.
+
+After an abrupt exit, follow the endpoint verification instructions in [Stop or restart](#stop-or-restart). Do not add an unconditional socket deletion to the supervisor's startup command.
+
 ## Send and settle a message
 
 Run this code in a separate PHP process with the package autoloader:

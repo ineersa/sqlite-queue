@@ -33,7 +33,7 @@ The database directory must exist. Queue names are independent of the database p
 
 `SqliteQueueStorage::open(string $path, ?Cancellation $cancellation = null)` starts the connection with explicit WAL, synchronous FULL, and immediate transactions. Initialization verifies the effective WAL/FULL settings and creates the table and index if absent. In-memory databases are not supported. Schema migrations and exclusive broker ownership belong to later tasks; the database is dedicated queue storage, not an application database to modify independently.
 
-`SqliteQueueStorage::fromConnection(SqliteConnection $connection)` transfers exclusive ownership of an existing driver connection. It requires explicitly configured WAL/FULL, verifies effective settings, and sets immediate transaction mode. Do not use the transferred connection concurrently or change its schema or settings. Initialization failure closes it. The constructor accepts the existing driver interface for embedding and controlled storage-failure tests, not a multi-driver abstraction.
+`new SqliteQueueStorage(SqliteConnection $connection)` transfers exclusive ownership of an existing driver connection. It requires explicitly configured WAL/FULL, verifies effective settings, and sets immediate transaction mode. Do not use the transferred connection concurrently or change its schema or settings. Initialization failure closes it. The constructor accepts the existing driver interface for embedding and controlled storage-failure tests, not a multi-driver abstraction.
 
 `new Queue(SqliteQueueStorage $storage, int $visibilityTimeout = 5000, ?Closure $clock = null)` is message policy only. It does not open, configure, or close storage. Invalid visibility fails without closing the caller-owned storage dependency.
 
@@ -52,9 +52,9 @@ Always close storage in `finally`, outside its `exclusive()` callback. `SqliteQu
 
 `DeliveryDTO` has readonly fields `id`, `queue`, `body`, `headers`, `receipt`, `availableAt`, and `reservedUntil`. The two timestamps are Unix wall-clock milliseconds. Treat the receipt as opaque, even though its current representation contains the insertion ID and a random reservation token.
 
-Queue owns receipt generation and interpretation. It creates the storage epoch and reservation tokens, formats receipts, and interprets settlement outcomes. Storage receives those policy inputs and returns whether a conditional write matched.
+Queue owns receipt generation and interpretation. It creates the storage epoch and reservation tokens, formats receipts, and interprets settlement outcomes. Storage receives those policy inputs and returns a `SettlementResultEnum` identifying success or the failed reservation predicate. Queue translates failures to specific exceptions.
 
-Callers own client lifetime. Create a new owner identity for each connection and pass that identity into receive and settlement. Pass an Amp cancellation for the connection lifetime. Cancel it on disconnect. Queue maps a requested cancellation to `InvalidReceiptException` without disclosing a receipt for a committed claim that already finished. A disconnect during an in-flight mutation cannot prove that the mutation did not commit.
+Callers own client lifetime. Create a new owner identity for each connection and pass that identity into receive and settlement. Pass an Amp cancellation for the connection lifetime. Cancel it on disconnect. Queue maps a requested cancellation to `ClientContextClosedException`, with the original Amp cancellation as its cause. This is not a receipt rejection. A completed claim can retain its reservation without disclosing its receipt to the disconnected caller. A disconnect during an in-flight mutation cannot prove that the mutation did not commit.
 
 ## Schema and ordering
 
@@ -92,7 +92,11 @@ Concurrent writers acquire SQLite's write lock before selection. Committed inser
 
 Availability is sampled after send acquires operation ownership, before insertion. Receive samples eligibility and visibility expiry inside its write transaction. Deadlines have millisecond resolution and follow wall clock, so clock adjustments can advance or postpone eligibility. A positive subsecond delay is preserved, not rounded to seconds or reset after reopen.
 
-A claim records its owner identity, Queue epoch, new random token, and expiry. Acknowledge and reject match all of those fields plus message ID. They also require `reserved_until > now`; a receipt is stale at expiry even if no consumer has reclaimed it yet. Wrong, malformed, expired, already-settled, cancelled, and previous-epoch receipts raise `InvalidReceiptException` without deleting another reservation.
+A claim records its owner identity, Queue epoch, new random token, and expiry. Acknowledge and reject match all of those fields plus message ID. They also require `reserved_until > now`; a receipt expires at its deadline even if no consumer has reclaimed it yet.
+
+Receipt rejections have distinct concrete exceptions under `Exception`, all extending the abstract `InvalidReceiptException` base. `MalformedReceiptException` identifies invalid syntax or an ID outside the supported positive integer range. A zero-row DELETE is diagnosed inside the same immediate transaction, using the same sampled clock. Failure precedence is `NoActiveReservationException`, `ReceiptOwnerMismatchException`, `ReceiptEpochMismatchException`, `ReceiptTokenMismatchException`, then `ExpiredReceiptException`. Multiple mismatches report the first in that order. These failures do not delete another reservation.
+
+No active reservation means the message is absent or unreserved. Storage retains no settlement history, so it cannot distinguish an already-settled message from an ID that never existed. If every predicate matches but DELETE removes no row, storage reports an invariant failure instead of a receipt rejection. Wire codes and client exception mappings are listed in the [protocol reference](broker-protocol.md#receipt-errors).
 
 Cancelling a connection lifetime invalidates in-flight queue calls immediately but leaves a committed reservation expiry unchanged. Reopening creates a new Queue epoch and does not clear reservations. Old receipts cannot settle them. At the original expiry, a new receive may claim the row with a new token. There is no receive-count cap or lease extension. A slow consumer can still repeat an external effect after redelivery; receipt fencing does not provide exactly-once application execution.
 
