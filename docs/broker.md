@@ -1,6 +1,6 @@
 # Run the broker and use the client
 
-Task 04 provides immediate receive. Notification waiting and the Messenger adapter are not implemented yet.
+The broker supports immediate receive and bounded WAIT. The Symfony Messenger adapter remains Task 06 work.
 
 ## Start the foreground broker
 
@@ -57,9 +57,31 @@ try {
 
 Use `reject($delivery->receipt)` for terminal disposal instead of acknowledgment. Use the same client connection that received the delivery. Neither operation schedules retries.
 
-Pass `delay: 1500` to `send()` to make a message unavailable for 1,500 milliseconds. `receive()` returns null immediately when no message is eligible. Do not build a busy polling loop as a substitute for Task 05 notifications.
+Pass `delay: 1500` to `send()` to make a message unavailable for 1,500 milliseconds. `receive()` still returns null immediately when no message is eligible. It never waits.
+
+## Wait for readiness without busy polling
+
+Use `Client::wait(string $queue, int $timeoutMilliseconds, ?Cancellation $cancellation = null): bool` after an empty receive. Bounds are `0` through `30_000` milliseconds. Zero is an immediate readiness probe. Out-of-range local bounds raise `InvalidArgumentException` before any bytes are written, so the request sequence is unchanged. The exchange deadline is the requested wait plus the client's normal transport allowance. One outstanding exchange still applies.
+
+`true` means try `receive()` again. It never grants a reservation. `false` means the bound elapsed without a readiness hint, including an empty zero-duration probe. Do not sleep after a hint. Cancellation during WAIT closes the connection, reports an uncertain outcome, and never replays.
+
+```php
+$delivery = $client->receive('jobs');
+if (null === $delivery) {
+	if (!$client->wait('jobs', 5_000)) {
+		// Bound elapsed with no readiness hint. Decide whether to wait again.
+		return;
+	}
+	$delivery = $client->receive('jobs');
+}
+if (null !== $delivery) {
+	$client->acknowledge($delivery->receipt);
+}
+```
 
 The default visibility timeout is 5,000 milliseconds. An unacknowledged reservation becomes eligible again at its persisted deadline. Closing a client does not shorten that deadline. For custom visibility, construct a `BrokerFactory` with that timeout and call `create()` to receive a fully initialized `Broker`. For an application-owned cancellation token, pass it to `Broker::run()` rather than adding a supervisor to this package.
+
+Task 06 must map this wait API onto Symfony Messenger worker idle handling so a readiness hint is not followed by an unnecessary remaining sleep, while still respecting cancellation, shutdown, and worker limits. That adapter is not implemented here.
 
 ## Recover from a failed exchange
 

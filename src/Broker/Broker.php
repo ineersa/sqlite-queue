@@ -6,6 +6,7 @@ namespace Ineersa\SqliteQueue\Broker;
 
 use Amp\Cancellation;
 use Amp\CancelledException;
+use Amp\CompositeCancellation;
 use Amp\DeferredCancellation;
 use Amp\Future;
 use Amp\Socket\ServerSocket;
@@ -16,6 +17,7 @@ use Ineersa\SqliteQueue\Exception\InvalidReceiptException;
 use Ineersa\SqliteQueue\Protocol\ControlField;
 use Ineersa\SqliteQueue\Protocol\ErrorCode;
 use Ineersa\SqliteQueue\Protocol\Frame;
+use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Protocol\Operation;
 use Ineersa\SqliteQueue\Protocol\ProtocolException;
 use Ineersa\SqliteQueue\Queue;
@@ -49,6 +51,7 @@ final class Broker
     private readonly DeferredCancellation $deadline;
     /** Pending shutdown timer, or null before the first stop request and after the disarm. */
     private ?string $shutdownTimer = null;
+    private readonly QueueNotifier $notifier;
 
     /** Fully acquired by BrokerFactory; a constructed broker is ready to serve. */
     public function __construct(
@@ -58,8 +61,13 @@ final class Broker
         private readonly SqliteWorkerHandle $worker,
         private readonly BrokerLifetimeLocks $locks,
         private readonly SocketIdentity $socketIdentity,
+        private readonly \Closure $clock,
     ) {
         $this->deadline = new DeferredCancellation();
+        $this->notifier = new QueueNotifier($this->queue, $this->clock, function (\Throwable $error): void {
+            $this->failed = true;
+            $this->stop();
+        });
     }
 
     /**
@@ -172,6 +180,7 @@ final class Broker
             $this->armShutdownDeadline();
         }
         $this->server->close();
+        $this->notifier->close();
         foreach ($this->clients as $client) {
             $client['lifetime']->cancel();
             $client['socket']->close();
@@ -302,7 +311,7 @@ final class Broker
                     $response = new Frame(['v' => Frame::VERSION, 'id' => 0, 'ok' => true, 'result' => ['max_payload' => Frame::MAX_PAYLOAD]]);
                 } else {
                     try {
-                        $response = $this->dispatch($request, $operation, $ownerId, $lifetime, $expected);
+                        $response = $this->dispatch($request, $operation, $ownerId, $lifetime, $expected, $socket);
                     } catch (ClientContextClosedException) {
                         // Disconnect and shutdown cancellation end the session, not the broker.
                         return;
@@ -380,7 +389,7 @@ final class Broker
         return $operation;
     }
 
-    private function dispatch(Frame $request, Operation $operation, string $ownerId, Cancellation $lifetime, int $id): Frame
+    private function dispatch(Frame $request, Operation $operation, string $ownerId, Cancellation $lifetime, int $id, Socket $socket): Frame
     {
         if (Operation::Send === $operation) {
             return $this->store($request, $lifetime, $id);
@@ -390,6 +399,9 @@ final class Broker
         }
         if (Operation::Acknowledge === $operation || Operation::Reject === $operation) {
             return $this->settle($request, $operation, $ownerId, $lifetime, $id);
+        }
+        if (Operation::Wait === $operation) {
+            return $this->awaitReadiness($request, $socket, $lifetime, $id);
         }
         throw new ProtocolException(ErrorCode::InvalidRequest, 'Unsupported operation.');
     }
@@ -405,7 +417,11 @@ final class Broker
             throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid delay.');
         }
 
-        return self::ok($id, $this->queue->send($name, $request->body, $request->headers, $delay, $lifetime));
+        $inserted = $this->queue->send($name, $request->body, $request->headers, $delay, $lifetime);
+        // Notify only after the committed mutation releases storage ownership and before the reply write.
+        $this->notifier->notify($name);
+
+        return self::ok($id, $inserted);
     }
 
     private function claim(Frame $request, string $ownerId, Cancellation $lifetime, int $id): Frame
@@ -416,6 +432,8 @@ final class Broker
         if (null === $delivery) {
             return self::ok($id, null);
         }
+        // A committed claim changes visibility readiness for other waiters.
+        $this->notifier->notify($name);
 
         return new Frame([
             ControlField::Version->value => Frame::VERSION,
@@ -429,6 +447,68 @@ final class Broker
                 ControlField::ReservedUntil->value => $delivery->reservedUntil,
             ],
         ], $delivery->body, $delivery->headers);
+    }
+
+    private function awaitReadiness(Frame $request, Socket $socket, Cancellation $lifetime, int $id): Frame
+    {
+        $this->assertNoPayload($request);
+        $name = $this->queueName($request->control[ControlField::Queue->value] ?? null);
+        $timeout = $request->control[ControlField::WaitMilliseconds->value] ?? null;
+        if (!\is_int($timeout)) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid wait timeout.');
+        }
+        if ($timeout < 0) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Wait timeout must be nonnegative milliseconds.');
+        }
+        if ($timeout > Limits::MAX_WAIT_MILLISECONDS) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Wait timeout exceeds the protocol maximum.');
+        }
+
+        $monitor = new DeferredCancellation();
+        $waitCancellation = new CompositeCancellation($lifetime, $monitor->getCancellation());
+        $monitorFuture = async(static function () use ($socket, $monitor, $lifetime): void {
+            try {
+                $chunk = $socket->read(new CompositeCancellation($lifetime, $monitor->getCancellation()));
+            } catch (CancelledException) {
+                return;
+            } catch (\Throwable $error) {
+                $monitor->cancel($error);
+
+                return;
+            }
+            if (null === $chunk) {
+                $monitor->cancel();
+
+                return;
+            }
+            $monitor->cancel(new ProtocolException(ErrorCode::InvalidRequest, 'Pipelined bytes during WAIT are not allowed.'));
+        });
+
+        try {
+            $ready = $this->notifier->wait($name, $timeout, $waitCancellation);
+            $waitCancellation->throwIfRequested();
+        } catch (CancelledException $error) {
+            $previous = $error->getPrevious();
+            if ($previous instanceof ProtocolException) {
+                throw $previous;
+            }
+            if ($this->stopping) {
+                throw new ClientContextClosedException('The broker stopped during WAIT.', previous: $error);
+            }
+            if ($lifetime->isRequested()) {
+                throw new ClientContextClosedException('The client connection lifetime was cancelled.', previous: $error);
+            }
+            throw new ClientContextClosedException('The client connection closed during WAIT.', previous: $error);
+        } finally {
+            $monitor->cancel();
+            try {
+                $monitorFuture->await();
+            } catch (\Throwable) {
+                $monitorFuture->ignore();
+            }
+        }
+
+        return self::ok($id, $ready);
     }
 
     private function settle(Frame $request, Operation $operation, string $ownerId, Cancellation $lifetime, int $id): Frame
@@ -466,7 +546,7 @@ final class Broker
         }
     }
 
-    private static function ok(int $id, ?int $result): Frame
+    private static function ok(int $id, int|bool|null $result): Frame
     {
         return new Frame([
             ControlField::Version->value => Frame::VERSION,

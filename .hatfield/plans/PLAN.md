@@ -22,7 +22,9 @@ Task 02 is complete. The standalone Doctrine SQLite runner captured all 24 sched
 
 Task 03 is complete. The [queue engine](../../docs/queue-engine.md) implements durable send, atomic receive, fenced settlement, visibility expiry, and persisted millisecond availability. File-backed tests cover concurrency, commit barriers, rollback, database-full failure, and persistence-worker death.
 
-Task 04 is complete for the approved SIGTERM and SIGKILL lifecycle scope. PR #4 merged at `70bc6cf`. The user excluded shutdown with a deliberately SIGSTOPped worker from release requirements; removing that scenario does not fix its historical intermittent hang. The [responsibility refactor](TASK-04-RESPONSIBILITY-REFACTOR.md) separates queue policy, SQLite storage, broker session lifetime, and lifetime locks. The [protocol reference](../../docs/broker-protocol.md) defines limits and recovery. Task 05's dependency is satisfied, but notification waiting and broker performance acceptance remain future work.
+Task 04 is complete for the approved SIGTERM and SIGKILL lifecycle scope. PR #4 merged at `70bc6cf`. The user excluded shutdown with a deliberately SIGSTOPped worker from release requirements; removing that scenario does not fix its historical intermittent hang. The [responsibility refactor](TASK-04-RESPONSIBILITY-REFACTOR.md) separates queue policy, SQLite storage, broker session lifetime, and lifetime locks. The [protocol reference](../../docs/broker-protocol.md) defines limits and recovery.
+
+Task 05 is implemented on `task-05-delayed-wakeups` as PR #6: bounded WAIT, `QueueNotifier` deadline scheduling, and restart/cancellation proof. Numeric queue keys and captured-timer races are fixed. Local Castor QA passes with 282 tests and 1,763 assertions. PR review remains open. Broker performance acceptance remains Task 08 work. The SIGSTOP-worker shutdown caveat from Task 04 still stands.
 
 ### Implementation task index
 
@@ -34,7 +36,7 @@ Read this plan before the assigned task. The task files divide the work; they do
 | [02: benchmark baseline](TASK-02-BENCHMARK-BASELINE.md) | Done. Package-local runner and recorded standard Messenger SQLite baseline, including failures | 01 |
 | [03: async SQLite queue](TASK-03-ASYNC-SQLITE-QUEUE.md) | Done. Durable engine, atomic claims, receipts, persisted delayed availability | 01 |
 | [04: broker and client](TASK-04-BROKER-AND-CLIENT.md) | Done for the approved SIGTERM/SIGKILL scope. Bounded sockets and foreground service | 03 |
-| [05: delayed wakeups](TASK-05-DELAYED-WAKEUPS.md) | Race-safe notifications, deadline scheduling, restart and cancellation | 04 |
+| [05: delayed wakeups](TASK-05-DELAYED-WAKEUPS.md) | Implemented. Bounded WAIT, deadline scheduling, restart and cancellation. PR #6 under review | 04 |
 | [06: Messenger adapter](TASK-06-MESSENGER-ADAPTER.md) | Real worker integration, serializers, DelayStamp, retry/idle mapping | 05 |
 | [07: failure and lifecycle proof](TASK-07-FAILURE-AND-LIFECYCLE-PROOF.md) | Remaining cross-component fault cases and independent safety review | 06 |
 | [08: benchmark and MVP acceptance](TASK-08-BENCHMARK-AND-MVP-ACCEPTANCE.md) | Actual A/B comparison, documentation, package acceptance | 02 and 07 |
@@ -268,16 +270,15 @@ Symfony 9 and later, are unverified. Messenger stays a development dependency un
 adapter lands, then becomes an optional runtime requirement so the engine and client still run
 without Symfony.
 
-The foreground command is `sqlite-queue broker`. Task 04 implements client send, immediate
-receive, acknowledge, reject, and close, with the API documented in
-[broker usage](../../docs/broker.md). Bounded waiting remains Task 05 work. No multi-driver
-abstraction, version fallback, or speculative adapter layer is added.
+The foreground command is `sqlite-queue broker`. Client send, immediate receive, acknowledge,
+reject, close, and bounded wait are documented in [broker usage](../../docs/broker.md). No
+multi-driver abstraction, version fallback, or speculative adapter layer is added.
 
 ## 7. Broker lifecycle and protocol requirements
 
 Start with a foreground local Unix-socket service. Persistent connections avoid repeated connection setup. Multiplexed requests are not an MVP requirement; one outstanding request per connection is a reasonable initial simplification, subject to cancellation and wakeup needs.
 
-The protocol must cover send, immediate receive, ACK, terminal reject, bounded waiting, and the initialization information needed to reject incompatible clients. Task 04 defines the [v1 wire format](../../docs/broker-protocol.md) for immediate operations; Task 05 adds bounded waiting. Do not add queue-admin endpoints from the deferred feature list.
+The protocol covers send, immediate receive, ACK, terminal reject, bounded waiting, and the initialization information needed to reject incompatible clients. The [v1 wire format](../../docs/broker-protocol.md) defines those operations. Do not add queue-admin endpoints from the deferred feature list.
 
 Before implementation, define a bounded frame format, request/reply correlation, and error representation. Existing Amp byte-stream and socket facilities should handle partial I/O and backpressure. Malformed, truncated, oversized, or unsupported frames must fail with bounded resource use.
 
@@ -320,7 +321,15 @@ Required mappings:
 
 Messenger retries and backoff remain Messenger's responsibility. No broker job runner or independent handler registry is needed.
 
-Coordinate notification waits with worker sleep. In the inspected Symfony worker, the idle event is followed by the remaining configured sleep interval. Waking promptly and then sleeping for the rest of 50ms defeats part of the design. Recheck the selected version and integrate through supported facilities without a busy loop, skipped worker limits, or hidden changes to unrelated transports.
+Coordinate notification waits with worker sleep through the actual Task 05 API:
+`Client::wait(string $queue, int $timeoutMilliseconds, ?Cancellation $cancellation = null): bool`.
+Bounds are `0..30_000`. `true` is only a receive hint; `false` is a normal timeout or empty
+probe. Local out-of-range bounds preserve the request sequence. Cancellation invalidates the
+connection with no replay. In the inspected Symfony worker, the idle event is followed by the
+remaining configured sleep interval. Waking promptly and then sleeping for the rest of that
+interval defeats part of the design. Recheck the selected version and integrate through
+supported facilities without a busy loop, skipped worker limits, or hidden changes to unrelated
+transports. Task 05 does not implement the Messenger adapter.
 
 Batch receive is deferred. Do not promise a batch API to satisfy a hypothetical future Symfony version. Preserve the actual supported receiver contract and validate compatibility with a real worker.
 

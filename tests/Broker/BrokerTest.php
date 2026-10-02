@@ -12,11 +12,13 @@ use Amp\Socket\Socket;
 use Amp\TimeoutCancellation;
 use Ineersa\SqliteQueue\Broker\Broker;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
+use Ineersa\SqliteQueue\Broker\QueueNotifier;
 use Ineersa\SqliteQueue\Client;
 use Ineersa\SqliteQueue\Exception\InvalidReceiptException;
 use Ineersa\SqliteQueue\Exception\TransportException;
 use Ineersa\SqliteQueue\Protocol\ErrorCode;
 use Ineersa\SqliteQueue\Protocol\Frame;
+use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Tests\Broker\Fixtures\GatingServerSocket;
 use Ineersa\SqliteQueue\Tests\Broker\Fixtures\WriteGate;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
@@ -25,6 +27,7 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\DataProviderExternal;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
+use Revolt\EventLoop\Internal\TimerCallback;
 
 use function Amp\async;
 use function Amp\Socket\connect;
@@ -306,6 +309,234 @@ final class BrokerTest extends TestCase
         });
     }
 
+    public function testIdleWaitWakesOnCommittedImmediateSend(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker(clock: fn (): int => $this->now);
+            $waiter = $this->connectClient();
+            $publisher = $this->connectClient();
+            $waiting = async(static fn (): bool => $waiter->wait('jobs', 5_000));
+            $this->awaitNotifierWaiters(1);
+            $publisher->send('jobs', 'wake');
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $delivery = $waiter->receive('jobs');
+            $this->assertNotNull($delivery);
+            $this->assertSame('wake', $delivery->body);
+            $waiter->acknowledge($delivery->receipt);
+        });
+    }
+
+    public function testEmptyReceiveThenWaitCannotMissALaterCommittedSend(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker(clock: fn (): int => $this->now);
+            $waiter = $this->connectClient();
+            $publisher = $this->connectClient();
+            $this->assertNull($waiter->receive('jobs'));
+            $waiting = async(static fn (): bool => $waiter->wait('jobs', 5_000));
+            $this->awaitNotifierWaiters(1);
+            $publisher->send('jobs', 'after empty receive');
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $delivery = $waiter->receive('jobs');
+            $this->assertNotNull($delivery);
+            $this->assertSame('after empty receive', $delivery->body);
+            $waiter->acknowledge($delivery->receipt);
+        });
+    }
+
+    public function testDelayedAndVisibilityWaitsWakeWithoutAnotherPublication(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker(50, fn (): int => $this->now);
+            $client = $this->connectClient();
+            $client->send('jobs', 'later', delay: 100);
+            $waiting = async(static fn (): bool => $client->wait('jobs', 5_000));
+            $timerId = $this->awaitNotifierDeadline($this->now + 100);
+            $this->now += 100;
+            $this->fireNotifierTimer($timerId);
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $delivery = $client->receive('jobs');
+            $this->assertNotNull($delivery);
+            $client->acknowledge($delivery->receipt);
+
+            $client->send('jobs', 'claimed');
+            $reserved = $client->receive('jobs');
+            $this->assertNotNull($reserved);
+            $waiting = async(static fn (): bool => $client->wait('jobs', 5_000));
+            $timerId = $this->awaitNotifierDeadline($reserved->reservedUntil);
+            $this->now = $reserved->reservedUntil;
+            $this->fireNotifierTimer($timerId);
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $redelivery = $client->receive('jobs');
+            $this->assertNotNull($redelivery);
+            $this->assertNotSame($reserved->receipt, $redelivery->receipt);
+            $client->acknowledge($redelivery->receipt);
+        });
+    }
+
+    public function testEarlierDeadlineReschedulesAndCrossQueueWaitsRemainIndependent(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker(clock: fn (): int => $this->now);
+            $jobs = $this->connectClient();
+            $other = $this->connectClient();
+            $publisher = $this->connectClient();
+            $publisher->send('jobs', 'late', delay: 500);
+            $waitingJobs = async(static fn (): bool => $jobs->wait('jobs', 5_000));
+            $this->awaitNotifierDeadline($this->now + 500);
+            $waitingOther = async(static fn (): bool => $other->wait('other', 5_000));
+            $this->awaitNotifierWaiters(2);
+            $publisher->send('jobs', 'earlier', delay: 50);
+            $timerId = $this->awaitNotifierDeadline($this->now + 50);
+            $this->now += 50;
+            $this->fireNotifierTimer($timerId);
+            $this->assertTrue($waitingJobs->await(new TimeoutCancellation(5)));
+            $this->assertFalse($waitingOther->isComplete());
+            $publisher->send('other', 'ready');
+            $this->assertTrue($waitingOther->await(new TimeoutCancellation(5)));
+        });
+    }
+
+    public function testMultipleWaitersClaimExclusivelyAfterWake(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker(clock: fn (): int => $this->now);
+            $first = $this->connectClient();
+            $second = $this->connectClient();
+            $waitingFirst = async(static fn (): bool => $first->wait('jobs', 5_000));
+            $waitingSecond = async(static fn (): bool => $second->wait('jobs', 5_000));
+            $this->awaitNotifierWaiters(2);
+            $publisher = $this->connectClient();
+            $publisher->send('jobs', 'one');
+            $this->assertTrue($waitingFirst->await(new TimeoutCancellation(5)));
+            $this->assertTrue($waitingSecond->await(new TimeoutCancellation(5)));
+            $firstClaim = async(static fn () => $first->receive('jobs'));
+            $secondClaim = async(static fn () => $second->receive('jobs'));
+            $a = $firstClaim->await(new TimeoutCancellation(5));
+            $b = $secondClaim->await(new TimeoutCancellation(5));
+            $this->assertTrue((null === $a) !== (null === $b));
+            $winner = $a ?? $b;
+            $this->assertNotNull($winner);
+            (null === $a ? $second : $first)->acknowledge($winner->receipt);
+            $this->assertNull((null === $a ? $first : $second)->receive('jobs'));
+        });
+    }
+
+    public function testZeroWaitTimeoutAndReuseRemainValid(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker(clock: fn (): int => $this->now);
+            $client = $this->connectClient();
+            $this->assertFalse($client->wait('jobs', 0));
+            $waiting = async(static fn (): bool => $client->wait('jobs', 5_000));
+            $timeoutId = $this->awaitNotifierWaitTimeout();
+            $this->fireNotifierTimer($timeoutId);
+            $this->assertFalse($waiting->await(new TimeoutCancellation(5)));
+            $client->send('jobs', 'ready');
+            $this->assertTrue($client->wait('jobs', 0));
+            $delivery = $client->receive('jobs');
+            $this->assertNotNull($delivery);
+            $client->acknowledge($delivery->receipt);
+        });
+    }
+
+    public function testWaitDisconnectCancelsPromptlyWithoutConsumingPeerBytesOnHealthyTimeout(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker(clock: fn (): int => $this->now);
+            $peer = $this->rawPeer();
+            Frame::write($peer, (new Frame(['v' => Frame::VERSION, 'id' => 0, 'op' => 'hello']))->encode(), new TimeoutCancellation(5));
+            $this->assertNotNull(Frame::read($peer, new TimeoutCancellation(5)));
+            Frame::write($peer, (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'wait', 'queue' => 'jobs', 'wait_ms' => 5_000]))->encode(), new TimeoutCancellation(5));
+            $this->awaitNotifierWaiters(1);
+            $peer->close();
+            $this->assertNull(Frame::read($peer, new TimeoutCancellation(5)));
+            $this->awaitNotifierWaiters(0);
+
+            $client = $this->connectClient();
+            $waiting = async(static fn (): bool => $client->wait('jobs', 5_000));
+            $timeoutId = $this->awaitNotifierWaitTimeout();
+            $this->fireNotifierTimer($timeoutId);
+            $this->assertFalse($waiting->await(new TimeoutCancellation(5)));
+            $client->send('jobs', 'still usable');
+            $delivery = $client->receive('jobs');
+            $this->assertNotNull($delivery);
+            $client->acknowledge($delivery->receipt);
+        });
+    }
+
+    public function testPipelinedBytesDuringWaitProduceAnExplicitProtocolError(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker(clock: fn (): int => $this->now);
+            $peer = $this->rawPeer();
+            Frame::write($peer, (new Frame(['v' => Frame::VERSION, 'id' => 0, 'op' => 'hello']))->encode(), new TimeoutCancellation(5));
+            $this->assertNotNull(Frame::read($peer, new TimeoutCancellation(5)));
+            Frame::write($peer, (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'wait', 'queue' => 'jobs', 'wait_ms' => 5_000]))->encode(), new TimeoutCancellation(5));
+            $this->awaitNotifierWaiters(1);
+            Frame::write($peer, (new Frame(['v' => Frame::VERSION, 'id' => 2, 'op' => 'receive', 'queue' => 'jobs']))->encode(), new TimeoutCancellation(5));
+            $reply = Frame::read($peer, new TimeoutCancellation(5));
+            $this->assertNotNull($reply);
+            $this->assertSame(1, $reply->control['id']);
+            $this->assertSame(ErrorCode::InvalidRequest->value, $reply->control['error']['code']);
+            $this->assertNull(Frame::read($peer, new TimeoutCancellation(5)));
+            $this->awaitNotifierWaiters(0);
+            $this->assertFalse($this->connectClient()->wait('jobs', 0));
+        });
+    }
+
+    public function testWaitShutdownCancelsOutstandingWaits(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker(clock: fn (): int => $this->now);
+            $client = $this->connectClient();
+            $waiting = async(static fn (): bool => $client->wait('jobs', 5_000));
+            $this->awaitNotifierWaiters(1);
+            $this->broker->stop();
+            try {
+                $waiting->await(new TimeoutCancellation(5));
+                $this->fail('Shutdown must invalidate an outstanding WAIT.');
+            } catch (TransportException) {
+                $this->addToAssertionCount(1);
+            }
+            $this->assertSame(0, $this->brokerFuture->await(new TimeoutCancellation(10)));
+            $this->brokerFuture = null;
+            $this->broker = null;
+        });
+    }
+
+    public function testNumericQueueWaitShutdownLeavesLiteralQueueIdentity(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker(clock: fn (): int => $this->now);
+            $client = $this->connectClient();
+            $id = $client->send('1', 'numeric-queue', delay: 1_000);
+            $waiting = async(static fn (): bool => $client->wait('1', 5_000));
+            $this->awaitNotifierWaiters(1);
+            $timerId = $this->awaitNotifierDeadline($this->now + 1_000);
+            $this->assertFalse(EventLoop::isEnabled($timerId));
+            $this->broker->stop();
+            try {
+                $waiting->await(new TimeoutCancellation(5));
+                $this->fail('Shutdown must invalidate a numeric-queue WAIT.');
+            } catch (TransportException) {
+                $this->addToAssertionCount(1);
+            }
+            $this->awaitNotifierWaiters(0);
+            $this->assertSame(0, $this->brokerFuture->await(new TimeoutCancellation(10)));
+            $this->brokerFuture = null;
+            $this->broker = null;
+            $database = new \SQLite3($this->database->path());
+            try {
+                $queue = $database->querySingle('SELECT queue FROM queue_messages WHERE id = '.(int) $id);
+                $this->assertSame('1', $queue);
+                $this->assertSame(0, $database->querySingle("SELECT count(*) FROM queue_messages WHERE queue = '01'"));
+            } finally {
+                $database->close();
+            }
+        });
+    }
+
     public static function malformedTraffic(): iterable
     {
         yield 'version 2 request' => ['version 2 request', 'unsupported_protocol_version'];
@@ -317,6 +548,11 @@ final class BrokerTest extends TestCase
         yield 'missing operation' => ['missing operation', 'invalid_request'];
         yield 'non-string operation' => ['non-string operation', 'invalid_request'];
         yield 'unsupported control field' => ['unsupported control field', 'invalid_request'];
+        yield 'wait with body' => ['wait with body', 'invalid_request'];
+        yield 'negative wait' => ['negative wait', 'invalid_request'];
+        yield 'oversized wait' => ['oversized wait', 'invalid_request'];
+        yield 'string wait' => ['string wait', 'invalid_request'];
+        yield 'missing wait_ms' => ['missing wait_ms', 'invalid_request'];
         yield 'extra field on send' => ['extra field on send', 'invalid_request'];
         yield 'receive with body' => ['receive with body', 'invalid_request'];
         yield 'acknowledge with headers' => ['acknowledge with headers', 'invalid_request'];
@@ -349,6 +585,11 @@ final class BrokerTest extends TestCase
                 'missing operation' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'queue' => 'jobs']))->encode(),
                 'non-string operation' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 5, 'queue' => 'jobs']))->encode(),
                 'unsupported control field' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'receive', 'queue' => 'jobs', 'wait_ms' => 10]))->encode(),
+                'wait with body' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'wait', 'queue' => 'jobs', 'wait_ms' => 0], 'body'))->encode(),
+                'negative wait' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'wait', 'queue' => 'jobs', 'wait_ms' => -1]))->encode(),
+                'oversized wait' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'wait', 'queue' => 'jobs', 'wait_ms' => Limits::MAX_WAIT_MILLISECONDS + 1]))->encode(),
+                'string wait' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'wait', 'queue' => 'jobs', 'wait_ms' => '5']))->encode(),
+                'missing wait_ms' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'wait', 'queue' => 'jobs']))->encode(),
                 'extra field on send' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'send', 'queue' => 'jobs', 'delay' => 0, 'receipt' => 'x']))->encode(),
                 'receive with body' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'receive', 'queue' => 'jobs'], 'body'))->encode(),
                 'acknowledge with headers' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'acknowledge', 'receipt' => 'r'], '', 'h'))->encode(),
@@ -739,6 +980,100 @@ final class BrokerTest extends TestCase
     private function runAsync(\Closure $operation): void
     {
         async($operation)->await();
+    }
+
+    private function awaitNotifierWaiters(int $count): void
+    {
+        $deadline = microtime(true) + 5;
+        do {
+            $notifier = (new \ReflectionProperty(Broker::class, 'notifier'))->getValue($this->broker);
+            $waiters = (new \ReflectionProperty(QueueNotifier::class, 'waiters'))->getValue($notifier);
+            $total = 0;
+            foreach ($waiters as $list) {
+                $total += \count($list);
+            }
+            if ($count === $total) {
+                return;
+            }
+            $this->turn();
+        } while (microtime(true) < $deadline);
+
+        $this->fail('Expected '.$count.' notifier waiters.');
+    }
+
+    private function awaitNotifierDeadline(int $readyAt): string
+    {
+        $deadline = microtime(true) + 5;
+        do {
+            $notifier = (new \ReflectionProperty(Broker::class, 'notifier'))->getValue($this->broker);
+            $watches = (new \ReflectionProperty(QueueNotifier::class, 'watches'))->getValue($notifier);
+            foreach ($watches as $watch) {
+                if (!$watch->querying && !$watch->dirty && $watch->timerReadyAt === $readyAt && null !== $watch->timerId) {
+                    $timerId = $watch->timerId;
+                    EventLoop::disable($timerId);
+
+                    return $timerId;
+                }
+            }
+            $this->turn();
+        } while (microtime(true) < $deadline);
+
+        $this->fail('Deadline timer was not scheduled at '.$readyAt.'.');
+    }
+
+    private function awaitNotifierWaitTimeout(): string
+    {
+        $deadline = microtime(true) + 5;
+        do {
+            $notifier = (new \ReflectionProperty(Broker::class, 'notifier'))->getValue($this->broker);
+            $waiters = (new \ReflectionProperty(QueueNotifier::class, 'waiters'))->getValue($notifier);
+            foreach ($waiters as $list) {
+                foreach ($list as $waiter) {
+                    if (null !== $waiter->timeoutId) {
+                        $timeoutId = $waiter->timeoutId;
+                        EventLoop::disable($timeoutId);
+
+                        return $timeoutId;
+                    }
+                }
+            }
+            $this->turn();
+        } while (microtime(true) < $deadline);
+
+        $this->fail('Waiter timeout timer was not armed.');
+    }
+
+    private function fireNotifierTimer(string $timerId): void
+    {
+        $driver = EventLoop::getDriver();
+        $callbacks = null;
+        $reflection = new \ReflectionObject($driver);
+        while (null !== $reflection) {
+            if ($reflection->hasProperty('callbacks')) {
+                $callbacks = $reflection->getProperty('callbacks')->getValue($driver);
+                break;
+            }
+            $reflection = $reflection->getParentClass() ?: null;
+        }
+        $this->assertIsArray($callbacks);
+        $callback = $callbacks[$timerId] ?? null;
+        $this->assertInstanceOf(TimerCallback::class, $callback);
+        EventLoop::cancel($timerId);
+        ($callback->closure)($timerId);
+        $this->turn();
+    }
+
+    private function turn(): void
+    {
+        $suspension = EventLoop::getSuspension();
+        $id = EventLoop::delay(0, static function () use ($suspension): void {
+            $suspension->resume();
+        });
+        try {
+            $suspension->suspend();
+        } finally {
+            EventLoop::cancel($id);
+        }
     }
 
     private function startBroker(int $visibilityTimeout = 5000, ?\Closure $clock = null): void

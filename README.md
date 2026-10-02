@@ -2,12 +2,8 @@
 
 A reusable PHP queue broker and client backed by SQLite. Symfony Messenger integration is planned.
 
-This checkout includes the async SQLite engine, foreground broker, socket client, driver verification, and a standalone Doctrine SQLite benchmark baseline.
-Notification waiting and the Messenger adapter are not implemented yet. See
-[docs/contracts.md](docs/contracts.md) for the settled package contracts and
-[docs/driver-verification.md](docs/driver-verification.md) for the measured driver behavior
-the later tasks depend on. The [queue engine reference](docs/queue-engine.md) describes the storage API, schema, and receipt lifecycle.
-See [Run the broker and use the client](docs/broker.md) for foreground startup and a client example.
+This checkout includes the async SQLite engine, foreground broker, socket client with bounded WAIT, driver verification, and a standalone Doctrine SQLite benchmark baseline.
+The Symfony Messenger adapter is not implemented yet. See [docs/contracts.md](docs/contracts.md) for the settled package contracts and [docs/driver-verification.md](docs/driver-verification.md) for the measured driver behavior later tasks depend on. The [queue engine reference](docs/queue-engine.md) describes the storage API, schema, and receipt lifecycle. See [Run the broker and use the client](docs/broker.md) for foreground startup, receive, and WAIT.
 
 ## Requirements
 
@@ -39,8 +35,8 @@ See [AGENTS.md](AGENTS.md) for Castor commands, validation rules, and report pat
 | --- | --- |
 | Package setup, dependency matrix, driver verification | Done in Task 01 |
 | Queue engine and schema | Done in Task 03, including durable delayed availability |
-| Foreground `sqlite-queue broker` and PHP client | Implemented in Task 04. Immediate receive only. |
-| Delayed wakeups | Not started, Task 05 |
+| Foreground `sqlite-queue broker` and PHP client | Done in Task 04 for the approved SIGTERM/SIGKILL scope. Immediate receive, ACK, reject, and close. |
+| Delayed wakeups | Implemented in Task 05. Bounded WAIT, deadline scheduling, and restart/cancellation proof. Pending final QA and PR. |
 | Symfony Messenger adapter | Not started, Task 06 |
 | Benchmark baseline | Task 02 complete, including recorded lock failures and comparison limits |
 | A/B comparison | Not started, Task 08. No broker performance result. |

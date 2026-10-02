@@ -6,13 +6,19 @@ namespace Ineersa\SqliteQueue\Tests\Broker;
 
 use Amp\ByteStream\BufferedReader;
 use Amp\CancelledException;
+use Amp\DeferredCancellation;
 use Amp\Process\Process;
+use Amp\Socket\Socket;
 use Amp\TimeoutCancellation;
 use Ineersa\SqliteQueue\Client;
+use Ineersa\SqliteQueue\Exception\TransportException;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
 use PHPUnit\Framework\Attributes\RequiresOperatingSystem;
 use PHPUnit\Framework\TestCase;
+
+use function Amp\async;
+use function Amp\Socket\connect;
 
 #[RequiresOperatingSystem('Linux')]
 final class BrokerProcessTest extends TestCase
@@ -22,6 +28,16 @@ final class BrokerProcessTest extends TestCase
     private const int PROBE_MARKER_TIMEOUT_SECONDS = 5;
     /** Bound on a broker shutdown; the production budget is five seconds. */
     private const int SIGNAL_BOUND_SECONDS = 10;
+    /** Bound for positive notifier registration or deadline observation. */
+    private const int CONTROL_OBSERVE_SECONDS = 5;
+    /** Controlled clock origin for delayed WAIT process evidence, in Unix milliseconds. */
+    private const int CONTROLLED_NOW_MS = 1_700_000_000_000;
+    /** Positive subsecond delay used by real-process delayed WAIT evidence. */
+    private const int SUBSECOND_DELAY_MS = 250;
+    /** Real due-timer smoke delay; short enough for CI, long enough to schedule. */
+    private const int REAL_TIMER_DELAY_MS = 200;
+    /** Safety bound around a real due-timer WAIT smoke, in seconds. */
+    private const float REAL_TIMER_SAFETY_SECONDS = 5.0;
     private ?IsolatedDatabase $fixture = null;
     private string $socket = '';
     /** @var list<Process> */
@@ -30,6 +46,8 @@ final class BrokerProcessTest extends TestCase
     private array $clients = [];
     /** @var list<int> */
     private array $tracked = [];
+    /** @var list<Socket> */
+    private array $controls = [];
 
     protected function setUp(): void
     {
@@ -44,6 +62,9 @@ final class BrokerProcessTest extends TestCase
     {
         foreach ($this->clients as $client) {
             $client->close();
+        }
+        foreach ($this->controls as $control) {
+            $control->close();
         }
         foreach (array_reverse($this->tracked) as $pid) {
             if (isset(ProcessTree::snapshot()[$pid]) && \function_exists('posix_kill')) {
@@ -277,6 +298,299 @@ final class BrokerProcessTest extends TestCase
         $this->assertTrackedGone();
     }
 
+    public function testIdleProtocolWaitWakesOnCommittedImmediatePublication(): void
+    {
+        async(function (): void {
+            $database = $this->fixture->path();
+            $controlPath = $this->fixture->path('control.sock');
+            [$broker, $control] = $this->startControlledClockBroker($database, $this->socket, $controlPath, self::CONTROLLED_NOW_MS);
+            $owned = $this->trackOwned($broker->getPid());
+            $this->assertCount(1, $owned['workers']);
+
+            $waiter = $this->client();
+            $publisher = $this->client();
+            $this->assertNull($waiter->receive('jobs'));
+            $waiting = async(static fn (): bool => $waiter->wait('jobs', 5_000));
+            $this->awaitControlWaiters($control, 1);
+            $publisher->send('jobs', 'wake');
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $delivery = $waiter->receive('jobs');
+            $this->assertNotNull($delivery);
+            $this->assertSame('wake', $delivery->body);
+            $waiter->acknowledge($delivery->receipt);
+
+            $waiter->close();
+            array_pop($this->clients);
+            $publisher->close();
+            array_pop($this->clients);
+            $this->stopControlledClockBroker($broker, $control);
+            $this->assertTrackedGone();
+            $this->assertFileDoesNotExist($this->socket);
+        })->await();
+    }
+
+    public function testControlledClockDelayedWaitWakesWithoutAnotherPublication(): void
+    {
+        async(function (): void {
+            $database = $this->fixture->path();
+            $controlPath = $this->fixture->path('control.sock');
+            [$broker, $control] = $this->startControlledClockBroker($database, $this->socket, $controlPath, self::CONTROLLED_NOW_MS);
+            $owned = $this->trackOwned($broker->getPid());
+            $this->assertCount(1, $owned['workers']);
+
+            $client = $this->client();
+            $readyAt = self::CONTROLLED_NOW_MS + self::SUBSECOND_DELAY_MS;
+            $id = $client->send('jobs', 'later', delay: self::SUBSECOND_DELAY_MS);
+            $this->assertNull($client->receive('jobs'), 'A delayed message must not be claimable before its deadline.');
+            $waiting = async(static fn (): bool => $client->wait('jobs', 5_000));
+            $timerId = $this->awaitControlDeadline($control, $readyAt);
+            $this->controlCommand($control, ['op' => 'set_now', 'now' => $readyAt]);
+            $this->assertTrue($this->controlCommand($control, ['op' => 'fire', 'timer_id' => $timerId])['ok']);
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $delivery = $client->receive('jobs');
+            $this->assertNotNull($delivery);
+            $this->assertSame($id, $delivery->id);
+            $this->assertSame('later', $delivery->body);
+            $this->assertSame($readyAt, $delivery->availableAt);
+            $client->acknowledge($delivery->receipt);
+
+            $client->close();
+            array_pop($this->clients);
+            $this->stopControlledClockBroker($broker, $control);
+            $this->assertTrackedGone();
+            $this->assertFileDoesNotExist($this->socket);
+        })->await();
+    }
+
+    public function testCliDelayedWaitWakesOnRealDueTimerWithoutAnotherPublication(): void
+    {
+        async(function (): void {
+            $database = $this->fixture->path();
+            $broker = $this->startBroker($database, $this->socket);
+            $owned = $this->trackOwned($broker->getPid());
+            $this->assertCount(1, $owned['workers']);
+
+            $client = $this->client();
+            $id = $client->send('jobs', 'due', delay: self::REAL_TIMER_DELAY_MS);
+            $this->assertNull($client->receive('jobs'));
+            $waiting = async(static fn (): bool => $client->wait('jobs', 5_000));
+            $this->assertTrue($waiting->await(new TimeoutCancellation(self::REAL_TIMER_SAFETY_SECONDS)));
+            $delivery = $client->receive('jobs');
+            $this->assertNotNull($delivery);
+            $this->assertSame($id, $delivery->id);
+            $this->assertSame('due', $delivery->body);
+            $client->acknowledge($delivery->receipt);
+
+            $client->close();
+            array_pop($this->clients);
+            $this->stopBroker($broker);
+            $this->assertTrackedGone();
+        })->await();
+    }
+
+    public function testWaitCancellationAndDisconnectInvalidateOnlyThatClient(): void
+    {
+        async(function (): void {
+            $database = $this->fixture->path();
+            $controlPath = $this->fixture->path('control.sock');
+            [$broker, $control] = $this->startControlledClockBroker($database, $this->socket, $controlPath, self::CONTROLLED_NOW_MS);
+            $this->trackOwned($broker->getPid());
+
+            $waitingClient = $this->client();
+            $session = new DeferredCancellation();
+            $waiting = async(static fn (): bool => $waitingClient->wait('jobs', 5_000, $session->getCancellation()));
+            $this->awaitControlWaiters($control, 1);
+            $healthy = $this->client();
+            $session->cancel();
+            try {
+                $waiting->await(new TimeoutCancellation(5));
+                $this->fail('Cancellation during WAIT must invalidate the client.');
+            } catch (TransportException) {
+                $this->addToAssertionCount(1);
+            }
+            try {
+                $waitingClient->send('jobs', 'must not reuse cancelled client');
+                $this->fail('A cancelled WAIT client must stay closed.');
+            } catch (TransportException) {
+                $this->addToAssertionCount(1);
+            }
+
+            $peer = $this->client();
+            $peerWaiting = async(static fn (): bool => $peer->wait('jobs', 5_000));
+            $this->awaitControlWaiters($control, 1);
+            $peer->close();
+            array_pop($this->clients);
+            try {
+                $peerWaiting->await(new TimeoutCancellation(5));
+                $this->fail('Disconnect during WAIT must invalidate that exchange.');
+            } catch (TransportException) {
+                $this->addToAssertionCount(1);
+            }
+            $this->awaitControlWaiters($control, 0);
+
+            $healthy->send('jobs', 'still usable');
+            $delivery = $healthy->receive('jobs');
+            $this->assertNotNull($delivery);
+            $this->assertSame('still usable', $delivery->body);
+            $healthy->acknowledge($delivery->receipt);
+
+            $healthy->close();
+            array_pop($this->clients);
+            $waitingClient->close();
+            array_pop($this->clients);
+            $this->stopControlledClockBroker($broker, $control);
+            $this->assertTrackedGone();
+        })->await();
+    }
+
+    public function testGracefulShutdownWithPendingWaitPreservesFutureMessage(): void
+    {
+        async(function (): void {
+            $database = $this->fixture->path();
+            $controlPath = $this->fixture->path('control.sock');
+            [$broker, $control] = $this->startControlledClockBroker($database, $this->socket, $controlPath, self::CONTROLLED_NOW_MS);
+            $this->trackOwned($broker->getPid());
+
+            $publisher = $this->client();
+            $readyAt = self::CONTROLLED_NOW_MS + self::SUBSECOND_DELAY_MS;
+            $id = $publisher->send('jobs', 'future', delay: self::SUBSECOND_DELAY_MS);
+            $this->assertSame($readyAt, $this->availableAt($database, $id));
+            $publisher->close();
+            array_pop($this->clients);
+
+            $waiter = $this->client();
+            $waiting = async(static fn (): bool => $waiter->wait('jobs', 5_000));
+            $this->awaitControlWaiters($control, 1);
+            $this->stopControlledClockBroker($broker, $control);
+            try {
+                $waiting->await(new TimeoutCancellation(5));
+                $this->fail('Shutdown must invalidate an outstanding WAIT.');
+            } catch (TransportException) {
+                $this->addToAssertionCount(1);
+            }
+            $this->assertTrackedGone();
+            $this->assertFileDoesNotExist($this->socket);
+            $this->assertSame($readyAt, $this->availableAt($database, $id), 'Shutdown must preserve the original availability deadline.');
+
+            [$restarted, $restartControl] = $this->startControlledClockBroker(
+                $database,
+                $this->socket,
+                $this->fixture->path('control-restart.sock'),
+                self::CONTROLLED_NOW_MS,
+            );
+            $this->trackOwned($restarted->getPid());
+            $client = $this->client();
+            $this->assertNull($client->receive('jobs'), 'A future deadline must remain unavailable after restart.');
+            $client->close();
+            array_pop($this->clients);
+            $this->stopControlledClockBroker($restarted, $restartControl);
+            $this->assertTrackedGone();
+            $this->assertSame($readyAt, $this->availableAt($database, $id));
+        })->await();
+    }
+
+    public function testControlledClockRestartPreservesFutureAndOverdueDeadlines(): void
+    {
+        async(function (): void {
+            $database = $this->fixture->path();
+            $controlPath = $this->fixture->path('control.sock');
+            $start = self::CONTROLLED_NOW_MS;
+            [$first, $control] = $this->startControlledClockBroker($database, $this->socket, $controlPath, $start);
+            $this->trackOwned($first->getPid());
+
+            $client = $this->client();
+            $readyAt = $start + self::SUBSECOND_DELAY_MS;
+            $id = $client->send('jobs', 'persisted', delay: self::SUBSECOND_DELAY_MS);
+            $this->assertNull($client->receive('jobs'));
+            $this->assertSame($readyAt, $this->availableAt($database, $id));
+            $client->close();
+            array_pop($this->clients);
+
+            $this->controlCommand($control, ['op' => 'set_now', 'now' => $start + 25]);
+            $this->stopControlledClockBroker($first, $control);
+            $this->assertTrackedGone();
+            $this->assertSame($readyAt, $this->availableAt($database, $id), 'Restart before the deadline must leave the original timestamp intact.');
+
+            [$second, $beforeControl] = $this->startControlledClockBroker($database, $this->socket, $this->fixture->path('control-before.sock'), $start + 25);
+            $this->trackOwned($second->getPid());
+            $client = $this->client();
+            $this->assertNull($client->receive('jobs'), 'A restarted broker must keep a future deadline unavailable.');
+            $waiting = async(static fn (): bool => $client->wait('jobs', 5_000));
+            $timerId = $this->awaitControlDeadline($beforeControl, $readyAt);
+            $this->controlCommand($beforeControl, ['op' => 'set_now', 'now' => $readyAt]);
+            $this->assertTrue($this->controlCommand($beforeControl, ['op' => 'fire', 'timer_id' => $timerId])['ok']);
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $delivery = $client->receive('jobs');
+            $this->assertNotNull($delivery);
+            $this->assertSame($id, $delivery->id);
+            $this->assertSame($readyAt, $delivery->availableAt);
+            $client->acknowledge($delivery->receipt);
+            $client->close();
+            array_pop($this->clients);
+            $this->stopControlledClockBroker($second, $beforeControl);
+            $this->assertTrackedGone();
+
+            [$seed, $seedControl] = $this->startControlledClockBroker($database, $this->socket, $this->fixture->path('control-seed.sock'), $readyAt);
+            $this->trackOwned($seed->getPid());
+            $seedClient = $this->client();
+            $overdueId = $seedClient->send('jobs', 'overdue-seed', delay: self::SUBSECOND_DELAY_MS);
+            $overdueAt = $readyAt + self::SUBSECOND_DELAY_MS;
+            $this->assertSame($overdueAt, $this->availableAt($database, $overdueId));
+            $seedClient->close();
+            array_pop($this->clients);
+            $this->stopControlledClockBroker($seed, $seedControl);
+            $this->assertTrackedGone();
+            $this->assertSame($overdueAt, $this->availableAt($database, $overdueId), 'Restart after the deadline must keep the original availability timestamp.');
+
+            [$third, $overdueControl] = $this->startControlledClockBroker($database, $this->socket, $this->fixture->path('control-late.sock'), $overdueAt);
+            $this->trackOwned($third->getPid());
+            $client = $this->client();
+            $waiting = async(static fn (): bool => $client->wait('jobs', 5_000));
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)), 'An overdue message must wake WAIT after restart without another publication.');
+            $delivery = $client->receive('jobs');
+            $this->assertNotNull($delivery);
+            $this->assertSame($overdueId, $delivery->id);
+            $this->assertSame($overdueAt, $delivery->availableAt);
+            $client->acknowledge($delivery->receipt);
+            $client->close();
+            array_pop($this->clients);
+            $this->stopControlledClockBroker($third, $overdueControl);
+            $this->assertTrackedGone();
+        })->await();
+    }
+
+    public function testCliIdleWaitWakesOnCommittedImmediatePublication(): void
+    {
+        async(function (): void {
+            $database = $this->fixture->path();
+            $broker = $this->startBroker($database, $this->socket);
+            $owned = $this->trackOwned($broker->getPid());
+            $this->assertCount(1, $owned['workers']);
+
+            $waiter = $this->client();
+            $publisher = $this->client();
+            $this->assertNull($waiter->receive('jobs'));
+            $waiting = async(static fn (): bool => $waiter->wait('jobs', 5_000));
+            // A second empty receive proves the broker is still serving while WAIT is outstanding.
+            // Exact waiter registration is covered by the controlled-clock process evidence.
+            $this->assertNull($publisher->receive('jobs'));
+            $publisher->send('jobs', 'cli-wake');
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $delivery = $waiter->receive('jobs');
+            $this->assertNotNull($delivery);
+            $this->assertSame('cli-wake', $delivery->body);
+            $waiter->acknowledge($delivery->receipt);
+
+            $waiter->close();
+            array_pop($this->clients);
+            $publisher->close();
+            array_pop($this->clients);
+            $this->stopBroker($broker);
+            $this->assertTrackedGone();
+            $this->assertFileDoesNotExist($this->socket);
+        })->await();
+    }
+
     private function startBroker(string $database, string $socket): Process
     {
         $process = $this->spawn($database, $socket);
@@ -289,6 +603,104 @@ final class BrokerProcessTest extends TestCase
         $this->processes[] = $process;
 
         return $process;
+    }
+
+    /**
+     * Starts the controlled-clock probe and returns the process plus its control socket.
+     *
+     * @return array{0: Process, 1: Socket}
+     */
+    private function startControlledClockBroker(string $database, string $socket, string $controlPath, int $now): array
+    {
+        $process = Process::start([
+            \PHP_BINARY,
+            __DIR__.'/Fixtures/broker-controlled-clock-probe.php',
+            $database,
+            $socket,
+            $controlPath,
+            (string) $now,
+        ], null, ['PATH' => '/usr/bin:/bin', 'LANG' => 'C']);
+        $line = (new BufferedReader($process->getStdout()))->readUntil("\n", new TimeoutCancellation(10), 65536);
+        $ready = json_decode((string) $line, true, 16, \JSON_THROW_ON_ERROR);
+        $this->assertIsArray($ready);
+        $this->assertSame('ready', $ready['event'] ?? null, 'The controlled-clock probe must report readiness.');
+        $this->assertSame($process->getPid(), $ready['pid'] ?? null);
+        $this->assertSame($socket, $ready['endpoint'] ?? null);
+        $this->processes[] = $process;
+        $control = connect('unix://'.$controlPath, cancellation: new TimeoutCancellation(5));
+        $this->controls[] = $control;
+
+        return [$process, $control];
+    }
+
+    private function stopControlledClockBroker(Process $broker, Socket $control): void
+    {
+        $this->controlCommand($control, ['op' => 'stop']);
+        $this->assertSame(0, $broker->join(new TimeoutCancellation(10)), 'The controlled-clock probe must stop cleanly.');
+        $control->close();
+        $index = array_search($control, $this->controls, true);
+        if (false !== $index) {
+            unset($this->controls[$index]);
+            $this->controls = array_values($this->controls);
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $command
+     *
+     * @return array<string, mixed>
+     */
+    private function controlCommand(Socket $control, array $command): array
+    {
+        $control->write(json_encode($command, \JSON_THROW_ON_ERROR)."\n");
+        $line = (new BufferedReader($control))->readUntil("\n", new TimeoutCancellation(5), 4096);
+        $reply = json_decode((string) $line, true, 8, \JSON_THROW_ON_ERROR);
+        $this->assertIsArray($reply);
+
+        return $reply;
+    }
+
+    private function awaitControlWaiters(Socket $control, int $count): void
+    {
+        $deadline = microtime(true) + self::CONTROL_OBSERVE_SECONDS;
+        do {
+            $reply = $this->controlCommand($control, ['op' => 'waiter_count']);
+            if ($count === ($reply['count'] ?? null)) {
+                return;
+            }
+            usleep(5_000);
+        } while (microtime(true) < $deadline);
+
+        $this->fail('Expected '.$count.' process notifier waiters.');
+    }
+
+    private function awaitControlDeadline(Socket $control, int $readyAt): string
+    {
+        $deadline = microtime(true) + self::CONTROL_OBSERVE_SECONDS;
+        do {
+            $reply = $this->controlCommand($control, ['op' => 'deadline', 'ready_at' => $readyAt]);
+            if (\is_string($reply['timer_id'] ?? null)) {
+                $this->assertFalse($reply['enabled'], 'The fixture must freeze the deadline before replying across IPC.');
+
+                return $reply['timer_id'];
+            }
+            usleep(5_000);
+        } while (microtime(true) < $deadline);
+
+        $this->fail('Deadline timer was not scheduled at '.$readyAt.'.');
+    }
+
+    private function availableAt(string $database, int $id): int
+    {
+        $sqlite = new \SQLite3($database);
+        try {
+            $value = $sqlite->querySingle('SELECT available_at FROM queue_messages WHERE id = '.$id);
+            $this->assertIsInt($value);
+
+            return $value;
+        } finally {
+            $sqlite->close();
+        }
     }
 
     private function conflictingBroker(string $database, string $socket): Process

@@ -21,8 +21,8 @@ use Revolt\EventLoop\FiberLocal;
  * Owns one async SQLite connection and the queue-specific persistence operations.
  *
  * Call {@see exclusive()} for every mutation. {@see insert()}, {@see claim()}, and {@see settle()}
- * require that ownership and throw if invoked without it. Storage never tracks live clients and
- * never chooses receipt tokens or epochs.
+ * require that ownership and throw if invoked without it. {@see earliestEligibility()} also requires
+ * that ownership. Storage never tracks live clients and never chooses receipt tokens or epochs.
  */
 final class SqliteQueueStorage
 {
@@ -70,6 +70,10 @@ final class SqliteQueueStorage
                     )
                 );
                 CREATE INDEX IF NOT EXISTS queue_messages_order ON queue_messages (queue, id);
+                CREATE INDEX IF NOT EXISTS queue_messages_ready ON queue_messages (
+                    queue,
+                    max(available_at, coalesce(reserved_until, available_at))
+                );
                 SQL);
         } catch (\Throwable $error) {
             $connection->close();
@@ -244,6 +248,35 @@ final class SqliteQueueStorage
         return $settled;
     }
 
+    /**
+     * Earliest effective eligibility deadline for one queue, or null when the queue has no rows.
+     *
+     * Effective eligibility is max(available_at, coalesce(reserved_until, available_at)):
+     * unreserved rows use availability, reserved rows use visibility expiry.
+     *
+     * @throws \LogicException when called outside {@see exclusive()}
+     */
+    public function earliestEligibility(string $queue): ?int
+    {
+        $this->assertOwned();
+        $result = $this->connection->execute(
+            'SELECT max(available_at, coalesce(reserved_until, available_at)) AS ready_at
+             FROM queue_messages WHERE queue = ?
+             ORDER BY ready_at LIMIT 1',
+            [$queue],
+        );
+        $row = $result->fetchRow();
+        $result->close();
+        if (null === $row) {
+            return null;
+        }
+        if (!\is_int($row['ready_at'])) {
+            throw new \RuntimeException('Stored eligibility deadline must be an integer.');
+        }
+
+        return $row['ready_at'];
+    }
+
     /** Wait for current operation ownership, then release the persistence worker. */
     public function close(): void
     {
@@ -328,7 +361,7 @@ final class SqliteQueueStorage
     private function assertOwned(): void
     {
         if (true !== $this->owned->get()) {
-            throw new \LogicException('Queue storage mutations require exclusive() ownership.');
+            throw new \LogicException('Queue storage operations require exclusive() ownership.');
         }
     }
 

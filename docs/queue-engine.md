@@ -2,7 +2,7 @@
 
 `Ineersa\SqliteQueue\Queue` owns message policy. `Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage` owns one `fabpot/amphp-sqlite3` connection, schema setup, SQL, and transaction boundaries. SQLite is authoritative. The engine stores no message cache, tracks no live client sessions, performs no application deserialization, and has no Symfony dependency.
 
-This is the storage API for Task 04. It does not implement a broker, socket client, waiting consumers, notifications, or Messenger transport.
+This is the storage and message-policy API. It does not implement the broker socket loop, WAIT coordination, or Messenger transport. Broker waiting uses `earliestEligibility()` as a scheduling hint only.
 
 ## Opening and ownership
 
@@ -47,6 +47,7 @@ Always close storage in `finally`, outside its `exclusive()` callback. `SqliteQu
 | --- | --- |
 | `send(QueueName $queue, string $body, string $headers = '', int $delay = 0, ?Cancellation $cancellation = null): int` | Committed insertion ID. Persists the original availability deadline. |
 | `receive(QueueName $queue, string $ownerId, ?Cancellation $cancellation = null): ?DeliveryDTO` | One committed reservation, or `null` when nothing can be claimed. Never waits for future work. |
+| `earliestEligibility(QueueName $queue, ?Cancellation $cancellation = null): ?int` | Earliest effective eligibility deadline for one queue, or `null` when the queue has no rows. Scheduling hint only. |
 | `acknowledge(string $receipt, string $ownerId, ?Cancellation $cancellation = null): void` | Deletes the current delivery after validating its receipt and ownership. Returns only after commit. |
 | `reject(string $receipt, string $ownerId, ?Cancellation $cancellation = null): void` | The same fenced terminal deletion. Does not reschedule or retry. |
 
@@ -73,7 +74,9 @@ There is one application table, `queue_messages`, for every named queue. SQLite 
 
 A constraint requires all four reservation fields to be null or all four to be populated. Deadlines cannot be negative.
 
-`queue_messages_order(queue, id)` narrows selection to one queue in insertion order. Eligibility filters are applied during that index scan. Future or reserved rows can increase scan work, but do not block a later eligible row or another queue. There is no temporary ordering step in the verified query plan. This is a correctness-first index choice, not a claim about delayed-backlog performance. Deadline notification queries and their indexes remain Task 05 work.
+`queue_messages_order(queue, id)` narrows selection to one queue in insertion order. Eligibility filters are applied during that index scan. Future or reserved rows can increase scan work, but do not block a later eligible row or another queue. There is no temporary ordering step in the verified query plan. This is a correctness-first index choice, not a claim about delayed-backlog performance.
+
+`queue_messages_ready(queue, max(available_at, coalesce(reserved_until, available_at)))` supports the earliest-eligibility query used by WAIT scheduling. Effective eligibility is that same expression: unreserved rows use availability, and reserved rows use visibility expiry. The query returns the minimum ready deadline for one queue, or no row when the queue is empty. It does not claim a message and does not hold a transaction while waiting.
 
 The claim selects the lowest eligible ID:
 
@@ -84,7 +87,7 @@ WHERE queue = ? AND available_at <= ?
 ORDER BY id LIMIT 1
 ```
 
-A local Amp mutex in storage serializes whole operations across fiber suspensions, including close. Public `insert`, `claim`, and `settle` require that ownership and throw if called without it. Each mutation uses the driver's immediate transaction. Receive selects an ID, conditionally updates its reservation using the same eligibility predicate, reads the payload inside that transaction, and commits before returning it. A zero-row conditional update or empty selection rolls back and returns `null`. There is no DML `RETURNING` and no connection-level query inside an active transaction.
+A local Amp mutex in storage serializes whole operations across fiber suspensions, including close. Public `insert`, `claim`, `settle`, and `earliestEligibility` require that ownership and throw if called without it. Each mutation uses the driver's immediate transaction. Receive selects an ID, conditionally updates its reservation using the same eligibility predicate, reads the payload inside that transaction, and commits before returning it. A zero-row conditional update or empty selection rolls back and returns `null`. There is no DML `RETURNING` and no connection-level query inside an active transaction.
 
 Concurrent writers acquire SQLite's write lock before selection. Committed insertions therefore define the ID order. This promises eligible-message ordering, not consumer completion order. The broker will own one database connection; tests also verify fencing across two independent connections to the same file.
 

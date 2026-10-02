@@ -21,6 +21,7 @@ use Ineersa\SqliteQueue\Exception\ReceiptTokenMismatchException;
 use Ineersa\SqliteQueue\Exception\TransportException;
 use Ineersa\SqliteQueue\Protocol\ErrorCode;
 use Ineersa\SqliteQueue\Protocol\Frame;
+use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Protocol\Operation;
 use Ineersa\SqliteQueue\Protocol\ProtocolException;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -466,6 +467,68 @@ final class ClientTest extends TestCase
         $this->assertSame(['queue'], Operation::Receive->allowedFields());
         $this->assertSame(['receipt'], Operation::Acknowledge->allowedFields());
         $this->assertSame(['receipt'], Operation::Reject->allowedFields());
+        $this->assertSame(['queue', 'wait_ms'], Operation::Wait->allowedFields());
+    }
+
+    public function testWaitBooleanReplyAndLocalBoundsPreserveSequence(): void
+    {
+        $seen = [];
+        $endpoint = $this->serve(static function (Socket $socket) use (&$seen): void {
+            Frame::read($socket, new TimeoutCancellation(3));
+            $socket->write(self::helloReply());
+            while (null !== ($request = Frame::read($socket, new TimeoutCancellation(3)))) {
+                $seen[] = $request->control['id'];
+                $op = $request->control['op'] ?? null;
+                if ('wait' === $op) {
+                    $socket->write((new Frame(['v' => Frame::VERSION, 'id' => $request->control['id'], 'ok' => true, 'result' => true]))->encode());
+                    continue;
+                }
+                if ('send' === $op) {
+                    $socket->write((new Frame(['v' => Frame::VERSION, 'id' => $request->control['id'], 'ok' => true, 'result' => 7]))->encode());
+                }
+            }
+        });
+        $client = Client::connect($endpoint);
+        $this->clients[] = $client;
+        $this->assertTrue($client->wait('jobs', 0));
+        try {
+            $client->wait('jobs', -1);
+            $this->fail('Negative wait must fail locally.');
+        } catch (\InvalidArgumentException) {
+        }
+        try {
+            $client->wait('jobs', Limits::MAX_WAIT_MILLISECONDS + 1);
+            $this->fail('Oversized wait must fail locally.');
+        } catch (\InvalidArgumentException) {
+        }
+        $this->assertSame(7, $client->send('jobs', 'after local wait validation'));
+        $this->assertSame([1, 2], $seen);
+    }
+
+    public function testWaitNonBooleanResultInvalidatesTheClient(): void
+    {
+        $endpoint = $this->serve(static function (Socket $socket): void {
+            Frame::read($socket, new TimeoutCancellation(3));
+            $socket->write(self::helloReply());
+            if (null !== Frame::read($socket, new TimeoutCancellation(3))) {
+                $socket->write((new Frame(['v' => Frame::VERSION, 'id' => 1, 'ok' => true, 'result' => 1]))->encode());
+            }
+        });
+        $client = Client::connect($endpoint);
+        $this->clients[] = $client;
+        try {
+            $client->wait('jobs', 0);
+            $this->fail('A non-boolean WAIT result must invalidate the client.');
+        } catch (ProtocolException $error) {
+            $this->assertSame(ErrorCode::InvalidRequest, $error->errorCode);
+            $this->assertSame('WAIT result must be a boolean.', $error->getMessage());
+        }
+        try {
+            $client->wait('jobs', 0);
+            $this->fail('An invalidated client must reject further calls.');
+        } catch (TransportException $error) {
+            $this->assertStringContainsString('Client is closed', $error->getMessage());
+        }
     }
 
     /**

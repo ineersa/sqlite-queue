@@ -113,6 +113,23 @@ final class Queue
         $this->settle($receipt, $ownerId, $cancellation);
     }
 
+    /**
+     * Earliest effective eligibility deadline for one queue, or null when the queue has no rows.
+     *
+     * Effective eligibility accounts for both availability and visibility expiry. This is a
+     * scheduling hint for wait coordination, not a claim.
+     */
+    public function earliestEligibility(QueueName $queue, ?Cancellation $cancellation = null): ?int
+    {
+        $cancellation ??= new NullCancellation();
+
+        return $this->storage->exclusive(function () use ($queue, $cancellation): ?int {
+            $this->assertActive($cancellation);
+
+            return $this->storage->earliestEligibility($queue->value);
+        });
+    }
+
     private function settle(string $receipt, string $ownerId, ?Cancellation $cancellation): void
     {
         if (1 !== preg_match('/\A([1-9][0-9]*):([a-f0-9]{64})\z/D', $receipt, $parts)) {
