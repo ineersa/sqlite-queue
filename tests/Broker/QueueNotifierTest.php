@@ -358,6 +358,58 @@ final class QueueNotifierTest extends DriverTestCase
         $this->assertNull($this->watch($notifier, 'jobs'));
     }
 
+    public function testNumericQueueWaitSurvivesCloseWithoutIntegerKeyCoercion(): void
+    {
+        $this->runAsync(function (): void {
+            $queue = $this->open();
+            $notifier = $this->notifier($queue);
+            $numeric = new QueueName('1');
+            $padded = new QueueName('01');
+            $queue->send($numeric, 'literal-one', delay: 1_000);
+            $queue->send($padded, 'zero-padded', delay: 1_000);
+            $waiting = async(static fn (): bool => $notifier->wait($numeric, 5_000, new TimeoutCancellation(5)));
+            $timerId = $this->awaitDeadlineTimer($notifier, $numeric->value, $this->now + 1_000);
+            $this->assertSame(['1'], $this->waiterNames($notifier));
+            $this->assertSame('1', $this->watch($notifier, $numeric->value)?->queue->value);
+            $this->assertNull($this->watch($notifier, $padded->value));
+            $this->assertSame(1, $this->scalar("SELECT count(*) FROM queue_messages WHERE queue = '1'"));
+            $this->assertSame(1, $this->scalar("SELECT count(*) FROM queue_messages WHERE queue = '01'"));
+            $notifier->close();
+            try {
+                $waiting->await(new TimeoutCancellation(5));
+                $this->fail('Close must cancel the numeric-queue wait.');
+            } catch (CancelledException) {
+                $this->addToAssertionCount(1);
+            }
+            $this->assertSame([], $this->waiterNames($notifier));
+            $this->assertNull($this->watch($notifier, $numeric->value));
+            $this->assertNotContains($timerId, EventLoop::getIdentifiers());
+            $this->assertSame(1, $this->scalar("SELECT count(*) FROM queue_messages WHERE queue = '1'"));
+            $this->assertSame(1, $this->scalar("SELECT count(*) FROM queue_messages WHERE queue = '01'"));
+        });
+    }
+
+    public function testCapturedDeadlineIsDisabledBeforeReturnAndRemainsManuallyFireable(): void
+    {
+        $this->runAsync(function (): void {
+            $queue = $this->open();
+            $notifier = $this->notifier($queue);
+            $name = new QueueName('jobs');
+            $queue->send($name, 'later', delay: 50);
+            $waiting = async(static fn (): bool => $notifier->wait($name, 5_000, new TimeoutCancellation(5)));
+            $timerId = $this->awaitDeadlineTimer($notifier, $name->value, $this->now + 50);
+            $this->assertFalse(EventLoop::isEnabled($timerId));
+            $this->assertSame($timerId, $this->watch($notifier, $name->value)?->timerId);
+            $this->turn();
+            $this->assertFalse($waiting->isComplete(), 'A disabled deadline must not fire on its own.');
+            $this->assertSame($timerId, $this->watch($notifier, $name->value)?->timerId);
+            $this->now += 50;
+            $this->fireTimer($timerId);
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $this->assertSame([], $this->failures);
+        });
+    }
+
     public function testImmediateSubscriptionCancellationPreservesCauseAndLeavesNoTimers(): void
     {
         $notifier = $this->notifier($this->open());
@@ -464,7 +516,10 @@ final class QueueNotifierTest extends DriverTestCase
         do {
             $watch = $this->watch($notifier, $queue);
             if (null !== $watch && !$watch->querying && !$watch->dirty && $watch->timerReadyAt === $readyAt && null !== $watch->timerId) {
-                return $watch->timerId;
+                $timerId = $watch->timerId;
+                EventLoop::disable($timerId);
+
+                return $timerId;
             }
             $this->turn();
         } while (microtime(true) < $deadline);
@@ -478,9 +533,12 @@ final class QueueNotifierTest extends DriverTestCase
         do {
             /** @var array<string, list<QueueNotifierWaiter>> $waiters */
             $waiters = (new \ReflectionProperty(QueueNotifier::class, 'waiters'))->getValue($notifier);
-            foreach ($waiters[$queue] ?? [] as $waiter) {
+            foreach ($waiters[$this->watchKey($queue)] ?? [] as $waiter) {
                 if (null !== $waiter->timeoutId) {
-                    return $waiter->timeoutId;
+                    $timeoutId = $waiter->timeoutId;
+                    EventLoop::disable($timeoutId);
+
+                    return $timeoutId;
                 }
             }
             $this->turn();
@@ -494,7 +552,7 @@ final class QueueNotifierTest extends DriverTestCase
         /** @var array<string, QueueNotifierWatch> $watches */
         $watches = (new \ReflectionProperty(QueueNotifier::class, 'watches'))->getValue($notifier);
 
-        return $watches[$queue] ?? null;
+        return $watches[$this->watchKey($queue)] ?? null;
     }
 
     /**
@@ -505,7 +563,15 @@ final class QueueNotifierTest extends DriverTestCase
         /** @var array<string, list<QueueNotifierWaiter>> $waiters */
         $waiters = (new \ReflectionProperty(QueueNotifier::class, 'waiters'))->getValue($notifier);
 
-        return array_keys($waiters);
+        return array_map(
+            static fn (string $key): string => str_starts_with($key, 'queue:') ? substr($key, \strlen('queue:')) : $key,
+            array_keys($waiters),
+        );
+    }
+
+    private function watchKey(string $queue): string
+    {
+        return 'queue:'.$queue;
     }
 
     private function fireTimer(string $timerId): void

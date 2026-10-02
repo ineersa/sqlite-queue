@@ -1,6 +1,6 @@
 # Task 05: consumer notifications and delayed-message wakeups
 
-Status: IMPLEMENTED, QA passed; submitted for PR review
+Status: IMPLEMENTED; PR #6 open for review
 Repository: `/home/ineersa/projects/sqlite-queue`
 Branch: `task-05-delayed-wakeups`
 Dependencies: [Task 04](TASK-04-BROKER-AND-CLIENT.md)
@@ -87,6 +87,10 @@ Proof shape in this branch:
 
 Document waiting and deadline behavior in `docs/broker.md`, `docs/broker-protocol.md`, `docs/queue-engine.md`, and `docs/contracts.md`. Hand Task 06 the actual client wait/cancellation API and worker-idle integration obligation. Do not claim Messenger implementation.
 
-`vendor/bin/castor cs:fix` and `vendor/bin/castor qa` pass on PHP 8.5.10. The reviewer found no blocking logic defect and requested fresh QA after the notifier edits. That gate now passes. Shutdown-specific diagnostics, closed-notifier handling, and the optional exchange-timeout documentation were also addressed. The reviewer has not rerun or re-reviewed the final delta; final PR review remains with the user.
+PR #6 review follow-ups:
+
+- Notifier maps use prefixed string keys. Watches retain the original `QueueName` for storage queries. Regressions cover an active WAIT on `"1"` followed by notifier close and broker shutdown, with `"01"` remaining a distinct queue.
+- Controlled-clock helpers disable captured timers before returning their IDs, including before the subprocess control reply. Assertions verify disabled state and explicit firing. Production timer scheduling and real CLI timer tests are unchanged.
+- `vendor/bin/castor cs:fix` and `vendor/bin/castor qa` pass after these fixes: 282 tests, 1,763 assertions on PHP 8.5.10. These are local Castor results, not attached GitHub CI checks. PR review remains open.
 
 The Task 04 SIGSTOP-worker shutdown caveat remains intact and outside this task's release claims.

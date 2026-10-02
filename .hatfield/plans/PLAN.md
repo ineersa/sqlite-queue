@@ -24,7 +24,7 @@ Task 03 is complete. The [queue engine](../../docs/queue-engine.md) implements d
 
 Task 04 is complete for the approved SIGTERM and SIGKILL lifecycle scope. PR #4 merged at `70bc6cf`. The user excluded shutdown with a deliberately SIGSTOPped worker from release requirements; removing that scenario does not fix its historical intermittent hang. The [responsibility refactor](TASK-04-RESPONSIBILITY-REFACTOR.md) separates queue policy, SQLite storage, broker session lifetime, and lifetime locks. The [protocol reference](../../docs/broker-protocol.md) defines limits and recovery.
 
-Task 05 is implemented on `task-05-delayed-wakeups`: bounded WAIT, `QueueNotifier` deadline scheduling, and restart/cancellation proof. Documentation now matches the wait API. Final Castor QA and PR remain open. Broker performance acceptance remains Task 08 work. The SIGSTOP-worker shutdown caveat from Task 04 still stands.
+Task 05 is implemented on `task-05-delayed-wakeups` as PR #6: bounded WAIT, `QueueNotifier` deadline scheduling, and restart/cancellation proof. Numeric queue keys and captured-timer races are fixed. Local Castor QA passes with 282 tests and 1,763 assertions. PR review remains open. Broker performance acceptance remains Task 08 work. The SIGSTOP-worker shutdown caveat from Task 04 still stands.
 
 ### Implementation task index
 
@@ -36,7 +36,7 @@ Read this plan before the assigned task. The task files divide the work; they do
 | [02: benchmark baseline](TASK-02-BENCHMARK-BASELINE.md) | Done. Package-local runner and recorded standard Messenger SQLite baseline, including failures | 01 |
 | [03: async SQLite queue](TASK-03-ASYNC-SQLITE-QUEUE.md) | Done. Durable engine, atomic claims, receipts, persisted delayed availability | 01 |
 | [04: broker and client](TASK-04-BROKER-AND-CLIENT.md) | Done for the approved SIGTERM/SIGKILL scope. Bounded sockets and foreground service | 03 |
-| [05: delayed wakeups](TASK-05-DELAYED-WAKEUPS.md) | Implemented. Bounded WAIT, deadline scheduling, restart and cancellation. Pending final QA/PR | 04 |
+| [05: delayed wakeups](TASK-05-DELAYED-WAKEUPS.md) | Implemented. Bounded WAIT, deadline scheduling, restart and cancellation. PR #6 under review | 04 |
 | [06: Messenger adapter](TASK-06-MESSENGER-ADAPTER.md) | Real worker integration, serializers, DelayStamp, retry/idle mapping | 05 |
 | [07: failure and lifecycle proof](TASK-07-FAILURE-AND-LIFECYCLE-PROOF.md) | Remaining cross-component fault cases and independent safety review | 06 |
 | [08: benchmark and MVP acceptance](TASK-08-BENCHMARK-AND-MVP-ACCEPTANCE.md) | Actual A/B comparison, documentation, package acceptance | 02 and 07 |

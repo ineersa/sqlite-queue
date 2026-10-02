@@ -98,7 +98,7 @@ function waiterCount(Broker $broker): int
 }
 
 /**
- * @return array{timer_id: ?string, ready_at: int}
+ * @return array{timer_id: ?string, ready_at: int, enabled: bool}
  */
 function deadline(Broker $broker, int $readyAt): array
 {
@@ -106,11 +106,15 @@ function deadline(Broker $broker, int $readyAt): array
     $watches = (new ReflectionProperty(QueueNotifier::class, 'watches'))->getValue($notifier);
     foreach ($watches as $watch) {
         if (!$watch->querying && !$watch->dirty && $watch->timerReadyAt === $readyAt && null !== $watch->timerId) {
-            return ['timer_id' => $watch->timerId, 'ready_at' => $readyAt];
+            $timerId = $watch->timerId;
+            // Freeze before the reply leaves this process so real elapsed time cannot replace the ID.
+            EventLoop::disable($timerId);
+
+            return ['timer_id' => $timerId, 'ready_at' => $readyAt, 'enabled' => EventLoop::isEnabled($timerId)];
         }
     }
 
-    return ['timer_id' => null, 'ready_at' => $readyAt];
+    return ['timer_id' => null, 'ready_at' => $readyAt, 'enabled' => false];
 }
 
 /**

@@ -680,6 +680,8 @@ final class BrokerProcessTest extends TestCase
         do {
             $reply = $this->controlCommand($control, ['op' => 'deadline', 'ready_at' => $readyAt]);
             if (\is_string($reply['timer_id'] ?? null)) {
+                $this->assertFalse($reply['enabled'], 'The fixture must freeze the deadline before replying across IPC.');
+
                 return $reply['timer_id'];
             }
             usleep(5_000);

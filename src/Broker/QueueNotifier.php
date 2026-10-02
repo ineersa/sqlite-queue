@@ -27,9 +27,14 @@ use Revolt\EventLoop;
  * When the last waiter for a queue detaches, the deadline timer is cancelled immediately even if a
  * readiness query is still in flight. Watch identity discards that stale result so it cannot
  * re-arm timers for an idle queue.
+ *
+ * Internal waiter and watch maps use a `queue:` prefix so numeric queue names stay strings under
+ * PHP array-key coercion. Storage queries always use the original {@see QueueName}.
  */
 final class QueueNotifier
 {
+    private const string WATCH_KEY_PREFIX = 'queue:';
+
     /** @var array<string, list<QueueNotifierWaiter>> */
     private array $waiters = [];
 
@@ -65,15 +70,15 @@ final class QueueNotifier
         }
         $cancellation->throwIfRequested();
 
-        $name = $queue->value;
+        $key = self::watchKey($queue);
         $deferred = new DeferredFuture();
         $future = $deferred->getFuture();
         $waiter = new QueueNotifierWaiter($deferred, $timeoutMilliseconds);
-        $this->waiters[$name][] = $waiter;
+        $this->waiters[$key][] = $waiter;
         try {
             $waiter->cancellationId = $cancellation->subscribe(
-                function (CancelledException $error) use ($name, $waiter): void {
-                    $this->failWaiter($name, $waiter, $error);
+                function (CancelledException $error) use ($key, $waiter): void {
+                    $this->failWaiter($key, $waiter, $error);
                 },
             );
             if ($waiter->settled) {
@@ -82,23 +87,23 @@ final class QueueNotifier
             if ($timeoutMilliseconds > 0) {
                 // Bound the wait by event-loop duration, not by comparing the controlled wall clock.
                 // A forward clock jump must not expire a still-running wait early.
-                $waiter->timeoutId = EventLoop::delay($timeoutMilliseconds / 1000, function () use ($name, $waiter): void {
+                $waiter->timeoutId = EventLoop::delay($timeoutMilliseconds / 1000, function () use ($key, $waiter): void {
                     try {
                         if ($waiter->settled || $this->closed) {
                             return;
                         }
                         $waiter->timeoutId = null;
-                        $this->completeWaiter($name, $waiter, false);
+                        $this->completeWaiter($key, $waiter, false);
                     } catch (\Throwable $error) {
-                        $this->failQueue($name, $error);
+                        $this->failQueue($key, $error);
                     }
                 });
             }
 
-            $this->watches[$name] ??= new QueueNotifierWatch();
+            $this->watches[$key] ??= new QueueNotifierWatch($queue);
             // Register first, then recheck on a queued callback. notify() may dirty the watch
             // before that callback runs, forcing another pass.
-            $this->scheduleRefresh($name);
+            $this->scheduleRefresh($key);
 
             return $future->await();
         } finally {
@@ -106,7 +111,7 @@ final class QueueNotifier
                 $cancellation->unsubscribe($waiter->cancellationId);
                 $waiter->cancellationId = null;
             }
-            $this->detachWaiter($name, $waiter);
+            $this->detachWaiter($key, $waiter);
         }
     }
 
@@ -116,12 +121,12 @@ final class QueueNotifier
         if ($this->closed) {
             return;
         }
-        $name = $queue->value;
-        if (!isset($this->waiters[$name]) && !isset($this->watches[$name])) {
+        $key = self::watchKey($queue);
+        if (!isset($this->waiters[$key]) && !isset($this->watches[$key])) {
             return;
         }
-        $this->watches[$name] ??= new QueueNotifierWatch();
-        $this->scheduleRefresh($name);
+        $this->watches[$key] ??= new QueueNotifierWatch($queue);
+        $this->scheduleRefresh($key);
     }
 
     public function close(): void
@@ -130,21 +135,27 @@ final class QueueNotifier
             return;
         }
         $this->closed = true;
-        foreach (array_keys($this->watches) as $name) {
-            $this->clearDeadline($name);
+        foreach (array_keys($this->watches) as $key) {
+            $this->clearDeadline($key);
         }
-        foreach ($this->waiters as $name => $waiters) {
+        foreach ($this->waiters as $key => $waiters) {
             foreach ($waiters as $waiter) {
-                $this->failWaiter($name, $waiter, new CancelledException());
+                $this->failWaiter($key, $waiter, new CancelledException());
             }
         }
         $this->waiters = [];
         $this->watches = [];
     }
 
-    private function scheduleRefresh(string $name): void
+    /** Stable string map key that keeps numeric queue names from becoming integer array keys. */
+    private static function watchKey(QueueName $queue): string
     {
-        $watch = $this->watches[$name] ?? null;
+        return self::WATCH_KEY_PREFIX.$queue->value;
+    }
+
+    private function scheduleRefresh(string $key): void
+    {
+        $watch = $this->watches[$key] ?? null;
         if (null === $watch || $this->closed) {
             return;
         }
@@ -153,38 +164,38 @@ final class QueueNotifier
             return;
         }
         $watch->querying = true;
-        EventLoop::queue(function () use ($name, $watch): void {
+        EventLoop::queue(function () use ($key, $watch): void {
             try {
-                $this->runRefresh($name, $watch);
+                $this->runRefresh($key, $watch);
             } catch (\Throwable $error) {
-                $this->failQueue($name, $error);
+                $this->failQueue($key, $error);
             }
         });
     }
 
-    private function runRefresh(string $name, QueueNotifierWatch $watch): void
+    private function runRefresh(string $key, QueueNotifierWatch $watch): void
     {
         if ($this->closed) {
             return;
         }
-        if (($this->watches[$name] ?? null) !== $watch) {
+        if (($this->watches[$key] ?? null) !== $watch) {
             return;
         }
         $watch->dirty = false;
         try {
-            $readyAt = $this->queue->earliestEligibility(new QueueName($name));
+            $readyAt = $this->queue->earliestEligibility($watch->queue);
         } catch (\Throwable $error) {
-            $this->failQueue($name, $error);
+            $this->failQueue($key, $error);
 
             return;
         }
-        $this->applyReadiness($name, $watch, $readyAt);
+        $this->applyReadiness($key, $watch, $readyAt);
     }
 
     /** A null deadline means the query found no messages in this queue. */
-    private function applyReadiness(string $name, QueueNotifierWatch $watch, ?int $readyAt): void
+    private function applyReadiness(string $key, QueueNotifierWatch $watch, ?int $readyAt): void
     {
-        if (($this->watches[$name] ?? null) !== $watch) {
+        if (($this->watches[$key] ?? null) !== $watch) {
             // The watch may have changed in another fiber while the query was suspended.
             return;
         }
@@ -192,66 +203,66 @@ final class QueueNotifier
         if ($watch->dirty) {
             // Mutation arrived while the query was suspended; discard and re-query so a stale
             // later deadline cannot overwrite earlier readiness.
-            $this->scheduleRefresh($name);
+            $this->scheduleRefresh($key);
 
             return;
         }
         $now = $this->now();
         if (null !== $readyAt && $readyAt <= $now) {
-            $this->clearDeadline($name);
-            foreach ($this->waiters[$name] ?? [] as $waiter) {
-                $this->completeWaiter($name, $waiter, true);
+            $this->clearDeadline($key);
+            foreach ($this->waiters[$key] ?? [] as $waiter) {
+                $this->completeWaiter($key, $waiter, true);
             }
-            $this->forgetIdle($name);
+            $this->forgetIdle($key);
 
             return;
         }
         // Positive waits expire only through their event-loop timers. Zero-duration probes settle
         // here once the first successful readiness sample for this generation is known.
-        foreach ($this->waiters[$name] ?? [] as $waiter) {
+        foreach ($this->waiters[$key] ?? [] as $waiter) {
             if (0 === $waiter->durationMilliseconds) {
-                $this->completeWaiter($name, $waiter, false);
+                $this->completeWaiter($key, $waiter, false);
             }
         }
-        if ([] === ($this->waiters[$name] ?? [])) {
-            $this->clearDeadline($name);
-            $this->forgetIdle($name);
+        if ([] === ($this->waiters[$key] ?? [])) {
+            $this->clearDeadline($key);
+            $this->forgetIdle($key);
 
             return;
         }
         if (null === $readyAt) {
-            $this->clearDeadline($name);
+            $this->clearDeadline($key);
 
             return;
         }
-        $this->armDeadline($name, $readyAt, $now);
+        $this->armDeadline($key, $readyAt, $now);
     }
 
-    private function armDeadline(string $name, int $readyAt, int $now): void
+    private function armDeadline(string $key, int $readyAt, int $now): void
     {
-        $watch = $this->watches[$name];
+        $watch = $this->watches[$key];
         if ($watch->timerReadyAt === $readyAt && null !== $watch->timerId) {
             return;
         }
-        $this->clearDeadline($name);
+        $this->clearDeadline($key);
         $delayMs = max(0, $readyAt - $now);
         $watch->timerReadyAt = $readyAt;
-        $watch->timerId = EventLoop::delay($delayMs / 1000, function (string $timerId) use ($name, $watch): void {
+        $watch->timerId = EventLoop::delay($delayMs / 1000, function (string $timerId) use ($key, $watch): void {
             try {
-                if (($this->watches[$name] ?? null) !== $watch || $watch->timerId !== $timerId) {
+                if (($this->watches[$key] ?? null) !== $watch || $watch->timerId !== $timerId) {
                     return;
                 }
                 $watch->timerId = null;
                 $watch->timerReadyAt = null;
                 // Due reserved rows must re-query; do not wake forever from stale availability.
-                $this->scheduleRefresh($name);
+                $this->scheduleRefresh($key);
             } catch (\Throwable $error) {
-                $this->failQueue($name, $error);
+                $this->failQueue($key, $error);
             }
         });
     }
 
-    private function completeWaiter(string $name, QueueNotifierWaiter $waiter, bool $ready): void
+    private function completeWaiter(string $key, QueueNotifierWaiter $waiter, bool $ready): void
     {
         if ($waiter->settled) {
             return;
@@ -259,10 +270,10 @@ final class QueueNotifier
         $waiter->settled = true;
         $this->cancelTimeout($waiter);
         $waiter->deferred->complete($ready);
-        $this->detachWaiter($name, $waiter);
+        $this->detachWaiter($key, $waiter);
     }
 
-    private function failWaiter(string $name, QueueNotifierWaiter $waiter, \Throwable $error): void
+    private function failWaiter(string $key, QueueNotifierWaiter $waiter, \Throwable $error): void
     {
         if ($waiter->settled) {
             return;
@@ -272,28 +283,28 @@ final class QueueNotifier
         $future = $waiter->deferred->getFuture();
         $future->ignore();
         $waiter->deferred->error($error);
-        $this->detachWaiter($name, $waiter);
+        $this->detachWaiter($key, $waiter);
     }
 
-    private function detachWaiter(string $name, QueueNotifierWaiter $waiter): void
+    private function detachWaiter(string $key, QueueNotifierWaiter $waiter): void
     {
-        if (!isset($this->waiters[$name])) {
+        if (!isset($this->waiters[$key])) {
             return;
         }
         $this->cancelTimeout($waiter);
-        $this->waiters[$name] = array_values(array_filter(
-            $this->waiters[$name],
+        $this->waiters[$key] = array_values(array_filter(
+            $this->waiters[$key],
             static fn (QueueNotifierWaiter $candidate): bool => $candidate !== $waiter,
         ));
-        if ([] === $this->waiters[$name]) {
-            unset($this->waiters[$name]);
+        if ([] === $this->waiters[$key]) {
+            unset($this->waiters[$key]);
             if (!$this->closed) {
                 // Cancel the deadline immediately, even while a readiness query is still running.
                 // Dropping this identity prevents stale results from mutating a replacement watch.
-                $watch = $this->watches[$name] ?? null;
+                $watch = $this->watches[$key] ?? null;
                 if (null !== $watch) {
-                    $this->clearDeadline($name);
-                    unset($this->watches[$name]);
+                    $this->clearDeadline($key);
+                    unset($this->watches[$key]);
                 }
             }
         }
@@ -307,9 +318,9 @@ final class QueueNotifier
         }
     }
 
-    private function clearDeadline(string $name): void
+    private function clearDeadline(string $key): void
     {
-        $watch = $this->watches[$name] ?? null;
+        $watch = $this->watches[$key] ?? null;
         if (null === $watch) {
             return;
         }
@@ -320,33 +331,33 @@ final class QueueNotifier
         $watch->timerReadyAt = null;
     }
 
-    private function forgetIdle(string $name): void
+    private function forgetIdle(string $key): void
     {
-        if ([] !== ($this->waiters[$name] ?? [])) {
+        if ([] !== ($this->waiters[$key] ?? [])) {
             return;
         }
-        $watch = $this->watches[$name] ?? null;
+        $watch = $this->watches[$key] ?? null;
         if (null === $watch || $watch->querying || $watch->dirty) {
             return;
         }
-        $this->clearDeadline($name);
-        unset($this->watches[$name]);
+        $this->clearDeadline($key);
+        unset($this->watches[$key]);
     }
 
-    private function failQueue(string $name, \Throwable $error): void
+    private function failQueue(string $key, \Throwable $error): void
     {
         if ($this->closed) {
             return;
         }
-        $watch = $this->watches[$name] ?? null;
+        $watch = $this->watches[$key] ?? null;
         if (null !== $watch) {
             $watch->querying = false;
             $watch->dirty = false;
-            $this->clearDeadline($name);
-            unset($this->watches[$name]);
+            $this->clearDeadline($key);
+            unset($this->watches[$key]);
         }
-        foreach ($this->waiters[$name] ?? [] as $waiter) {
-            $this->failWaiter($name, $waiter, $error);
+        foreach ($this->waiters[$key] ?? [] as $waiter) {
+            $this->failWaiter($key, $waiter, $error);
         }
         ($this->onFailure)($error);
     }

@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Broker;
 
+use Ineersa\SqliteQueue\ValueObject\QueueName;
+
 /**
  * Derived readiness state for one watched queue.
  *
@@ -19,4 +21,8 @@ final class QueueNotifierWatch
     public bool $dirty = false;
     public ?string $timerId = null;
     public ?int $timerReadyAt = null;
+
+    public function __construct(public readonly QueueName $queue)
+    {
+    }
 }

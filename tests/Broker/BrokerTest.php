@@ -505,6 +505,38 @@ final class BrokerTest extends TestCase
         });
     }
 
+    public function testNumericQueueWaitShutdownLeavesLiteralQueueIdentity(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker(clock: fn (): int => $this->now);
+            $client = $this->connectClient();
+            $id = $client->send('1', 'numeric-queue', delay: 1_000);
+            $waiting = async(static fn (): bool => $client->wait('1', 5_000));
+            $this->awaitNotifierWaiters(1);
+            $timerId = $this->awaitNotifierDeadline($this->now + 1_000);
+            $this->assertFalse(EventLoop::isEnabled($timerId));
+            $this->broker->stop();
+            try {
+                $waiting->await(new TimeoutCancellation(5));
+                $this->fail('Shutdown must invalidate a numeric-queue WAIT.');
+            } catch (TransportException) {
+                $this->addToAssertionCount(1);
+            }
+            $this->awaitNotifierWaiters(0);
+            $this->assertSame(0, $this->brokerFuture->await(new TimeoutCancellation(10)));
+            $this->brokerFuture = null;
+            $this->broker = null;
+            $database = new \SQLite3($this->database->path());
+            try {
+                $queue = $database->querySingle('SELECT queue FROM queue_messages WHERE id = '.(int) $id);
+                $this->assertSame('1', $queue);
+                $this->assertSame(0, $database->querySingle("SELECT count(*) FROM queue_messages WHERE queue = '01'"));
+            } finally {
+                $database->close();
+            }
+        });
+    }
+
     public static function malformedTraffic(): iterable
     {
         yield 'version 2 request' => ['version 2 request', 'unsupported_protocol_version'];
@@ -977,7 +1009,10 @@ final class BrokerTest extends TestCase
             $watches = (new \ReflectionProperty(QueueNotifier::class, 'watches'))->getValue($notifier);
             foreach ($watches as $watch) {
                 if (!$watch->querying && !$watch->dirty && $watch->timerReadyAt === $readyAt && null !== $watch->timerId) {
-                    return $watch->timerId;
+                    $timerId = $watch->timerId;
+                    EventLoop::disable($timerId);
+
+                    return $timerId;
                 }
             }
             $this->turn();
@@ -995,7 +1030,10 @@ final class BrokerTest extends TestCase
             foreach ($waiters as $list) {
                 foreach ($list as $waiter) {
                     if (null !== $waiter->timeoutId) {
-                        return $waiter->timeoutId;
+                        $timeoutId = $waiter->timeoutId;
+                        EventLoop::disable($timeoutId);
+
+                        return $timeoutId;
                     }
                 }
             }
