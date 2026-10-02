@@ -144,8 +144,8 @@ reply never proves absence of the mutation.
   interval. Overdue messages are eligible immediately; future messages keep their original
   deadline.
 - A wakeup is a hint to try receiving, not a reservation. Waiter registration has no race with
-  an empty receive, and notification, not polling, is the normal path. Task 05 implements the
-  wakeup lanes.
+  an empty receive, and notification, not polling, is the normal path. Task 05 implements those
+  wakeup lanes through `Client::wait()` and the protocol WAIT operation.
 - Delayed work never blocks a ready message or another queue.
 
 ## Protocol
@@ -157,9 +157,9 @@ reply never proves absence of the mutation.
   binary-safe, including empty bodies and arbitrary bytes.
 - One outstanding request per connection. The request carries a request identifier, and the
   reply carries the same identifier with either a result or an explicit error.
-- The operations are send with queue, body, headers, and delay; receive with a bounded wait;
-  acknowledge with a receipt; and reject with a receipt. Administrative endpoints are
-  deferred and out of scope.
+- The operations are send with queue, body, headers, and delay; immediate receive with queue;
+  acknowledge with a receipt; reject with a receipt; and bounded wait with queue and
+  `wait_ms`. Administrative endpoints are deferred and out of scope.
 - Frame size, connection count, pending requests, and output buffers are bounded. Concrete
   limits are Task 04 work, chosen from payload requirements and tests. Limits fail explicitly
   and never truncate a message silently.
@@ -172,8 +172,7 @@ reply never proves absence of the mutation.
 - Readiness follows successful ownership, schema initialization, database connection, and
   socket readiness, not process creation.
 
-Task 04 implements the immediate-operation subset. The [v1 protocol reference](broker-protocol.md)
-defines exact framing, limits, and error codes. Bounded notification waiting remains Task 05 work.
+The [v1 protocol reference](broker-protocol.md) defines framing, limits, WAIT, and error codes.
 Receipt errors distinguish malformed input, no active reservation, owner mismatch, epoch mismatch,
 token mismatch, and expiry. They leave the client session usable. The protocol reference defines
 their wire codes and deterministic precedence when several reservation predicates fail.

@@ -15,6 +15,7 @@ use Ineersa\SqliteQueue\Exception\TransportException;
 use Ineersa\SqliteQueue\Protocol\ControlField;
 use Ineersa\SqliteQueue\Protocol\ErrorCode;
 use Ineersa\SqliteQueue\Protocol\Frame;
+use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Protocol\Operation;
 use Ineersa\SqliteQueue\Protocol\ProtocolException;
 
@@ -133,6 +134,40 @@ final class Client
         $this->settle(Operation::Reject, $receipt, $cancellation);
     }
 
+    /**
+     * Bounded readiness hint. True means try receive; it never grants a reservation.
+     * False means the wait elapsed without a readiness hint.
+     *
+     * Bounds are validated locally before any bytes are written, so an out-of-range
+     * timeout does not consume a request id. The exchange deadline is the requested
+     * wait duration plus the client's normal transport allowance.
+     */
+    public function wait(string $queue, int $timeoutMilliseconds, ?Cancellation $cancellation = null): bool
+    {
+        if ($timeoutMilliseconds < 0 || $timeoutMilliseconds > Limits::MAX_WAIT_MILLISECONDS) {
+            throw new \InvalidArgumentException(\sprintf('Wait timeout must be between 0 and %d milliseconds.', Limits::MAX_WAIT_MILLISECONDS));
+        }
+
+        return $this->exchange(
+            Operation::Wait,
+            static function (Frame $reply): bool {
+                $result = $reply->control[ControlField::Result->value];
+                if (!\is_bool($result)) {
+                    throw new ProtocolException(ErrorCode::InvalidRequest, 'WAIT result must be a boolean.');
+                }
+                self::assertNoPayload($reply, 'WAIT');
+
+                return $result;
+            },
+            [
+                ControlField::Queue->value => $queue,
+                ControlField::WaitMilliseconds->value => $timeoutMilliseconds,
+            ],
+            cancellation: $cancellation,
+            timeout: $this->timeout + ($timeoutMilliseconds / 1000),
+        );
+    }
+
     public function close(): void
     {
         $this->closed = true;
@@ -164,10 +199,11 @@ final class Client
      *
      * @param \Closure(Frame): T   $decode
      * @param array<string, mixed> $params
+     * @param float|null           $timeout null uses the normal transport bound; WAIT adds its requested duration
      *
      * @return T
      */
-    private function exchange(Operation $operation, \Closure $decode, array $params = [], string $body = '', string $headers = '', ?Cancellation $cancellation = null): mixed
+    private function exchange(Operation $operation, \Closure $decode, array $params = [], string $body = '', string $headers = '', ?Cancellation $cancellation = null, ?float $timeout = null): mixed
     {
         if ($this->closed) {
             throw new TransportException('Client is closed; create a new connection explicitly.');
@@ -189,7 +225,7 @@ final class Client
             throw new ProtocolException(ErrorCode::InvalidRequest, 'Request control is not valid UTF-8 JSON.');
         }
         ++$this->nextId;
-        $deadline = new TimeoutCancellation($this->timeout);
+        $deadline = new TimeoutCancellation($timeout ?? $this->timeout);
         $cancellation = null === $cancellation ? $deadline : new CompositeCancellation($deadline, $cancellation);
         $this->busy = true;
         $reply = null;

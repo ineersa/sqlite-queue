@@ -82,7 +82,8 @@ final class BrokerFactory
             $storage = new SqliteQueueStorage($connection);
             array_pop($release);
             $release[] = $storage->close(...);
-            $queue = new Queue($storage, $this->visibilityTimeout, $this->clock);
+            $clock = $this->clock ?? static fn (): int => (int) floor(microtime(true) * 1000);
+            $queue = new Queue($storage, $this->visibilityTimeout, $clock);
             $mask = umask(0077);
             try {
                 $server = listen('unix://'.$locks->endpoint);
@@ -102,7 +103,7 @@ final class BrokerFactory
                 throw new \RuntimeException('Cannot make socket private.', 0, $error);
             }
 
-            return new Broker($server, $queue, $storage, $worker, $locks, $socketIdentity);
+            return new Broker($server, $queue, $storage, $worker, $locks, $socketIdentity, $clock);
         } catch (\Throwable $error) {
             // Kill any spawned child before graceful releases: connect() may fail after the
             // connector starts the worker but before the handle is assigned, and a stuck

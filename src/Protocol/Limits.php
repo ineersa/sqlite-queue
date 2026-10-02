@@ -34,6 +34,9 @@ final class Limits
     /** Maximum nesting accepted when decoding JSON control. */
     public const int JSON_DEPTH = 32;
 
+    /** Maximum WAIT bound in milliseconds. Zero is an immediate readiness probe. */
+    public const int MAX_WAIT_MILLISECONDS = 30_000;
+
     private function __construct()
     {
     }

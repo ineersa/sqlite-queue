@@ -1,7 +1,8 @@
 # Task 05: consumer notifications and delayed-message wakeups
 
-Status: TODO
+Status: IMPLEMENTED, QA passed; submitted for PR review
 Repository: `/home/ineersa/projects/sqlite-queue`
+Branch: `task-05-delayed-wakeups`
 Dependencies: [Task 04](TASK-04-BROKER-AND-CLIENT.md)
 Read first: [PLAN.md](PLAN.md), sections 5.5, 7, and 10.
 
@@ -27,18 +28,65 @@ Do not imitate notifications with an unbounded high-frequency database polling l
 
 ## Acceptance criteria
 
-- [ ] An idle consumer wakes for a committed immediate message without another client action.
-- [ ] Waiter registration cannot miss work published between empty receive and waiting.
-- [ ] A delayed message cannot be received early and wakes an idle consumer when due, without another publication.
-- [ ] Positive subsecond deadlines are preserved; inserting an earlier deadline updates scheduling.
-- [ ] Restart before a deadline preserves it; restart after it exposes overdue work without restarting the delay.
-- [ ] Multiple consumers still reserve exclusively; notification never substitutes for a committed claim.
-- [ ] Ready work in another queue is not blocked by a future or reserved message.
-- [ ] Cancellation, disconnect, timeout, and shutdown leave no orphan waiters/timers or persistence children.
-- [ ] Idle operation yields without a busy loop and does not require a second supervisor/service.
+- [x] An idle consumer wakes for a committed immediate message without another client action.
+- [x] Waiter registration cannot miss work published between empty receive and waiting.
+- [x] A delayed message cannot be received early and wakes an idle consumer when due, without another publication.
+- [x] Positive subsecond deadlines are preserved; inserting an earlier deadline updates scheduling.
+- [x] Restart before a deadline preserves it; restart after it exposes overdue work without restarting the delay.
+- [x] Multiple consumers still reserve exclusively; notification never substitutes for a committed claim.
+- [x] Ready work in another queue is not blocked by a future or reserved message.
+- [x] Cancellation, disconnect, timeout, and shutdown leave no orphan waiters/timers or persistence children.
+- [x] Idle operation yields without a busy loop and does not require a second supervisor/service.
+
+## Implementation notes
+
+Public wait API:
+
+- `Client::wait(string $queue, int $timeoutMilliseconds, ?Cancellation $cancellation = null): bool`
+- Bounds `0..30_000`. Zero is an immediate readiness probe.
+- `true` is only a receive hint. `false` is a normal timeout or empty probe.
+- No reservation. One outstanding exchange.
+- Invalid local bounds raise before any write and preserve the request sequence.
+- The exchange deadline adds the client's transport allowance to the requested wait.
+- Cancellation during WAIT invalidates the connection with no replay.
+
+Protocol:
+
+- Operation `wait` with `queue` and `wait_ms`.
+- Payload-free request and boolean result.
+- WAIT-specific validation. Pipelined bytes are rejected.
+- Dedicated socket monitor is cancelled and awaited before the reply.
+- Normal timeout leaves the session reusable.
+- Immediate `receive` stays immediate. `receive` plus `wait_ms` remains invalid.
+
+Scheduling:
+
+- Earliest effective eligibility is `max(available_at, coalesce(reserved_until, available_at))`, indexed by `queue_messages_ready`.
+- Per-watched-queue timers. Lazy rebuild after restart or first watch.
+- Visibility deadlines and dirty rechecks against committed changes.
+- Post-commit hints after send and claim. No body mirror and no DB polling loop.
+- Watch identity is object identity. Stale in-flight queries cannot re-arm a replaced or idle watch.
+- Timeout, cancellation, disconnect, and shutdown clear waiters and timers.
+
+Clock assumptions:
+
+- Persisted availability and visibility use wall-clock milliseconds.
+- WAIT bounds and deadline delays use Revolt duration timers.
+- Normal forward wall-clock progression is assumed when converting a deadline to a duration.
+- A backward jump can postpone eligibility and force rearming.
+- A forward jump can make work eligible on recheck, but an already armed monotonic timer is not moved earlier, so a wake hint may be late until another recheck, mutation, or WAIT.
+- No realtime or latency guarantee. No separate scheduler service.
 
 ## Validation and handoff
 
-Use controlled clocks and deterministic publication/registration barriers for scheduling correctness. Add bounded real-process evidence for delayed restart, idle delivery, and wait cancellation using actual protocol endpoints. No arbitrary sleeps to manufacture races or production test-only APIs.
+Proof shape in this branch:
 
-Document waiting and deadline behavior, including wall-clock assumptions and limits. Hand Task 06 the actual client wait/cancellation API and its proof.
+- Real `bin/sqlite-queue` process tests cover idle publication wakeups and a real 200 ms delayed timer without another publication.
+- The controlled-clock subprocess fixture `tests/Broker/Fixtures/broker-controlled-clock-probe.php` drives a real `Broker`/`Client`/socket protocol for exact before/after restart, deadline preservation, registered-wait cancellation/disconnect, and shutdown with a pending WAIT. Fixture clock injection is not a CLI option.
+- In-process barriers in `QueueNotifierTest` and `BrokerTest` prove stale query replacement, missed-registration protection, earlier-deadline reschedule, visibility scheduling, exclusive claims after wake, zero-duration reuse, and pipelined-byte rejection.
+
+Document waiting and deadline behavior in `docs/broker.md`, `docs/broker-protocol.md`, `docs/queue-engine.md`, and `docs/contracts.md`. Hand Task 06 the actual client wait/cancellation API and worker-idle integration obligation. Do not claim Messenger implementation.
+
+`vendor/bin/castor cs:fix` and `vendor/bin/castor qa` pass on PHP 8.5.10. The reviewer found no blocking logic defect and requested fresh QA after the notifier edits. That gate now passes. Shutdown-specific diagnostics, closed-notifier handling, and the optional exchange-timeout documentation were also addressed. The reviewer has not rerun or re-reviewed the final delta; final PR review remains with the user.
+
+The Task 04 SIGSTOP-worker shutdown caveat remains intact and outside this task's release claims.

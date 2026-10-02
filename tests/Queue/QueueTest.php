@@ -675,6 +675,42 @@ final class QueueTest extends DriverTestCase
         }
     }
 
+    public function testEarliestEligibilityUsesReadyIndexAndAccountsForVisibility(): void
+    {
+        $queue = $this->open(50);
+        $jobs = $this->queueName('jobs');
+        $other = $this->queueName('other');
+        $queue->send($jobs, 'future', delay: 100);
+        $queue->send($other, 'ready-elsewhere');
+        $this->assertSame($this->now + 100, $queue->earliestEligibility($jobs));
+        $this->assertSame($this->now, $queue->earliestEligibility($other));
+        $this->assertNull($queue->earliestEligibility($this->queueName('empty')));
+
+        $queue->send($jobs, 'claim-me');
+        $delivery = $queue->receive($jobs, $this->owner());
+        $this->assertNotNull($delivery);
+        $this->assertSame($delivery->reservedUntil, $queue->earliestEligibility($jobs));
+
+        $database = new \SQLite3($this->database->path());
+        try {
+            $result = $database->query(
+                "EXPLAIN QUERY PLAN SELECT max(available_at, coalesce(reserved_until, available_at)) AS ready_at
+                 FROM queue_messages WHERE queue = 'jobs' ORDER BY ready_at LIMIT 1",
+            );
+            $details = [];
+            while (false !== ($row = $result->fetchArray(\SQLITE3_ASSOC))) {
+                $details[] = $row['detail'];
+            }
+            $result->finalize();
+            $plan = implode('; ', $details);
+            $this->assertStringContainsString('queue_messages_ready', $plan);
+            $this->assertStringNotContainsString('TEMP B-TREE', $plan);
+            $this->assertStringNotContainsString('SCAN queue_messages', $plan);
+        } finally {
+            $database->close();
+        }
+    }
+
     public function testReceiveSamplesVisibilityAfterTransactionAcquisition(): void
     {
         $entered = new DeferredFuture();
