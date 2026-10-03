@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Tests\Messenger;
 
+use Amp\Cancellation;
 use Amp\DeferredFuture;
 use Amp\Future;
 use Amp\TimeoutCancellation;
@@ -12,6 +13,7 @@ use Ineersa\SqliteQueue\Broker\BrokerFactory;
 use Ineersa\SqliteQueue\Broker\QueueNotifier;
 use Ineersa\SqliteQueue\Client;
 use Ineersa\SqliteQueue\Command\BrokerCommand;
+use Ineersa\SqliteQueue\Messenger\BrokerConnection;
 use Ineersa\SqliteQueue\Messenger\NativeConsumeWaitSubscriber;
 use Ineersa\SqliteQueue\Messenger\Transport;
 use Ineersa\SqliteQueue\Messenger\TransportFactory;
@@ -139,7 +141,14 @@ final class NativeIntegrationTest extends TestCase
         $container = $this->kernel?->getContainer() ?? throw new \LogicException('Missing kernel.');
         $this->assertInstanceOf(TransportFactory::class, $container->get(TransportFactory::class));
         $this->assertInstanceOf(NativeConsumeWaitSubscriber::class, $container->get(NativeConsumeWaitSubscriber::class));
-        // Do not resolve messenger.transport.* here: factory connects eagerly on first use.
+        $transport = $this->transport('async');
+        $this->assertInstanceOf(Transport::class, $transport);
+        $this->assertSame(0, $app->run(new ArrayInput([
+            'command' => 'messenger:setup-transports',
+            'transport' => 'async',
+        ]), new BufferedOutput()));
+        $this->expectException(\Symfony\Component\Messenger\Exception\TransportException::class);
+        $transport->get();
     }
 
     public function testNativeConsumeLimitHandlesAndAcks(): void
@@ -464,7 +473,7 @@ final class NativeIntegrationTest extends TestCase
     {
         $this->runAsync(function (): void {
             $this->startBroker();
-            $broken = new Transport($this->connectClient(), new QueueName('jobs'), new BrokenDecodeSerializer());
+            $broken = new Transport($this->connection(), new QueueName('jobs'), new BrokenDecodeSerializer(), $this->connection());
             $broken->send(new Envelope(new NativeProbeMessage('ignored')));
 
             if (\is_callable([MessageDecodingFailedException::class, 'wrap'])) {
@@ -484,6 +493,47 @@ final class NativeIntegrationTest extends TestCase
             }
 
             $this->assertSame([], iterator_to_array($this->transport()->get()));
+        });
+    }
+
+    public function testConfiguredFailureTransportExhaustionAndNativeRetryRecovery(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker();
+            NativeProbeMessageHandler::$mode = NativeProbeMessageHandler::MODE_ALWAYS_FAIL;
+            $this->publisher()->send(new Envelope(new NativeProbeMessage('recover-failure')));
+            $consume = async(fn (): int => $this->runConsume([
+                'command' => 'messenger:consume',
+                'receivers' => ['async_failure'],
+                '--limit' => '2',
+            ]));
+            $this->awaitNotifierWaiters(1);
+            $timer = $this->awaitNotifierDeadline($this->now + 50);
+            $this->now += 50;
+            $this->fireNotifierTimer($timer);
+            $this->assertSame(0, $consume->await(new TimeoutCancellation(self::SAFETY_SECONDS)));
+            $this->assertSame(2, NativeProbeMessageHandler::$attempts);
+            $this->assertSame([], iterator_to_array($this->transport('async_failure')->get()));
+            $failed = $this->bootKernel()->getContainer()->get('messenger.transport.failed');
+            $this->assertInstanceOf(\Symfony\Component\Messenger\Bridge\Doctrine\Transport\DoctrineTransport::class, $failed);
+            $envelopes = iterator_to_array($failed->all());
+            $this->assertCount(1, $envelopes);
+            $envelope = $envelopes[0];
+            $this->assertSame('async_failure', $envelope->last(\Symfony\Component\Messenger\Stamp\SentToFailureTransportStamp::class)->getOriginalReceiverName());
+            $this->assertNotNull($envelope->last(\Symfony\Component\Messenger\Stamp\ErrorDetailsStamp::class));
+            $this->assertSame(0, $envelope->last(\Symfony\Component\Messenger\Stamp\RedeliveryStamp::class)->getRetryCount());
+            $this->assertNull($envelope->last(\Ineersa\SqliteQueue\Messenger\Stamp\DeliveryReceiptStamp::class));
+            $id = $envelope->last(\Symfony\Component\Messenger\Stamp\TransportMessageIdStamp::class)->getId();
+            NativeProbeMessageHandler::$mode = NativeProbeMessageHandler::MODE_ACK;
+            $this->assertSame(0, $this->runConsume([
+                'command' => 'messenger:failed:retry',
+                'id' => [$id],
+                '--transport' => 'failed',
+                '--force' => true,
+            ]));
+            $this->assertSame(['recover-failure'], NativeProbeMessageHandler::$handled);
+            $this->assertCount(0, iterator_to_array($failed->all()));
+            $this->assertSame([], iterator_to_array($this->transport('async_failure')->get()));
         });
     }
 
@@ -587,15 +637,17 @@ final class NativeIntegrationTest extends TestCase
 
     private function publisher(): Transport
     {
-        return new Transport($this->connectClient(), new QueueName('jobs'), new PhpSerializer());
+        return new Transport($this->connection(), new QueueName('jobs'), new PhpSerializer(), $this->connection());
     }
 
-    private function connectClient(): Client
+    private function connection(): BrokerConnection
     {
-        $client = Client::connect($this->endpoint);
-        $this->clients[] = $client;
+        return new BrokerConnection(function (Cancellation $cancellation): Client {
+            $client = Client::connect($this->endpoint, cancellation: $cancellation);
+            $this->clients[] = $client;
 
-        return $client;
+            return $client;
+        });
     }
 
     private function eventDispatcher(): object

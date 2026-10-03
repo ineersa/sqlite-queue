@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Tests\Messenger;
 
+use Amp\Cancellation;
+use Amp\DeferredCancellation;
 use Amp\DeferredFuture;
 use Amp\Future;
 use Amp\TimeoutCancellation;
@@ -11,9 +13,11 @@ use Ineersa\SqliteQueue\Broker\Broker;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
 use Ineersa\SqliteQueue\Client;
 use Ineersa\SqliteQueue\Exception\TransportException as ClientTransportException;
+use Ineersa\SqliteQueue\Messenger\BrokerConnection;
 use Ineersa\SqliteQueue\Messenger\Stamp\DeliveryReceiptStamp;
 use Ineersa\SqliteQueue\Messenger\Transport;
 use Ineersa\SqliteQueue\Protocol\Frame;
+use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use PHPUnit\Framework\TestCase;
@@ -33,6 +37,8 @@ use function Amp\Socket\listen;
 
 final class TransportTest extends TestCase
 {
+    private const int PROBE_SAFETY_SECONDS = 5;
+
     private ?IsolatedDatabase $database = null;
     private ?Broker $broker = null;
     /** @var Future<int>|null */
@@ -111,7 +117,7 @@ final class TransportTest extends TestCase
                     ];
                 }
             };
-            $transport = new Transport($this->connectClient(), new QueueName('jobs'), $serializer);
+            $transport = $this->transportWithSerializer($serializer);
             $message = new TransportProbeMessage("payload\0binary");
             $envelope = new Envelope($message, [
                 new DelayStamp(250),
@@ -174,7 +180,7 @@ final class TransportTest extends TestCase
                     return ['body' => 'x', 'headers' => ['type' => 'probe']];
                 }
             };
-            $transport = new Transport($this->connectClient(), new QueueName('jobs'), $serializer);
+            $transport = $this->transportWithSerializer($serializer);
             $transport->send(new Envelope(new TransportProbeMessage('seed')));
             $received = iterator_to_array($transport->get());
             $this->assertCount(1, $received);
@@ -206,7 +212,7 @@ final class TransportTest extends TestCase
                     return ['body' => 'x', 'headers' => null];
                 }
             };
-            $transport = new Transport($this->connectClient(), new QueueName('jobs'), $serializer);
+            $transport = $this->transportWithSerializer($serializer);
             try {
                 $transport->send(new Envelope(new TransportProbeMessage('x')));
                 $this->fail('Explicit null headers must be rejected.');
@@ -236,7 +242,7 @@ final class TransportTest extends TestCase
                     return ['body' => 'no-headers'];
                 }
             };
-            $transport = new Transport($this->connectClient(), new QueueName('jobs'), $serializer);
+            $transport = $this->transportWithSerializer($serializer);
             $transport->send(new Envelope(new TransportProbeMessage('ignored')));
             $received = iterator_to_array($transport->get());
             $this->assertCount(1, $received);
@@ -259,7 +265,7 @@ final class TransportTest extends TestCase
                     return ['body' => 'x', 'headers' => ['bad' => "\xFF"]];
                 }
             };
-            $transport = new Transport($this->connectClient(), new QueueName('jobs'), $serializer);
+            $transport = $this->transportWithSerializer($serializer);
             try {
                 $transport->send(new Envelope(new TransportProbeMessage('x')));
                 $this->fail('Invalid UTF-8 headers must be rejected.');
@@ -286,9 +292,8 @@ final class TransportTest extends TestCase
     {
         $this->runAsync(function (): void {
             $this->startBroker();
-            $client = $this->connectClient();
-            $first = new Transport($client, new QueueName('jobs'), new PhpSerializer());
-            $second = new Transport($client, new QueueName('jobs'), new PhpSerializer());
+            $first = $this->transport();
+            $second = $this->transport();
             $first->send(new Envelope(new TransportProbeMessage('shared-client')));
             $received = iterator_to_array($first->get());
             $this->assertCount(1, $received);
@@ -344,7 +349,7 @@ final class TransportTest extends TestCase
                     return ['body' => 'x', 'headers' => ['type' => 'probe']];
                 }
             };
-            $transport = new Transport($this->connectClient(), new QueueName('jobs'), $broken);
+            $transport = $this->transportWithSerializer($broken);
             $transport->send(new Envelope(new TransportProbeMessage('ignored')));
 
             try {
@@ -372,7 +377,7 @@ final class TransportTest extends TestCase
             $this->startBroker();
             $client = $this->connectClient();
             $client->send('jobs', 'raw-body', 'not-json');
-            $transport = new Transport($client, new QueueName('jobs'), new PhpSerializer());
+            $transport = $this->transport();
 
             try {
                 $received = iterator_to_array($transport->get());
@@ -420,9 +425,7 @@ final class TransportTest extends TestCase
             });
 
             try {
-                $client = Client::connect($endpoint);
-                $this->clients[] = $client;
-                $transport = new Transport($client, new QueueName('jobs'), new PhpSerializer());
+                $transport = new Transport($this->connection($endpoint), new QueueName('jobs'), new PhpSerializer(), $this->connection($endpoint));
                 try {
                     $transport->send(new Envelope(new TransportProbeMessage('lost')));
                     $this->fail('A peer close without confirmation must fail the send.');
@@ -451,14 +454,83 @@ final class TransportTest extends TestCase
         $this->runAsync(function (): void {
             $this->startBroker();
             $transport = $this->transport();
-            $waiting = async(static fn (): bool => $transport->wait(5_000, new TimeoutCancellation(5)));
+            $waiting = async(static fn (): bool => $transport->wait(5_000, new TimeoutCancellation(self::PROBE_SAFETY_SECONDS)));
             $this->awaitNotifierWaiters(1);
             $publisher = $this->transport();
             $publisher->send(new Envelope(new TransportProbeMessage('wake')));
-            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $this->assertTrue($waiting->await(new TimeoutCancellation(self::PROBE_SAFETY_SECONDS)));
             $received = iterator_to_array($transport->get());
             $this->assertCount(1, $received);
             $transport->ack($received[0]);
+        });
+    }
+
+    public function testSameConnectionOwnerIsRejectedBeforeAcquisition(): void
+    {
+        $attempts = 0;
+        $owner = new BrokerConnection(static function (Cancellation $cancellation) use (&$attempts): Client {
+            ++$attempts;
+            throw new \LogicException('Constructor validation must not acquire a client.');
+        });
+        try {
+            new Transport($owner, new QueueName('jobs'), new PhpSerializer(), $owner);
+            $this->fail('Reservation and notification owners must be distinct.');
+        } catch (\InvalidArgumentException $error) {
+            $this->assertStringContainsString('must be distinct', $error->getMessage());
+        }
+        $this->assertSame(0, $attempts);
+    }
+
+    public function testCancellationDuringNotificationHandshakePreservesReservationOwner(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker();
+            $endpoint = $this->database->path('notification.sock');
+            $server = listen('unix://'.$endpoint);
+            $entered = new DeferredFuture();
+            $peer = async(static function () use ($server, $entered): bool {
+                $socket = $server->accept();
+                if (null === $socket) {
+                    throw new \LogicException('Missing notification probe peer.');
+                }
+                try {
+                    Frame::read($socket, new TimeoutCancellation(self::PROBE_SAFETY_SECONDS));
+                    // Hold HELLO confirmation until the caller cancels acquisition.
+                    $entered->complete();
+
+                    return null === Frame::read($socket, new TimeoutCancellation(self::PROBE_SAFETY_SECONDS));
+                } finally {
+                    $socket->close();
+                }
+            });
+            $transport = new Transport($this->connection($this->endpoint), new QueueName('jobs'), new PhpSerializer(), $this->connection($endpoint));
+            $stop = new DeferredCancellation();
+            try {
+                $transport->send(new Envelope(new TransportProbeMessage('reserved-during-handshake')));
+                $envelopes = iterator_to_array($transport->get());
+                $this->assertCount(1, $envelopes);
+                $wait = async(static fn (): bool => $transport->wait(Limits::MAX_WAIT_MILLISECONDS, $stop->getCancellation()));
+                $entered->getFuture()->await(new TimeoutCancellation(self::PROBE_SAFETY_SECONDS));
+                $stop->cancel();
+                try {
+                    $wait->await(new TimeoutCancellation(self::PROBE_SAFETY_SECONDS));
+                    $this->fail('Notification handshake must honor WAIT cancellation.');
+                } catch (TransportException $error) {
+                    $cause = $error;
+                    while (null !== $cause->getPrevious()) {
+                        $cause = $cause->getPrevious();
+                    }
+                    $this->assertInstanceOf(\Amp\CancelledException::class, $cause);
+                }
+                $this->assertTrue($peer->await(new TimeoutCancellation(self::PROBE_SAFETY_SECONDS)), 'Cancelling acquisition must close its socket.');
+                $transport->ack($envelopes[0]);
+                $this->assertSame([], iterator_to_array($transport->get()));
+            } finally {
+                $stop->cancel();
+                $transport->close();
+                $server->close();
+                @unlink($endpoint);
+            }
         });
     }
 
@@ -521,7 +593,22 @@ final class TransportTest extends TestCase
 
     private function transport(): Transport
     {
-        return new Transport($this->connectClient(), new QueueName('jobs'), new PhpSerializer());
+        return $this->transportWithSerializer(new PhpSerializer());
+    }
+
+    private function transportWithSerializer(SerializerInterface $serializer): Transport
+    {
+        return new Transport($this->connection($this->endpoint), new QueueName('jobs'), $serializer, $this->connection($this->endpoint));
+    }
+
+    private function connection(string $endpoint): BrokerConnection
+    {
+        return new BrokerConnection(function (Cancellation $cancellation) use ($endpoint): Client {
+            $client = Client::connect($endpoint, cancellation: $cancellation);
+            $this->clients[] = $client;
+
+            return $client;
+        });
     }
 
     private function connectClient(): Client

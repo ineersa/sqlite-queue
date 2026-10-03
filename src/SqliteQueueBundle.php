@@ -7,6 +7,7 @@ namespace Ineersa\SqliteQueue;
 use Ineersa\SqliteQueue\Command\BrokerCommand;
 use Ineersa\SqliteQueue\DependencyInjection\RegisterNativeConsumeWaitSubscriberPass;
 use Ineersa\SqliteQueue\Messenger\TransportFactory;
+use Symfony\Component\Config\Definition\Configurator\DefinitionConfigurator;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Loader\Configurator\ContainerConfigurator;
 use Symfony\Component\HttpKernel\Bundle\AbstractBundle;
@@ -30,6 +31,13 @@ final class SqliteQueueBundle extends AbstractBundle
         $container->addCompilerPass(new RegisterNativeConsumeWaitSubscriberPass());
     }
 
+    public function configure(DefinitionConfigurator $definition): void
+    {
+        $definition->rootNode()->children()
+            ->integerNode('visibility_timeout')->min(1)->defaultValue(BrokerCommand::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS)->end()
+        ->end();
+    }
+
     /** @param array<array-key, mixed> $config */
     public function loadExtension(array $config, ContainerConfigurator $container, ContainerBuilder $builder): void
     {
@@ -40,6 +48,7 @@ final class SqliteQueueBundle extends AbstractBundle
             ->tag('messenger.transport_factory');
 
         $services->set(BrokerCommand::class)
+            ->arg('$visibilityTimeoutMilliseconds', $config['visibility_timeout'])
             ->autoconfigure(false)
             ->tag('console.command', ['command' => 'sqlite-queue:broker']);
     }

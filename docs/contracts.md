@@ -21,12 +21,23 @@ range; the committed lock requires PHP >= 8.5, so the suite does not run there. 
 later are unverified. Symfony 7.4 resolves with the driver, and the package does not support
 it. Core APIs do not boot a Symfony application. Console, Messenger, Clock, Lock, and
 Filesystem are runtime dependencies. FrameworkBundle is optional for standalone use and
-required for bundle integration. Task 06 is implemented awaiting PR/user review, not merged.
-Current-tree QA passed with 335 tests and 2,028 assertions. Isolated Symfony 8.0 adapter and
-native-command tests passed with 53 tests and 257 assertions. See [Messenger reference](messenger.md).
+required for bundle integration. Task 06 is implemented PR #7 awaiting user review, not merged.
+Current-tree QA passed with 350 tests and 2,098 assertions. Isolated Symfony 8.0 adapter and
+native-command tests passed with 68 tests and 327 assertions. See [Messenger reference](messenger.md).
 
-Doctrine DBAL and the Symfony Messenger Doctrine SQLite transport are benchmark-only. The
-package supports one async SQLite client, with no multi-driver abstraction.
+Doctrine DBAL and the Symfony Messenger Doctrine SQLite transport are development dependencies
+for benchmarks and real failure-transport recovery tests, not package runtime requirements.
+Applications choosing a Doctrine failure transport install its dependencies themselves.
+The package supports one async SQLite driver, with no multi-driver abstraction.
+
+Package type `symfony-bundle` enables Flex registration. The opt-in `vendor/bin/castor test:flex`
+verifies a real no-dev consuming application without pre-registered bundle configuration.
+Transport acquisition is lazy and uses distinct operation and notification broker socket
+clients, not distinct SQLite connections. Notification cancellation preserves the operation
+client for final batch ACKs. Neither failed acquisition nor an uncertain operation is
+automatically reconnected or replayed. Real Doctrine failure queue recovery through stock
+`messenger:failed:retry` is covered. Batch idle flushing differs between Symfony 8.0 and 8.1;
+see the [Messenger reference](messenger.md).
 
 ## Package boundary
 
@@ -98,6 +109,10 @@ makes SQLite lock-free, and the extra driver round trips count in the benchmark.
 
 - Visibility timeout is configurable. The default is 5000 ms, matching both reference
   projects.
+- Broker CLI `--visibility-timeout` uses positive integer milliseconds. For the bundle command,
+  explicit CLI overrides `sqlite_queue.visibility_timeout`, which overrides the 5000ms default.
+  The standalone command has no bundle configuration. Communication timeout is separate.
+  The example's 60000ms lease is configurable, not a safety guarantee for every handler.
 - The claim persists the reservation expiry. Disconnect does not release the reservation
   early, and a broker restart does not reset or extend it. The message becomes eligible again
   when the persisted expiry passes.

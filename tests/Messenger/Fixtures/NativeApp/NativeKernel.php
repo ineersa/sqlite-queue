@@ -55,12 +55,26 @@ final class NativeKernel extends Kernel
         $container->addCompilerPass(new class implements CompilerPassInterface {
             public function process(ContainerBuilder $container): void
             {
+                // Use Symfony's durable, listable failure receiver without an application Doctrine bundle.
+                $dbal = (new \Symfony\Component\DependencyInjection\Definition(\Doctrine\DBAL\Connection::class))
+                    ->setFactory([\Doctrine\DBAL\DriverManager::class, 'getConnection'])
+                    ->setArguments([['driver' => 'pdo_sqlite', 'path' => '%kernel.project_dir%/failed.sqlite']]);
+                $connection = new \Symfony\Component\DependencyInjection\Definition(
+                    \Symfony\Component\Messenger\Bridge\Doctrine\Transport\Connection::class,
+                    [['queue_name' => 'failed'], $dbal],
+                );
+                $container->setDefinition('messenger.transport.failed', new \Symfony\Component\DependencyInjection\Definition(
+                    \Symfony\Component\Messenger\Bridge\Doctrine\Transport\DoctrineTransport::class,
+                    [$connection, new \Symfony\Component\DependencyInjection\Reference('messenger.transport.native_php_serializer')],
+                ));
                 foreach ([
                     TransportFactory::class,
                     NativeConsumeWaitSubscriber::class,
                     BrokerCommand::class,
                     'messenger.transport.async',
                     'messenger.transport.async_terminal',
+                    'messenger.transport.async_failure',
+                    'messenger.transport.failed',
                     'messenger.default_bus',
                     'event_dispatcher',
                 ] as $id) {

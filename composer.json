@@ -2,7 +2,7 @@
     "name": "ineersa/sqlite-queue",
     "description": "Sqlite based queue broker",
     "license": "MIT",
-    "type": "library",
+    "type": "symfony-bundle",
     "bin": ["bin/sqlite-queue"],
     "require": {
         "php": "^8.5",

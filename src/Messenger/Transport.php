@@ -6,7 +6,6 @@ namespace Ineersa\SqliteQueue\Messenger;
 
 use Amp\Cancellation;
 use Amp\CancelledException;
-use Ineersa\SqliteQueue\Client;
 use Ineersa\SqliteQueue\DTO\DeliveryDTO;
 use Ineersa\SqliteQueue\Exception\InvalidReceiptException;
 use Ineersa\SqliteQueue\Exception\TransportException as ClientTransportException;
@@ -24,7 +23,7 @@ use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
 use Symfony\Component\Messenger\Transport\TransportInterface;
 
 /**
- * Symfony Messenger adapter over one Client and one validated queue.
+ * Symfony Messenger adapter over separate operation and notification connections for one queue.
  *
  * Serialization stays at this boundary. The broker stores opaque body and headers
  * strings. Headers crossing this adapter are a JSON object of UTF-8 string values;
@@ -37,11 +36,20 @@ final class Transport implements TransportInterface, CloseableTransportInterface
     public const string RAW_HEADERS_HEADER = 'x-sqlite-queue-raw-headers';
     private const int JSON_DEPTH = 32;
 
+    /**
+     * Owners must acquire distinct broker Clients. Cancelling notification WAIT closes that
+     * connection; the operation connection must remain live for deferred reservation ACKs.
+     * Both owners belong to this transport and are closed with it.
+     */
     public function __construct(
-        private readonly Client $client,
+        private readonly BrokerConnection $operations,
         private readonly QueueName $queue,
         private readonly SerializerInterface $serializer,
+        private readonly BrokerConnection $notifications,
     ) {
+        if ($operations === $notifications) {
+            throw new \InvalidArgumentException('Operation and notification connection owners must be distinct.');
+        }
     }
 
     private function __clone(): void
@@ -63,7 +71,7 @@ final class Transport implements TransportInterface, CloseableTransportInterface
         }
 
         try {
-            $delivery = $this->client->receive($this->queue->value);
+            $delivery = $this->operations->client()->receive($this->queue->value);
         } catch (ClientTransportException|ProtocolException $error) {
             throw $this->transportFailure('Could not receive from the queue broker.', $error);
         }
@@ -101,7 +109,7 @@ final class Transport implements TransportInterface, CloseableTransportInterface
         $delay = $this->delayMilliseconds($envelope);
 
         try {
-            $id = $this->client->send($this->queue->value, $encoded['body'], $headers, $delay);
+            $id = $this->operations->client()->send($this->queue->value, $encoded['body'], $headers, $delay);
         } catch (ClientTransportException|ProtocolException $error) {
             throw $this->transportFailure('Could not send to the queue broker.', $error);
         }
@@ -117,7 +125,7 @@ final class Transport implements TransportInterface, CloseableTransportInterface
     public function wait(int $timeoutMilliseconds, Cancellation $cancellation): bool
     {
         try {
-            return $this->client->wait($this->queue->value, $timeoutMilliseconds, $cancellation);
+            return $this->notifications->client($cancellation)->wait($this->queue->value, $timeoutMilliseconds, $cancellation);
         } catch (CancelledException $error) {
             throw $this->transportFailure('Queue wait was cancelled.', $error);
         } catch (ClientTransportException|ProtocolException $error) {
@@ -127,7 +135,11 @@ final class Transport implements TransportInterface, CloseableTransportInterface
 
     public function close(): void
     {
-        $this->client->close();
+        try {
+            $this->notifications->close();
+        } finally {
+            $this->operations->close();
+        }
     }
 
     private function settle(Envelope $envelope, bool $acknowledge): void
@@ -142,9 +154,9 @@ final class Transport implements TransportInterface, CloseableTransportInterface
 
         try {
             if ($acknowledge) {
-                $this->client->acknowledge($stamp->receipt);
+                $this->operations->client()->acknowledge($stamp->receipt);
             } else {
-                $this->client->reject($stamp->receipt);
+                $this->operations->client()->reject($stamp->receipt);
             }
         } catch (InvalidReceiptException $error) {
             throw $this->transportFailure('The delivery receipt is no longer valid.', $error);
@@ -204,7 +216,7 @@ final class Transport implements TransportInterface, CloseableTransportInterface
         // Symfony Messenger 8.0 has no failure-envelope helper and deletes on decode failure.
         // Reject the committed claim before rethrowing so the delivery cannot stay invisible.
         try {
-            $this->client->reject($received->receipt);
+            $this->operations->client()->reject($received->receipt);
         } catch (InvalidReceiptException|ClientTransportException|ProtocolException $rejectError) {
             throw $this->transportFailure('Could not reject a delivery after a decode failure.', $rejectError);
         }

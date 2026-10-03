@@ -13,11 +13,9 @@ use Ineersa\SqliteQueue\Broker\Broker;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
 use Ineersa\SqliteQueue\Broker\QueueNotifier;
 use Ineersa\SqliteQueue\Client;
-use Ineersa\SqliteQueue\Messenger\Transport;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeProbeMessage;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
-use Ineersa\SqliteQueue\ValueObject\QueueName;
 use PHPUnit\Framework\Attributes\RequiresOperatingSystem;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
@@ -32,6 +30,8 @@ use function Amp\ByteStream\buffer;
 final class NativeConsoleProcessTest extends TestCase
 {
     private const int SAFETY_SECONDS = 15;
+    // Keep reservations live until explicit settlement, independent of subprocess scheduling.
+    private const int BROKER_NOW_MILLISECONDS = 1_700_000_000_000;
 
     // Resources may be absent after failed setup; the CLI-broker case has no in-process broker.
     private ?IsolatedDatabase $fixture = null;
@@ -85,8 +85,9 @@ final class NativeConsoleProcessTest extends TestCase
         $this->assertSame('ready', json_decode((string) $ready, true, 16, \JSON_THROW_ON_ERROR)['event']);
         $this->trackDescendants($broker);
 
-        $client = Client::connect($this->endpoint());
-        $transport = new Transport($client, new QueueName('jobs'), new PhpSerializer());
+        $transport = (new \Ineersa\SqliteQueue\Messenger\TransportFactory())->createTransport(
+            'sqlite-queue://jobs?endpoint='.rawurlencode($this->endpoint()), [], new PhpSerializer(),
+        );
         try {
             $transport->send(new Envelope(new NativeProbeMessage('native-ack')));
         } finally {
@@ -136,6 +137,37 @@ final class NativeConsoleProcessTest extends TestCase
         $this->assertFileDoesNotExist($this->endpoint());
     }
 
+    public function testSigtermDuringWaitFlushesDeferredBatchAndAcksDurably(): void
+    {
+        $this->startBroker();
+        $publisher = (new \Ineersa\SqliteQueue\Messenger\TransportFactory())->createTransport(
+            'sqlite-queue://jobs?endpoint='.rawurlencode($this->endpoint()), [], new PhpSerializer(),
+        );
+        $publisher->send(new Envelope(new Fixtures\NativeApp\Message\NativeBatchMessage('deferred')));
+        $publisher->close();
+        $consumer = $this->console(['messenger:consume', 'async', '--quiet']);
+        $this->awaitWaiters(1);
+        if (Fixtures\NativeApp\Handler\NativeBatchMessageHandler::supportsDeferredIdleFlush()) {
+            $this->assertSame(1, $this->messageCount());
+            $this->assertFileDoesNotExist($this->project().'/batch.jsonl');
+        } else {
+            // Messenger 8.0 flushes pending batches before dispatching its idle event.
+            $this->assertSame(0, $this->messageCount());
+            $this->assertFileExists($this->project().'/batch.jsonl');
+        }
+        $this->assertTrue(posix_kill($consumer->getPid(), \SIGTERM));
+        $this->assertExit($consumer, 0);
+        $this->assertSame("{\"body\":\"deferred\"}\n", file_get_contents($this->project().'/batch.jsonl'));
+        $this->assertSame(0, $this->messageCount());
+        $client = Client::connect($this->endpoint());
+        try {
+            $this->assertNull($client->receive('jobs'));
+        } finally {
+            $client->close();
+        }
+        $this->assertOwnedGone();
+    }
+
     /** @param list<string> $arguments */
     private function console(array $arguments): Process
     {
@@ -164,7 +196,11 @@ final class NativeConsoleProcessTest extends TestCase
 
     private function startBroker(): void
     {
-        $broker = (new BrokerFactory($this->database(), $this->endpoint()))->create();
+        $broker = (new BrokerFactory(
+            $this->database(),
+            $this->endpoint(),
+            clock: static fn (): int => self::BROKER_NOW_MILLISECONDS,
+        ))->create();
         $this->broker = $broker;
         $ready = new DeferredFuture();
         $this->brokerRun = async(static fn (): int => $broker->run(static function (array $event) use ($ready): void {

@@ -108,19 +108,20 @@ final class TransportFactoryTest extends TestCase
     public function testConnectFailureIsSymfonyTransportException(): void
     {
         $factory = new TransportFactory();
+        $transport = $factory->createTransport(
+            'sqlite-queue://jobs?endpoint=/var/missing-sqlite-queue-'.bin2hex(random_bytes(4)).'.sock',
+            [],
+            new PhpSerializer(),
+        );
         try {
-            $factory->createTransport(
-                'sqlite-queue://jobs?endpoint=/var/missing-sqlite-queue-'.bin2hex(random_bytes(4)).'.sock',
-                [],
-                new PhpSerializer(),
-            );
+            $transport->get();
             $this->fail('Missing endpoint must fail connect.');
         } catch (TransportException $error) {
             $this->assertInstanceOf(ClientTransportException::class, $error->getPrevious());
         }
     }
 
-    public function testExplicitOptionsOverrideQueryAndConnectEagerly(): void
+    public function testExplicitOptionsOverrideQueryAndConnectOnFirstOperation(): void
     {
         $this->runAsync(function (): void {
             $this->startBroker();

@@ -1,6 +1,6 @@
 # Task 06: Symfony Messenger transport adapter
 
-Status: IMPLEMENTED — awaiting PR and user review; not merged
+Status: IMPLEMENTED — PR #7 awaiting user review; not merged
 Repository: `/home/ineersa/projects/sqlite-queue`
 Dependencies: [Task 05](TASK-05-DELAYED-WAKEUPS.md)
 Read first: [PLAN.md](PLAN.md), sections 5–8 and 10.
@@ -47,6 +47,12 @@ Provide the concrete adapter configuration to Tasks 07 and 08. Keep task-local t
 
 The bundle registers the transport factory and broker command. Native `messenger:consume` uses bounded WAIT for one literal receiver with omitted or zero sleep. No custom consume command or manual Worker construction is required. `DeliveryReceiptStamp` binds settlement to the delivery and transport.
 
-Current-tree `vendor/bin/castor cs:fix` then `vendor/bin/castor qa` passed: 335 tests, 2,028 assertions. Isolated Symfony 8.0 adapter/native-command tests passed: 53 tests, 257 assertions; production-source PHPStan passed. The isolated matrix used FrameworkBundle, Console, Messenger, and DependencyInjection 8.0.15, and Clock 8.0.8. Castor ran externally because its dependencies cannot resolve with Console 8.0.
+Review follow-ups add lazy initial acquisition with cancellation through handshake and required distinct operation and notification `BrokerConnection` owners. Notification cancellation preserves final batch ACKs. Closed owners cannot reconnect or be resurrected. Real Doctrine failure transport recovery uses native `messenger:failed:retry`; idle batch flushing is version-dependent.
+
+CLI `--visibility-timeout` is positive integer milliseconds. Explicit CLI overrides bundle `sqlite_queue.visibility_timeout`, then the default 5000ms. Communication timeouts remain separate. Controlled six-second handler coverage verifies configured leases and successful ACK without correctness sleeps.
+
+Package type `symfony-bundle` enables actual Flex discovery. `vendor/bin/castor test:flex` passed real no-dev installation without pre-registration, native broker command availability, and offline transport resolution. This network task stays outside ordinary QA. Reports are under `var/qa/test-flex/`; compatibility artifacts are under `var/task06-review-connection-compat/`.
+
+Current-tree `vendor/bin/castor cs:fix` then `vendor/bin/castor qa` passed: 350 tests, 2,098 assertions. Isolated Symfony 8.0 adapter/native-command tests passed: 68 tests, 327 assertions; production-source PHPStan passed. The isolated matrix used FrameworkBundle, Console, Messenger, and DependencyInjection 8.0.15, and Clock 8.0.8. Castor ran externally because its dependencies cannot resolve with Console 8.0.
 
 [Configuration example](../../docs/examples/messenger.yaml), [setup guide](../../docs/messenger-setup.md), and [reference](../../docs/messenger.md) cover native usage. Explicit positive sleep, multiple receivers, and regex-like names retain polling. Non-signal idle stops can incur one 1,000ms WAIT budget. No lease keepalive is provided. Task 07 failure audit and Task 08 performance comparison remain separate work.

@@ -29,6 +29,10 @@ The package is not published. For application installation, configure a Composer
 
 See [AGENTS.md](AGENTS.md) for Castor commands, validation rules, and report paths.
 
+`vendor/bin/castor test:flex` runs an opt-in real no-dev Flex installation probe. It requires network access and is not part of ordinary QA. Reports are under `var/qa/test-flex/`.
+
+The `symfony-bundle` package registers its bundle automatically with Flex. Transport clients connect lazily, so container boot and transport resolution work before broker startup. Messenger uses separate operation and notification socket clients to preserve final batch ACKs after WAIT cancellation. They share the broker's SQLite storage, not separate SQLite connections. See the [setup guide](docs/messenger-setup.md) for configurable visibility and native consumption.
+
 ## Status
 
 | Area | State |
@@ -37,7 +41,7 @@ See [AGENTS.md](AGENTS.md) for Castor commands, validation rules, and report pat
 | Queue engine and schema | Done in Task 03, including durable delayed availability |
 | Foreground `sqlite-queue broker` and PHP client | Done in Task 04 for the approved SIGTERM/SIGKILL scope. Immediate receive, ACK, reject, and close. |
 | Delayed wakeups | Done in Task 05. Bounded WAIT, deadline scheduling, and restart/cancellation proof. |
-| Symfony Messenger adapter | Implemented in Task 06, awaiting PR/user review, not merged. Native consume integration; QA 335 tests/2,028 assertions. Isolated Symfony 8.0 adapter/native tests: 53/257. |
+| Symfony Messenger adapter | Implemented in Task 06, PR #7 awaiting user review, not merged. Native consume integration; QA 350 tests/2,098 assertions. Isolated Symfony 8.0 adapter/native tests: 68/327. |
 | Benchmark baseline | Task 02 complete, including recorded lock failures and comparison limits |
 | A/B comparison | Not started, Task 08. No broker performance result. |
 

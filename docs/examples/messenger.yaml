@@ -1,5 +1,8 @@
 # Copy into config/packages/messenger.yaml in your Symfony application.
 # Replace the endpoint and message class with your application's values.
+# Choose visibility for your handler duration; this example does not renew leases.
+sqlite_queue:
+    visibility_timeout: 60000
 framework:
     messenger:
         transports:

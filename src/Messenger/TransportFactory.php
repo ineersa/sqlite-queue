@@ -4,10 +4,9 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Messenger;
 
+use Amp\Cancellation;
 use Ineersa\SqliteQueue\Client;
-use Ineersa\SqliteQueue\Exception\TransportException as ClientTransportException;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
-use Symfony\Component\Messenger\Exception\TransportException;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
 use Symfony\Component\Messenger\Transport\TransportFactoryInterface;
 
@@ -17,8 +16,8 @@ use Symfony\Component\Messenger\Transport\TransportFactoryInterface;
  * The DSN authority is the literal QueueName. endpoint is required via query or
  * options. timeout defaults to Client's 10s transport allowance. Explicit options
  * override query values. Symfony may inject transport_name metadata; credentials,
- * ports, fragments, and nonempty URL paths are rejected. The Client connects
- * eagerly after local validation, so a constructed transport is already initialized.
+ * ports, fragments, and nonempty URL paths are rejected. Connection acquisition is
+ * deferred until the first operation, with no retry after failed acquisition.
  *
  * @implements TransportFactoryInterface<Transport>
  */
@@ -94,13 +93,9 @@ final class TransportFactory implements TransportFactoryInterface
             $timeout = $this->positiveTimeout($merged['timeout']);
         }
 
-        try {
-            $client = Client::connect($endpoint, $timeout);
-        } catch (ClientTransportException $error) {
-            throw new TransportException('Could not connect to the queue broker.', 0, $error);
-        }
+        $connect = static fn (Cancellation $cancellation): Client => Client::connect($endpoint, $timeout, $cancellation);
 
-        return new Transport($client, $queue, $serializer);
+        return new Transport(new BrokerConnection($connect), $queue, $serializer, new BrokerConnection($connect));
     }
 
     /** @param array<mixed> $options */

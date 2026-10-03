@@ -6,6 +6,20 @@ framework:
     messenger:
         failure_transport: null
         transports:
+            failed:
+                # NativeKernel supplies this real Doctrine receiver's connection directly.
+                dsn: 'doctrine://fixture'
+                serializer: messenger.transport.native_php_serializer
+            async_failure:
+                dsn: '%env(NATIVE_ASYNC_DSN)%'
+                serializer: messenger.transport.native_php_serializer
+                failure_transport: failed
+                retry_strategy:
+                    max_retries: 1
+                    delay: 50
+                    multiplier: 1
+                    max_delay: 50
+                    jitter: 0.0
             async:
                 dsn: '%env(NATIVE_ASYNC_DSN)%'
                 serializer: messenger.transport.native_php_serializer

@@ -19,7 +19,7 @@ The broker supports immediate receive and bounded WAIT. The [Symfony Messenger a
 
 4. Wait for a JSON line whose `event` is `ready` before starting clients. Process creation alone is not readiness.
 
-The executable uses Symfony Console `^8.0`. Development installation includes it. In a consuming project without development dependencies, install `symfony/console:^8.0` to use `vendor/bin/sqlite-queue`. The broker requires `symfony/lock:^8.0` and `symfony/filesystem:^8.0` at runtime for exclusive ownership. The `Queue` and `Client` APIs need no Symfony packages, and no Symfony application boot is involved anywhere.
+The executable uses the package's runtime Symfony Console dependency. A no-dev installation includes `vendor/bin/sqlite-queue`. With the bundle enabled, `php bin/console sqlite-queue:broker` accepts the same options. Standalone `Queue` and `Client` APIs do not boot a Symfony application.
 
 ## Run under a supervisor in production
 
@@ -79,7 +79,9 @@ if (null !== $delivery) {
 }
 ```
 
-The default visibility timeout is 5,000 milliseconds. An unacknowledged reservation becomes eligible again at its persisted deadline. Closing a client does not shorten that deadline. For custom visibility, construct a `BrokerFactory` with that timeout and call `create()` to receive a fully initialized `Broker`. For an application-owned cancellation token, pass it to `Broker::run()` rather than adding a supervisor to this package.
+The default visibility timeout is 5,000 milliseconds. Both broker commands accept `--visibility-timeout=60000` for a 60,000-millisecond lease. Choose a duration for your handlers; this example is not a universal safety guarantee. There is no lease renewal. The bundle accepts `sqlite_queue.visibility_timeout`; an explicit CLI value wins over bundle configuration, which wins over the 5,000ms default. The standalone command does not load bundle configuration. Client communication timeouts are separate and do not change the lease.
+
+An unacknowledged reservation becomes eligible again at its persisted deadline. Closing a client does not shorten that deadline. PHP callers can construct `BrokerFactory` with `visibilityTimeout` and call `create()`. For an application-owned cancellation token, pass it to `Broker::run()`.
 
 The Messenger bundle maps WAIT onto native consumer idle events for one literal receiver when `--sleep` is omitted or zero. See [Messenger idle behavior and limits](messenger.md#native-consume-idle-behavior).
 

@@ -37,7 +37,7 @@ Read this plan before the assigned task. The task files divide the work; they do
 | [03: async SQLite queue](TASK-03-ASYNC-SQLITE-QUEUE.md) | Done. Durable engine, atomic claims, receipts, persisted delayed availability | 01 |
 | [04: broker and client](TASK-04-BROKER-AND-CLIENT.md) | Done for the approved SIGTERM/SIGKILL scope. Bounded sockets and foreground service | 03 |
 | [05: delayed wakeups](TASK-05-DELAYED-WAKEUPS.md) | Done. Bounded WAIT, deadline scheduling, restart and cancellation. PR #6 merged | 04 |
-| [06: Messenger adapter](TASK-06-MESSENGER-ADAPTER.md) | Implemented, awaiting PR/user review; not merged. Native consume, serializers, delay/retry mapping. QA 335/2028; isolated 8.0 adapter/native 53/257 | 05 |
+| [06: Messenger adapter](TASK-06-MESSENGER-ADAPTER.md) | Implemented, PR #7 awaiting user review; not merged. Native consume, serializers, delay/retry mapping. QA 350/2098; isolated 8.0 adapter/native 68/327 | 05 |
 | [07: failure and lifecycle proof](TASK-07-FAILURE-AND-LIFECYCLE-PROOF.md) | Remaining cross-component fault cases and independent safety review | 06 |
 | [08: benchmark and MVP acceptance](TASK-08-BENCHMARK-AND-MVP-ACCEPTANCE.md) | Actual A/B comparison, documentation, package acceptance | 02 and 07 |
 

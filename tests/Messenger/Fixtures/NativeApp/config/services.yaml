@@ -7,3 +7,7 @@ services:
         public: true
         arguments:
             $recordPath: '%kernel.project_dir%/handled.jsonl'
+
+    Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Handler\NativeBatchMessageHandler:
+        arguments:
+            $recordPath: '%kernel.project_dir%/batch.jsonl'
