@@ -17,7 +17,7 @@ php bin/console list --raw >"$report/commands.log" 2>&1
 grep -q '^sqlite-queue:broker ' "$report/commands.log"
 cat > config/packages/sqlite_queue.yaml <<'YAML'
 sqlite_queue:
-    visibility_timeout: 15000
+    redeliver_timeout: 15
 framework:
     messenger:
         transports:

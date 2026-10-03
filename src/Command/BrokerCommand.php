@@ -7,6 +7,7 @@ namespace Ineersa\SqliteQueue\Command;
 use Amp\DeferredCancellation;
 use Ineersa\SqliteQueue\Broker\BrokerEventEnum;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
+use Ineersa\SqliteQueue\Queue;
 use Revolt\EventLoop;
 use Symfony\Component\Clock\Clock;
 use Symfony\Component\Clock\ClockInterface;
@@ -20,8 +21,7 @@ use Symfony\Component\Console\Output\OutputInterface;
 #[AsCommand(name: 'broker', description: 'Run the foreground SQLite queue broker on a private local Unix socket.')]
 final class BrokerCommand extends BaseCommand
 {
-    public const int DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS = 5000;
-    private const int MILLISECONDS_PER_SECOND = 1000;
+    public const int DEFAULT_REDELIVER_TIMEOUT_SECONDS = Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS / 1000;
 
     /**
      * Upper bound, in seconds, on how long the serving loop may wait for events without waking.
@@ -37,11 +37,14 @@ final class BrokerCommand extends BaseCommand
 
     /** Standalone defaults match queue policy and use the wall clock; injection supports controlled runtime clocks. */
     public function __construct(
-        private readonly int $visibilityTimeoutMilliseconds = self::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS,
+        private readonly int $redeliverTimeoutSeconds = self::DEFAULT_REDELIVER_TIMEOUT_SECONDS,
         private readonly ClockInterface $clock = new Clock(),
     ) {
-        if ($visibilityTimeoutMilliseconds <= 0) {
-            throw new \InvalidArgumentException('Visibility timeout must be positive milliseconds.');
+        if ($redeliverTimeoutSeconds <= 0) {
+            throw new \InvalidArgumentException('Redelivery timeout must be positive seconds.');
+        }
+        if ($redeliverTimeoutSeconds > intdiv(\PHP_INT_MAX, 1000)) {
+            throw new \InvalidArgumentException('Redelivery timeout exceeds the supported milliseconds range.');
         }
         parent::__construct();
     }
@@ -51,7 +54,7 @@ final class BrokerCommand extends BaseCommand
         $this
             ->addOption('database', null, InputOption::VALUE_REQUIRED, 'Absolute path to the private queue database file.')
             ->addOption('endpoint', null, InputOption::VALUE_REQUIRED, 'Absolute path to the private Unix socket file.')
-            ->addOption('visibility-timeout', null, InputOption::VALUE_REQUIRED, 'Reservation visibility timeout in milliseconds.', (string) $this->visibilityTimeoutMilliseconds)
+            ->addOption('redeliver-timeout', null, InputOption::VALUE_REQUIRED, 'Reservation redelivery timeout in seconds.', (string) $this->redeliverTimeoutSeconds)
             ->setHelp('Readiness, framing bounds, lifetime locks, failure handling, and client recovery are documented in docs/broker-protocol.md.');
     }
 
@@ -62,9 +65,12 @@ final class BrokerCommand extends BaseCommand
         try {
             $database = $input->getOption('database');
             $endpoint = $input->getOption('endpoint');
-            $visibilityTimeout = filter_var($input->getOption('visibility-timeout'), \FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
-            if (false === $visibilityTimeout) {
-                throw new \InvalidArgumentException('--visibility-timeout must be positive integer milliseconds.');
+            $redeliverTimeoutSeconds = filter_var($input->getOption('redeliver-timeout'), \FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+            if (false === $redeliverTimeoutSeconds) {
+                throw new \InvalidArgumentException('--redeliver-timeout must be positive integer seconds.');
+            }
+            if ($redeliverTimeoutSeconds > intdiv(\PHP_INT_MAX, 1000)) {
+                throw new \InvalidArgumentException('--redeliver-timeout exceeds the supported milliseconds range.');
             }
             if (!\is_string($database) || '' === $database || !\is_string($endpoint) || '' === $endpoint) {
                 throw new \InvalidArgumentException('Both --database and --endpoint are required.');
@@ -88,7 +94,7 @@ final class BrokerCommand extends BaseCommand
             $broker = (new BrokerFactory(
                 $database,
                 $endpoint,
-                visibilityTimeout: $visibilityTimeout,
+                visibilityTimeout: $redeliverTimeoutSeconds * 1000,
                 clock: fn (): int => $this->nowMilliseconds(),
                 cancellation: $shutdown->getCancellation(),
             ))->create();
@@ -113,7 +119,7 @@ final class BrokerCommand extends BaseCommand
     {
         $now = $this->clock->now();
 
-        return $now->getTimestamp() * self::MILLISECONDS_PER_SECOND + (int) $now->format('v');
+        return $now->getTimestamp() * 1000 + (int) $now->format('v');
     }
 
     /** @param array<string, int|string> $event */

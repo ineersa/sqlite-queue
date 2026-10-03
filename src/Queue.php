@@ -28,6 +28,8 @@ use Ineersa\SqliteQueue\ValueObject\QueueName;
  */
 final class Queue
 {
+    public const int DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS = 60_000;
+
     private const int BROKER_EPOCH_BYTES = 32;
     private const int RESERVATION_TOKEN_BYTES = 32;
 
@@ -40,7 +42,7 @@ final class Queue
      */
     public function __construct(
         private readonly SqliteQueueStorage $storage,
-        private readonly int $visibilityTimeout = 5000,
+        private readonly int $visibilityTimeout = self::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS,
         ?\Closure $clock = null,
     ) {
         if ($visibilityTimeout <= 0) {

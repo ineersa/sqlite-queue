@@ -2,8 +2,9 @@
 
 declare(strict_types=1);
 
-namespace Ineersa\SqliteQueue\Messenger;
+namespace Ineersa\SqliteQueue\Messenger\DTO;
 
+use Ineersa\SqliteQueue\Messenger\Transport;
 use Symfony\Component\Console\Command\Command;
 
 /**
@@ -12,7 +13,7 @@ use Symfony\Component\Console\Command\Command;
  * Constructed only after the exact sqlite-queue receiver activation checks succeed and
  * before any InputOption mutation. originalSleepDefault keeps the option's native type.
  */
-final class NativeConsumeWaitPendingMutation
+final class ConsumeWaitPendingDTO
 {
     public function __construct(
         public readonly Command $command,

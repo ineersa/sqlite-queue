@@ -34,7 +34,7 @@ final class SqliteQueueBundle extends AbstractBundle
     public function configure(DefinitionConfigurator $definition): void
     {
         $definition->rootNode()->children()
-            ->integerNode('visibility_timeout')->min(1)->defaultValue(BrokerCommand::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS)->end()
+            ->integerNode('redeliver_timeout')->min(1)->max(intdiv(\PHP_INT_MAX, 1000))->defaultValue(BrokerCommand::DEFAULT_REDELIVER_TIMEOUT_SECONDS)->end()
         ->end();
     }
 
@@ -48,7 +48,7 @@ final class SqliteQueueBundle extends AbstractBundle
             ->tag('messenger.transport_factory');
 
         $services->set(BrokerCommand::class)
-            ->arg('$visibilityTimeoutMilliseconds', $config['visibility_timeout'])
+            ->arg('$redeliverTimeoutSeconds', $config['redeliver_timeout'])
             ->autoconfigure(false)
             ->tag('console.command', ['command' => 'sqlite-queue:broker']);
     }

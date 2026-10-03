@@ -1,6 +1,6 @@
-# Task 02 baseline capture
+# Doctrine SQLite baseline results
 
-Task 02 captured all six workloads with one warmup and three measured repetitions each. This is baseline-only evidence. No broker candidate exists, and these results establish no performance win.
+The baseline capture contains six workloads, each with one warmup and three measured repetitions. It measures the Doctrine SQLite transport only, not this broker. The results establish no broker performance advantage.
 
 ## Revision and reproduction
 
@@ -10,9 +10,9 @@ Historical capture command at revision `13a43bc`:
 	php bench/run.php
 ```
 
-The capture used the benchmark source now committed at `13a43bc`. Git signing initially failed, so the metadata records parent revision `688353e` and a dirty worktree. Every benchmark PHP file hash in the capture matches `13a43bc`; the archive also records the Composer lock hash.
+The benchmark source hashes match revision `13a43bc`. Capture metadata records parent revision `688353e` and a dirty worktree; the recorded file hashes, rather than that parent revision alone, identify the measured source. The archive also records the Composer lock hash.
 
-PR review replaced the procedural scripts with Composer autoloading and a Symfony Console application. The current command is `php bin/benchmark run`. The archived capture remains evidence for `13a43bc`, not a measurement of the refactored CLI. Workload budgets and timing definitions are unchanged, but new measurements must record the new runner and dependency hashes. Do not relabel the old timings as results from the refactor.
+The runner was later refactored into a Symfony Console application. The current command is `php bin/benchmark run`. The archived capture remains evidence for `13a43bc`, not a measurement of the refactored CLI. Workload budgets and timing definitions are unchanged, but new measurements must record the new runner and dependency hashes. Do not relabel the old timings as results from the refactor.
 
 The original artifact directory is `var/bench/20260928-010402-4cda6aa2/`. The [retained archive](../bench/results/baseline-v1-20260928.tar.gz) contains all 24 repetition directories, raw JSONL samples, logs, configuration, `summary.json`, and `report.md`. It contains no queue database files.
 
@@ -53,7 +53,7 @@ These are individual-run observations, not pooled values. Every p99 remains tail
 | Idle publish-to-handler p95 | 17.124 | 9.678 | 7.325 |
 | Idle full-cycle p95 | 20.064 | 12.560 | 10.175 |
 
-Roundtrip full-cycle p95 spanned about 0.67 ms. Idle full-cycle p95 varied by almost a factor of two. That variability and the concurrent failures rule out a useful speedup claim from one favorable run. Task 08 needs repeated paired runs and larger matched budgets before candidate tuning, as specified in method v1.
+Roundtrip full-cycle p95 spanned about 0.67 ms. Idle full-cycle p95 varied by almost a factor of two. That variability and the concurrent failures rule out a useful speedup claim from one favorable run. A broker comparison needs repeated paired runs and larger matched budgets, as specified in method v1.
 
 Idle child-tree CPU was about 22–24% of one CPU during the sampled empty interval at 1 ms worker polling. Peak sampled child counts were two for roundtrip/idle/delayed, five for concurrent/many-to-one, and three for backlog including prefill. These counts exclude the separately reported coordinator. Raw child footers retain final CPU time and high-water RSS.
 
@@ -63,8 +63,4 @@ The clock probe bounded the possible offset to -3781 through 4223 ns and passed.
 
 Doctrine floors delay milliseconds to seconds and stores eligibility at second resolution. Stored-deadline lateness and requested-deadline lateness are therefore different measurements. The successful measured delayed repetition had stored-deadline p95 lateness of about 112.84 ms. That does not establish millisecond-delay compatibility. The separate 300 ms probe and quantization fields preserve the discrepancy.
 
-Task 08 must not compare an early baseline delivery against a correctly delayed broker delivery and call the baseline faster. The concurrent failures, insufficient tail samples, and delay-precision mismatch remain explicit limits on later comparison, not reasons to weaken broker durability or discard failed runs.
-
-## Correctness validation
-
-`composer qa` passed with 27 tests and 123 assertions. Benchmark tests cover percentile math, negative correlated timings, delayed quantization, missing/duplicate/failing samples, incomplete reports, process timeout cleanup, and real Doctrine commit/ACK visibility with a binary payload. Performance workloads remain outside QA.
+An early baseline delivery is not a valid speed advantage over a correctly delayed broker delivery. The concurrent failures, insufficient tail samples, and delay-precision mismatch remain explicit limits on later comparison, not reasons to weaken broker durability or discard failed runs.

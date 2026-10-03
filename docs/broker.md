@@ -79,11 +79,13 @@ if (null !== $delivery) {
 }
 ```
 
-The default visibility timeout is 5,000 milliseconds. Both broker commands accept `--visibility-timeout=60000` for a 60,000-millisecond lease. Choose a duration for your handlers; this example is not a universal safety guarantee. There is no lease renewal. The bundle accepts `sqlite_queue.visibility_timeout`; an explicit CLI value wins over bundle configuration, which wins over the 5,000ms default. The standalone command does not load bundle configuration. Client communication timeouts are separate and do not change the lease.
+The default reservation lasts 60 seconds. Both broker commands accept `--redeliver-timeout=60` in positive integer seconds. Choose a duration that covers your handlers; there is no lease renewal. For the bundle command, an explicit CLI value overrides `sqlite_queue.redeliver_timeout`, which defaults to 60. The standalone command does not load bundle configuration.
+
+The PHP `BrokerFactory::visibilityTimeout` argument uses milliseconds and defaults to 60,000. Client communication timeouts are separate and do not change reservation expiry. The default communication allowance is 10 seconds, plus the requested duration for WAIT.
 
 An unacknowledged reservation becomes eligible again at its persisted deadline. Closing a client does not shorten that deadline. PHP callers can construct `BrokerFactory` with `visibilityTimeout` and call `create()`. For an application-owned cancellation token, pass it to `Broker::run()`.
 
-The Messenger bundle maps WAIT onto native consumer idle events for one literal receiver when `--sleep` is omitted or zero. See [Messenger idle behavior and limits](messenger.md#native-consume-idle-behavior).
+The Messenger bundle maps WAIT onto native consumer idle events for one literal receiver when `--sleep` is omitted or zero. See [Messenger idle behavior and limits](messenger.md#idle-waits).
 
 ## Recover from a failed exchange
 
@@ -95,20 +97,10 @@ Client methods accept an optional Amp `Cancellation`. Cancellation during an exc
 
 Send SIGTERM or SIGINT, or press Ctrl-C in the foreground terminal. Wait for process exit before restarting. Normal stop removes the owned socket but preserves the database. Symfony FlockStore lock sidecars stay on disk under the private resource directories, which preserves the lock namespace.
 
-The command registers a one-second event-loop timer to prevent an indefinite select wait when a signal arrives between the driver's signal check and its select call. This timer does not poll storage.
+Shutdown shares one five-second cleanup budget across client draining, storage close, and SQLite worker teardown. If that budget expires, the broker attempts to terminate its SQLite worker. It removes only its own socket and then releases the database and endpoint locks.
 
-The five-second budget is armed on the first shutdown request, inside `stop()` and before the server or any client socket closes, so the deadline covers every step that follows. Repeated requests, including the serving loop's own, share that one deadline and never re-arm it. The deadline is disarmed once every awaited step has returned; a shutdown that finishes inside the budget never fires it.
+The cleanup budget is not an exact process-exit deadline. Signal delivery and process reaping depend on the operating system. A stalled event loop or a stopped child or shell launcher can prevent cleanup from finishing. Configure the supervisor to terminate and reap the whole process tree after its grace period.
 
-Shutdown shares one five-second budget across the client drain, storage close, SQLite worker pipe observation, and child monitor. No step starts a fresh clock. `SqliteQueueStorage` owns the connection; `Queue` supplies message policy without SQL or connection lifecycle code. The broker closes storage during shutdown.
+If an endpoint remains after an abrupt exit, do not delete it just because a connection attempt fails. Verify that no broker or other listener owns it before removal, or choose another endpoint. Startup refuses existing sockets, regular files, and symlinks.
 
-When the budget expires, the broker terminates the worker through `SqliteWorkerHandle`. Repeating the driver's graceful close cannot interrupt it because the driver marks the connection closed before awaiting completion. Vendor `SqliteConnector` calls `SqliteWorkerContextFactory`, which retains a handle to the same worker Amp starts. The driver alone joins that context. This workaround remains until the driver offers bounded close or abort support.
-
-Steps that take no cancellation, such as storage close, run in their own fiber and are awaited with the same budget. A step abandoned at the deadline can finish or fail later; its outcome is ignored. The broker attempts every cleanup step and preserves the first failure. After worker shutdown, it removes the endpoint only if its device and inode still match, then releases `BrokerLifetimeLocks`. The lock component does not prepare files or remove sockets.
-
-The budget bounds what the broker waits for, not the exact wall-clock duration of the exit. Signal delivery, process teardown, and reaping are scheduled by the operating system. The broker owns the persistence child it starts, not the shell launcher Amp creates around it: a launcher that is stopped rather than killed is left for its supervisor to reap.
-
-Worker pipe reads are cancellable, so an expired budget releases their event-loop watchers. A pending driver close can remain until an external launcher resumes or exits. Normal SIGTERM shutdown and SIGKILL worker failure/recovery have process coverage. Shutdown with a deliberately SIGSTOPped worker is excluded from the release requirements by explicit scope decision. Its historical intermittent hang was not diagnosed or fixed by removing that test.
-
-If an endpoint remains after an abrupt exit, do not remove it merely because a connection attempt fails. Verify that no broker or other listener owns it before removing it, or choose a new endpoint. Startup refuses existing sockets, regular files, and symlinks.
-
-See the [protocol reference](broker-protocol.md) for exact framing, deadlines, errors, and ownership requirements. See [AGENTS.md](../AGENTS.md) for validation commands and report locations.
+See the [protocol reference](broker-protocol.md) for framing, deadlines, errors, and ownership requirements.

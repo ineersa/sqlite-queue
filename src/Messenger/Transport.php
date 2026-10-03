@@ -73,7 +73,7 @@ final class Transport implements TransportInterface, CloseableTransportInterface
         try {
             $delivery = $this->operations->client()->receive($this->queue->value);
         } catch (ClientTransportException|ProtocolException $error) {
-            throw $this->transportFailure('Could not receive from the queue broker.', $error);
+            throw new TransportException('Could not receive from the queue broker.', 0, $error);
         }
 
         if (null === $delivery) {
@@ -111,7 +111,7 @@ final class Transport implements TransportInterface, CloseableTransportInterface
         try {
             $id = $this->operations->client()->send($this->queue->value, $encoded['body'], $headers, $delay);
         } catch (ClientTransportException|ProtocolException $error) {
-            throw $this->transportFailure('Could not send to the queue broker.', $error);
+            throw new TransportException('Could not send to the queue broker.', 0, $error);
         }
 
         return $envelope->with(new TransportMessageIdStamp($id));
@@ -127,9 +127,9 @@ final class Transport implements TransportInterface, CloseableTransportInterface
         try {
             return $this->notifications->client($cancellation)->wait($this->queue->value, $timeoutMilliseconds, $cancellation);
         } catch (CancelledException $error) {
-            throw $this->transportFailure('Queue wait was cancelled.', $error);
+            throw new TransportException('Queue wait was cancelled.', 0, $error);
         } catch (ClientTransportException|ProtocolException $error) {
-            throw $this->transportFailure('Could not wait on the queue broker.', $error);
+            throw new TransportException('Could not wait on the queue broker.', 0, $error);
         }
     }
 
@@ -159,9 +159,9 @@ final class Transport implements TransportInterface, CloseableTransportInterface
                 $this->operations->client()->reject($stamp->receipt);
             }
         } catch (InvalidReceiptException $error) {
-            throw $this->transportFailure('The delivery receipt is no longer valid.', $error);
+            throw new TransportException('The delivery receipt is no longer valid.', 0, $error);
         } catch (ClientTransportException|ProtocolException $error) {
-            throw $this->transportFailure($acknowledge ? 'Could not acknowledge the delivery.' : 'Could not reject the delivery.', $error);
+            throw new TransportException($acknowledge ? 'Could not acknowledge the delivery.' : 'Could not reject the delivery.', 0, $error);
         }
     }
 
@@ -218,7 +218,7 @@ final class Transport implements TransportInterface, CloseableTransportInterface
         try {
             $this->operations->client()->reject($received->receipt);
         } catch (InvalidReceiptException|ClientTransportException|ProtocolException $rejectError) {
-            throw $this->transportFailure('Could not reject a delivery after a decode failure.', $rejectError);
+            throw new TransportException('Could not reject a delivery after a decode failure.', 0, $rejectError);
         }
 
         throw new MessageDecodingFailedException($message, $code, $previous);
@@ -295,10 +295,5 @@ final class Transport implements TransportInterface, CloseableTransportInterface
         }
 
         return $normalized;
-    }
-
-    private function transportFailure(string $message, \Throwable $previous): TransportException
-    {
-        return new TransportException($message, 0, $previous);
     }
 }

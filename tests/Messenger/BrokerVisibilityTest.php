@@ -30,18 +30,21 @@ final class BrokerVisibilityTest extends TestCase
 {
     public static function configuredLeases(): iterable
     {
-        yield 'bundle configuration' => [[], 15000];
-        yield 'CLI override' => [['--visibility-timeout' => '20000'], 20000];
+        yield 'bundle configuration' => [[], 15000, 15];
+        yield 'CLI override' => [['--redeliver-timeout' => '20'], 20000, 15];
+        yield 'default' => [[], 60000, null];
     }
 
     #[DataProvider('configuredLeases')]
-    public function testNativeBrokerLeaseSurvivesSixSecondHandler(array $options, int $lease): void
+    public function testNativeBrokerLeaseSurvivesSixSecondHandler(array $options, int $lease, ?int $configuredSeconds): void
     {
         $fixture = new IsolatedDatabase();
         $project = $fixture->directory().'/app';
         $filesystem = new Filesystem();
         $filesystem->mirror(__DIR__.'/Fixtures/NativeApp/config', $project.'/config');
-        $filesystem->dumpFile($project.'/config/packages/sqlite_queue.yaml', "sqlite_queue:\n    visibility_timeout: 15000\n");
+        if (null !== $configuredSeconds) {
+            $filesystem->dumpFile($project.'/config/packages/sqlite_queue.yaml', "sqlite_queue:\n    redeliver_timeout: $configuredSeconds\n");
+        }
         $clock = new MockClock('2026-10-03 00:00:00 UTC');
         $previousClock = Clock::get();
         Clock::set($clock);
@@ -111,21 +114,43 @@ final class BrokerVisibilityTest extends TestCase
 
     public static function invalidLeases(): iterable
     {
-        foreach (['0', '-1', '1.5', 'invalid', '9223372036854775808'] as $value) {
+        foreach (['0', '-1', '1.5', 'invalid', (string) (intdiv(\PHP_INT_MAX, 1000) + 1)] as $value) {
             yield $value => [$value];
         }
     }
 
-    public function testStandaloneDefaultKeepsFiveSecondVisibility(): void
+    public function testStandaloneDefaultKeepsSixtySecondRedelivery(): void
     {
-        $this->assertSame('5000', (new BrokerCommand())->getDefinition()->getOption('visibility-timeout')->getDefault());
+        $this->assertSame('60', (new BrokerCommand())->getDefinition()->getOption('redeliver-timeout')->getDefault());
+    }
+
+    public function testCommandAcceptsBothSecondBoundaries(): void
+    {
+        $this->assertSame('1', (new BrokerCommand(1))->getDefinition()->getOption('redeliver-timeout')->getDefault());
+        $maximum = intdiv(\PHP_INT_MAX, 1000);
+        $this->assertSame((string) $maximum, (new BrokerCommand($maximum))->getDefinition()->getOption('redeliver-timeout')->getDefault());
+    }
+
+    public static function invalidConfiguredSeconds(): iterable
+    {
+        yield 'zero' => [0, 'Redelivery timeout must be positive seconds.'];
+        yield 'negative' => [-1, 'Redelivery timeout must be positive seconds.'];
+        yield 'overflow' => [intdiv(\PHP_INT_MAX, 1000) + 1, 'Redelivery timeout exceeds the supported milliseconds range.'];
+    }
+
+    #[DataProvider('invalidConfiguredSeconds')]
+    public function testInvalidConfiguredSecondsAreRejected(int $seconds, string $message): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage($message);
+        new BrokerCommand($seconds);
     }
 
     #[DataProvider('invalidLeases')]
     public function testInvalidCliLeaseFailsBeforeStartup(string $value): void
     {
         $tester = new CommandTester(new BrokerCommand());
-        $this->assertSame(1, $tester->execute(['--visibility-timeout' => $value]));
+        $this->assertSame(1, $tester->execute(['--redeliver-timeout' => $value]));
         $this->assertStringContainsString('InvalidArgumentException', $tester->getDisplay());
     }
 }

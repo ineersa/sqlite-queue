@@ -7,6 +7,8 @@ namespace Ineersa\SqliteQueue\Messenger;
 use Amp\CancelledException;
 use Amp\DeferredCancellation;
 use Ineersa\SqliteQueue\Exception\TransportException as ClientTransportException;
+use Ineersa\SqliteQueue\Messenger\DTO\ConsumeWaitPendingDTO;
+use Ineersa\SqliteQueue\Messenger\DTO\ConsumeWaitSessionDTO;
 use Ineersa\SqliteQueue\Protocol\Limits;
 use Psr\Container\ContainerInterface;
 use Symfony\Component\Clock\ClockInterface;
@@ -35,23 +37,21 @@ use Symfony\Component\Messenger\Worker;
  * left untouched.
  *
  * Default wait budget is 1000ms, matching the stock Messenger sleep default. The budget is capped
- * by any native --time-limit deadline and by Limits::MAX_WAIT_MILLISECONDS. Stop listeners may
+ * by any native --time-limit deadline. Invalid budgets are rejected. Stop listeners may
  * mark the worker stopped before this callback runs; without a public shouldStop getter the
  * worst-case idle stop latency is one wait budget unless ConsoleEvents::SIGNAL cancels first.
  */
 final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
 {
     private const int DEFAULT_WAIT_BUDGET_MILLISECONDS = 1_000;
-    private const int MILLISECONDS_PER_SECOND = 1_000;
-    private const string RECEIVER_REGEX_METACHARACTERS = '.\\+*?[]^$(){}|';
 
-    /** @var \WeakMap<Command, NativeConsumeWaitPendingMutation> */
+    /** @var \WeakMap<Command, ConsumeWaitPendingDTO> */
     private \WeakMap $pendingByCommand;
 
-    /** @var \WeakMap<Worker, NativeConsumeWaitSession> */
+    /** @var \WeakMap<Worker, ConsumeWaitSessionDTO> */
     private \WeakMap $sessionsByWorker;
 
-    /** @var \WeakMap<Command, NativeConsumeWaitSession> */
+    /** @var \WeakMap<Command, ConsumeWaitSessionDTO> */
     private \WeakMap $sessionsByCommand;
 
     public function __construct(
@@ -109,9 +109,10 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         }
 
         $name = $receivers[0];
-        // Native consume interprets even existing receiver names as regular expressions.
+        // Symfony 8.1 interprets receiver arguments as anchored regular expressions.
+        // Symfony 8.0 uses literal names; use the same conservative activation on both.
         // Do not change its sleep default when one name could select several receivers.
-        if (false !== strpbrk($name, self::RECEIVER_REGEX_METACHARACTERS)) {
+        if (preg_quote($name, '{') !== $name) {
             return;
         }
         if (!$this->receiverLocator->has($name)) {
@@ -125,7 +126,7 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         $option = $command->getDefinition()->getOption('sleep');
         $originalDefault = $option->getDefault();
         $mutateDefault = ExplicitSleep::Omitted === $explicitSleep;
-        $pending = new NativeConsumeWaitPendingMutation(
+        $pending = new ConsumeWaitPendingDTO(
             $command,
             $receiver,
             $name,
@@ -149,19 +150,19 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
 
         $names = $event->getWorker()->getMetadata()->getTransportNames();
         if ([0 => $pending->receiverName] !== $names) {
-            $this->restorePendingSleepDefault($pending);
+            $this->restoreSleepDefault($pending);
 
             return;
         }
 
         $idleTimeout = $this->idleTimeoutMicroseconds($event);
         if (null !== $idleTimeout && 0 !== $idleTimeout) {
-            $this->restorePendingSleepDefault($pending);
+            $this->restoreSleepDefault($pending);
 
             return;
         }
 
-        $session = new NativeConsumeWaitSession(
+        $session = new ConsumeWaitSessionDTO(
             $pending->command,
             $pending->transport,
             $pending->receiverName,
@@ -231,9 +232,7 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         unset($this->sessionsByWorker[$event->getWorker()]);
         unset($this->sessionsByCommand[$session->command]);
         $session->stop->cancel();
-        if ($session->sleepDefaultMutated) {
-            $this->restoreSleepDefault($session->command, $session->originalSleepDefault);
-        }
+        $this->restoreSleepDefault($session);
     }
 
     public function onConsoleTerminate(ConsoleTerminateEvent $event): void
@@ -261,7 +260,7 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         $pending = $this->pendingByCommand[$command] ?? null;
         if (null !== $pending) {
             unset($this->pendingByCommand[$command]);
-            $this->restorePendingSleepDefault($pending);
+            $this->restoreSleepDefault($pending);
         }
 
         $session = $this->sessionsByCommand[$command] ?? null;
@@ -271,26 +270,24 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         unset($this->sessionsByCommand[$command]);
         unset($this->sessionsByWorker[$session->worker]);
         $session->stop->cancel();
-        if ($session->sleepDefaultMutated) {
-            $this->restoreSleepDefault($session->command, $session->originalSleepDefault);
-        }
+        $this->restoreSleepDefault($session);
     }
 
     private function restoreAllPending(): void
     {
         foreach ($this->pendingByCommand as $command => $pending) {
             unset($this->pendingByCommand[$command]);
-            $this->restorePendingSleepDefault($pending);
+            $this->restoreSleepDefault($pending);
         }
     }
 
-    private function takePending(): ?NativeConsumeWaitPendingMutation
+    private function takePending(): ?ConsumeWaitPendingDTO
     {
         foreach ($this->pendingByCommand as $command => $pending) {
             unset($this->pendingByCommand[$command]);
             foreach ($this->pendingByCommand as $extraCommand => $extraPending) {
                 unset($this->pendingByCommand[$extraCommand]);
-                $this->restorePendingSleepDefault($extraPending);
+                $this->restoreSleepDefault($extraPending);
             }
 
             return $pending;
@@ -299,25 +296,22 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         return null;
     }
 
-    private function restorePendingSleepDefault(NativeConsumeWaitPendingMutation $pending): void
+    private function restoreSleepDefault(ConsumeWaitPendingDTO|ConsumeWaitSessionDTO $state): void
     {
-        if (!$pending->sleepDefaultMutated) {
-            return;
+        if ($state->sleepDefaultMutated) {
+            $state->command->getDefinition()->getOption('sleep')->setDefault($state->originalSleepDefault);
         }
-        $this->restoreSleepDefault($pending->command, $pending->originalSleepDefault);
     }
 
-    private function restoreSleepDefault(Command $command, int|string|float|bool|null $originalDefault): void
+    private function waitTimeoutMilliseconds(ConsumeWaitSessionDTO $session): int
     {
-        if (!$command->getDefinition()->hasOption('sleep')) {
-            return;
+        $timeout = $session->waitBudgetMilliseconds;
+        if ($timeout < 1) {
+            throw new \InvalidArgumentException('Wait budget must be positive milliseconds.');
         }
-        $command->getDefinition()->getOption('sleep')->setDefault($originalDefault);
-    }
-
-    private function waitTimeoutMilliseconds(NativeConsumeWaitSession $session): int
-    {
-        $timeout = min($session->waitBudgetMilliseconds, Limits::MAX_WAIT_MILLISECONDS);
+        if ($timeout > Limits::MAX_WAIT_MILLISECONDS) {
+            throw new \InvalidArgumentException('Wait budget exceeds the protocol maximum.');
+        }
         if (null === $session->deadline) {
             return $timeout;
         }
@@ -327,10 +321,10 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
             return 0;
         }
 
-        $budgetSeconds = $timeout / self::MILLISECONDS_PER_SECOND;
+        $budgetSeconds = $timeout / 1000;
         $waitSeconds = min($budgetSeconds, $remainingSeconds);
 
-        return (int) ceil($waitSeconds * self::MILLISECONDS_PER_SECOND);
+        return (int) ceil($waitSeconds * 1000);
     }
 
     // Keep the version-dependent event API structural: these methods exist only in 8.1+.
@@ -402,7 +396,7 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         return ExplicitSleep::Invalid;
     }
 
-    private function isStopCancellation(NativeConsumeWaitSession $session, \Throwable $error): bool
+    private function isStopCancellation(ConsumeWaitSessionDTO $session, \Throwable $error): bool
     {
         if (!$session->stop->isCancelled()) {
             return false;

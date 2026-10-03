@@ -1,16 +1,24 @@
-# Copy into config/packages/messenger.yaml in your Symfony application.
-# Replace the endpoint and message class with your application's values.
-# Choose visibility for your handler duration; this example does not renew leases.
+# Copy into config/packages/messenger.yaml.
+# Replace the message classes and endpoint with your application's values.
+# Redelivery is seconds. Choose a duration that covers processing and batch flushes.
 sqlite_queue:
-    visibility_timeout: 60000
+    redeliver_timeout: 60
+
 framework:
     messenger:
         transports:
-            async:
-                dsn: 'sqlite-queue://jobs'
+            email:
+                dsn: 'sqlite-queue://emails'
+                options:
+                    endpoint: '/tmp/sqlite-queue-demo/queue.sock'
+                    timeout: 10
+                serializer: messenger.transport.native_php_serializer
+            reports:
+                dsn: 'sqlite-queue://reports'
                 options:
                     endpoint: '/tmp/sqlite-queue-demo/queue.sock'
                     timeout: 10
                 serializer: messenger.transport.native_php_serializer
         routing:
-            'App\Message\ExampleMessage': async
+            'App\Message\SendWelcomeEmail': email
+            'App\Message\GenerateMonthlyReport': reports
