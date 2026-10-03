@@ -7,7 +7,10 @@ namespace Ineersa\SqliteQueue\Command;
 use Amp\DeferredCancellation;
 use Ineersa\SqliteQueue\Broker\BrokerEventEnum;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
+use Ineersa\SqliteQueue\Queue;
 use Revolt\EventLoop;
+use Symfony\Component\Clock\Clock;
+use Symfony\Component\Clock\ClockInterface;
 use Symfony\Component\Console\Attribute\AsCommand;
 use Symfony\Component\Console\Command\Command as BaseCommand;
 use Symfony\Component\Console\Input\InputInterface;
@@ -18,6 +21,8 @@ use Symfony\Component\Console\Output\OutputInterface;
 #[AsCommand(name: 'broker', description: 'Run the foreground SQLite queue broker on a private local Unix socket.')]
 final class BrokerCommand extends BaseCommand
 {
+    public const int DEFAULT_REDELIVER_TIMEOUT_SECONDS = Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS / 1000;
+
     /**
      * Upper bound, in seconds, on how long the serving loop may wait for events without waking.
      *
@@ -30,11 +35,26 @@ final class BrokerCommand extends BaseCommand
      */
     private const float SIGNAL_DISPATCH_INTERVAL_SECONDS = 1.0;
 
+    /** Standalone defaults match queue policy and use the wall clock; injection supports controlled runtime clocks. */
+    public function __construct(
+        private readonly int $redeliverTimeoutSeconds = self::DEFAULT_REDELIVER_TIMEOUT_SECONDS,
+        private readonly ClockInterface $clock = new Clock(),
+    ) {
+        if ($redeliverTimeoutSeconds <= 0) {
+            throw new \InvalidArgumentException('Redelivery timeout must be positive seconds.');
+        }
+        if ($redeliverTimeoutSeconds > intdiv(\PHP_INT_MAX, 1000)) {
+            throw new \InvalidArgumentException('Redelivery timeout exceeds the supported milliseconds range.');
+        }
+        parent::__construct();
+    }
+
     protected function configure(): void
     {
         $this
             ->addOption('database', null, InputOption::VALUE_REQUIRED, 'Absolute path to the private queue database file.')
             ->addOption('endpoint', null, InputOption::VALUE_REQUIRED, 'Absolute path to the private Unix socket file.')
+            ->addOption('redeliver-timeout', null, InputOption::VALUE_REQUIRED, 'Reservation redelivery timeout in seconds.', (string) $this->redeliverTimeoutSeconds)
             ->setHelp('Readiness, framing bounds, lifetime locks, failure handling, and client recovery are documented in docs/broker-protocol.md.');
     }
 
@@ -45,6 +65,13 @@ final class BrokerCommand extends BaseCommand
         try {
             $database = $input->getOption('database');
             $endpoint = $input->getOption('endpoint');
+            $redeliverTimeoutSeconds = filter_var($input->getOption('redeliver-timeout'), \FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+            if (false === $redeliverTimeoutSeconds) {
+                throw new \InvalidArgumentException('--redeliver-timeout must be positive integer seconds.');
+            }
+            if ($redeliverTimeoutSeconds > intdiv(\PHP_INT_MAX, 1000)) {
+                throw new \InvalidArgumentException('--redeliver-timeout exceeds the supported milliseconds range.');
+            }
             if (!\is_string($database) || '' === $database || !\is_string($endpoint) || '' === $endpoint) {
                 throw new \InvalidArgumentException('Both --database and --endpoint are required.');
             }
@@ -64,7 +91,13 @@ final class BrokerCommand extends BaseCommand
             $watchers[] = EventLoop::repeat(self::SIGNAL_DISPATCH_INTERVAL_SECONDS, static function (): void {
             });
 
-            $broker = (new BrokerFactory($database, $endpoint, cancellation: $shutdown->getCancellation()))->create();
+            $broker = (new BrokerFactory(
+                $database,
+                $endpoint,
+                visibilityTimeout: $redeliverTimeoutSeconds * 1000,
+                clock: fn (): int => $this->nowMilliseconds(),
+                cancellation: $shutdown->getCancellation(),
+            ))->create();
             $code = $broker->run(function (array $event) use ($output): void {
                 $this->write($event, $output);
             }, $shutdown->getCancellation());
@@ -80,6 +113,13 @@ final class BrokerCommand extends BaseCommand
                 EventLoop::cancel($watcher);
             }
         }
+    }
+
+    private function nowMilliseconds(): int
+    {
+        $now = $this->clock->now();
+
+        return $now->getTimestamp() * 1000 + (int) $now->format('v');
     }
 
     /** @param array<string, int|string> $event */

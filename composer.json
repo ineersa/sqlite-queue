@@ -2,7 +2,7 @@
     "name": "ineersa/sqlite-queue",
     "description": "Sqlite based queue broker",
     "license": "MIT",
-    "type": "library",
+    "type": "symfony-bundle",
     "bin": ["bin/sqlite-queue"],
     "require": {
         "php": "^8.5",
@@ -13,8 +13,11 @@
         "amphp/sync": "^2.3",
         "fabpot/amphp-sqlite3": "^1.0",
         "revolt/event-loop": "^1.0",
+        "symfony/clock": "^8.0",
+        "symfony/console": "^8.0",
         "symfony/filesystem": "^8.0",
-        "symfony/lock": "^8.0"
+        "symfony/lock": "^8.0",
+        "symfony/messenger": "^8.0"
     },
     "require-dev": {
         "ext-pcntl": "*",
@@ -27,17 +30,17 @@
         "phpstan/phpstan-phpunit": "^2.0",
         "phpstan/phpstan-strict-rules": "^2.0",
         "phpunit/phpunit": "^13.2",
-        "symfony/console": "^8.0",
+        "symfony/dependency-injection": "^8.0",
         "symfony/doctrine-messenger": "^8.0",
         "symfony/event-dispatcher": "^8.0",
-        "symfony/messenger": "^8.0",
-        "symfony/process": "^8.0"
+        "symfony/framework-bundle": "^8.0",
+        "symfony/process": "^8.0",
+        "symfony/yaml": "^8.0"
     },
     "suggest": {
         "ext-pcntl": "Required to run the foreground broker with signal handling.",
         "ext-posix": "Required to run the foreground broker with private file ownership checks.",
-        "symfony/console": "Required for the sqlite-queue CLI command (^8.0), but not for the PHP APIs.",
-        "symfony/messenger": "Required to use the Symfony Messenger transport adapter."
+        "symfony/framework-bundle": "Required for automatic transport and broker command registration in Symfony apps (^8.0)."
     },
     "autoload": {
         "psr-4": {

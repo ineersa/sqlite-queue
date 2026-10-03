@@ -43,6 +43,12 @@ function test(#[AsOption(description: 'PHPUnit test-name filter.')] ?string $fil
     return run_tests('test', null, $filter);
 }
 
+#[AsTask(name: 'test:flex', namespace: '', description: 'Install into a real no-dev Flex app; requires network and saves reports.')]
+function test_flex(): int
+{
+    return report('test:flex', ['bash', 'tests/Messenger/Fixtures/flex-install.sh'], timeout: null);
+}
+
 #[AsTask(name: 'test:driver', namespace: '', description: 'Run async-driver tests; save JUnit XML and logs.')]
 function test_driver(#[AsOption(description: 'PHPUnit test-name filter.')] ?string $filter = null): int
 {

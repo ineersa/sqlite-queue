@@ -1,8 +1,6 @@
 # Baseline method v1
 
-This reference fixes the Task 02 measurement method before a broker candidate exists. The runner uses the standard Symfony Doctrine transport, `PhpSerializer`, a real Messenger `Worker`, and a payload-verification handler. There is no application kernel, fake candidate, or custom claim SQL.
-
-`bin/benchmark` registers Symfony Console commands through Composer's development PSR-4 mapping. `RunCommand` handles options and cancellation; `Benchmark` owns the capture schedule, and `Runner` owns one repetition. Worker commands delegate to publisher or consumer classes. Symfony Process starts and stops children with an explicitly isolated environment. The internal clock command exists to verify cross-process timestamp subtraction, not to measure queue throughput.
+This reference defines the Doctrine SQLite baseline measurement method. The runner uses the standard Symfony Doctrine transport, `PhpSerializer`, a real Messenger `Worker`, and a payload-verification handler. There is no application kernel, fake candidate, or custom claim SQL.
 
 ## Workloads and budgets
 
@@ -27,7 +25,7 @@ The idle workload is the controlled offered-load case. Targets advance from one 
 
 Every DBAL connection explicitly sets WAL, synchronous FULL, a 5000 ms busy timeout, and a 1000-page auto-checkpoint. The runner reads back effective settings on each child connection. Schema setup finishes before children start. An explicit final `wal_checkpoint(TRUNCATE)` runs outside measured operations and its result is recorded.
 
-Focused tests verify that a second connection observes a confirmed send and the deletion after a confirmed ACK. This is commit-boundary evidence, not a power-loss test. SQLite and the filesystem still determine power-loss guarantees.
+Confirmed send and ACK are measured at the commit boundary. This is not a power-loss test; SQLite and the filesystem still determine power-loss guarantees.
 
 Children receive a minimal environment, explicit file paths, and no inherited application DSN. Readiness files include their actual PIDs. Start files carry parent clock readings. Every child has a finite runtime; the coordinator has a repetition deadline and a TERM/KILL cleanup path. Database cleanup names only the files it created. Raw evidence remains under the unique run directory.
 
@@ -59,12 +57,12 @@ A send can commit before its confirmation reaches the publisher. Negative confir
 
 The coordinator samples descendant CPU, resident memory, and process count. Sampled tree peaks are lower bounds, not exact simultaneous peaks. Each child's final `getrusage()` records CPU time and high-water RSS, and its footer records PHP peak memory. Missing footers mean final resource totals are incomplete. The coordinator's CPU and PHP peak memory are reported separately. Idle CPU is the sampled child-tree CPU delta during the explicit empty interval. The baseline owns no broker or persistence worker; the candidate must include both.
 
-The coordinator checks child progress and samples resources at roughly 20 ms intervals. After publishers finish, it also queries the shared database inventory at that interval until the queue drains. These reads add measurement overhead. Task 08 must match this cadence and diagnostic cost, or revise the method and capture both backends again.
+The coordinator checks child progress and samples resources at roughly 20 ms intervals. After publishers finish, it also queries the shared database inventory at that interval until the queue drains. These reads add measurement overhead. A comparison must match this cadence and diagnostic cost, or revise the method and capture both backends again.
 
 The machine record includes PHP/SQLite/dependency versions, source revision and dirty state, per-file benchmark hashes, lock hash, CPU, storage mount, workload settings, and debug extensions. Artifact retention includes every raw sample and child error.
 
 ## Later comparison
 
-Task 08 must use the real adapter, matched durability, payloads, serialization, handler, counts, and diagnostics. Pickup differs intentionally: baseline polling versus candidate notifications. Record both configurations.
+A broker comparison must use the real adapter and match durability, payloads, serialization, handler, counts, and diagnostics. Pickup differs intentionally: baseline polling versus candidate notifications. Record both configurations.
 
-Use alternating paired backend order across repetitions. Keep startup separate, preserve failures, and compare individual-run variation rather than only pooled percentiles. Before a tail claim, collect at least 1000 successful samples per workload, payload size, and repetition on both backends under a declared revised budget. Re-run the baseline with that budget before candidate tuning. A failure-heavy or statistically inconclusive baseline cannot establish a speedup. Neutral or regressing evidence pauses adoption rather than justifying weaker durability.
+Use alternating paired backend order across repetitions. Keep startup separate, preserve failures, and compare individual-run variation rather than only pooled percentiles. Before a tail claim, collect at least 1000 successful samples per workload, payload size, and repetition on both backends under a declared revised budget. Re-run the baseline with that budget before candidate tuning. A failure-heavy or statistically inconclusive baseline cannot establish a speedup. Neutral or slower results do not justify weaker durability.

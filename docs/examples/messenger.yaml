@@ -1,0 +1,24 @@
+# Copy into config/packages/messenger.yaml.
+# Replace the message classes and endpoint with your application's values.
+# Redelivery is seconds. Choose a duration that covers processing and batch flushes.
+sqlite_queue:
+    redeliver_timeout: 60
+
+framework:
+    messenger:
+        transports:
+            email:
+                dsn: 'sqlite-queue://emails'
+                options:
+                    endpoint: '/tmp/sqlite-queue-demo/queue.sock'
+                    timeout: 10
+                serializer: messenger.transport.native_php_serializer
+            reports:
+                dsn: 'sqlite-queue://reports'
+                options:
+                    endpoint: '/tmp/sqlite-queue-demo/queue.sock'
+                    timeout: 10
+                serializer: messenger.transport.native_php_serializer
+        routing:
+            'App\Message\SendWelcomeEmail': email
+            'App\Message\GenerateMonthlyReport': reports

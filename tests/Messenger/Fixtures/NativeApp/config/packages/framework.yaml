@@ -1,0 +1,57 @@
+framework:
+    secret: 'native-integration-test'
+    test: true
+    php_errors:
+        log: false
+    messenger:
+        failure_transport: null
+        transports:
+            failed:
+                # NativeKernel supplies this real Doctrine receiver's connection directly.
+                dsn: 'doctrine://fixture'
+                serializer: messenger.transport.native_php_serializer
+            async_failure:
+                dsn: '%env(NATIVE_ASYNC_DSN)%'
+                serializer: messenger.transport.native_php_serializer
+                failure_transport: failed
+                retry_strategy:
+                    max_retries: 1
+                    delay: 50
+                    multiplier: 1
+                    max_delay: 50
+                    jitter: 0.0
+            async:
+                dsn: '%env(NATIVE_ASYNC_DSN)%'
+                serializer: messenger.transport.native_php_serializer
+                retry_strategy:
+                    max_retries: 1
+                    delay: 50
+                    multiplier: 1
+                    max_delay: 50
+                    jitter: 0.0
+            async_terminal:
+                dsn: '%env(NATIVE_ASYNC_DSN)%'
+                serializer: messenger.transport.native_php_serializer
+                retry_strategy:
+                    max_retries: 0
+                    delay: 0
+                    multiplier: 1
+                    max_delay: 0
+                    jitter: 0.0
+            sync_probe:
+                dsn: 'in-memory://'
+                serializer: messenger.transport.native_php_serializer
+            async-high:
+                dsn: '%env(NATIVE_ASYNC_DSN)%'
+                serializer: messenger.transport.native_php_serializer
+            'async:high':
+                dsn: '%env(NATIVE_ASYNC_DSN)%'
+                serializer: messenger.transport.native_php_serializer
+            'async.alpha':
+                dsn: '%env(NATIVE_ASYNC_DSN)%'
+                serializer: messenger.transport.native_php_serializer
+            asyncXalpha:
+                dsn: 'in-memory://'
+                serializer: messenger.transport.native_php_serializer
+        routing:
+            Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeProbeMessage: async

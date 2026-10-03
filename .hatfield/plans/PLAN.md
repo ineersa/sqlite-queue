@@ -36,8 +36,8 @@ Read this plan before the assigned task. The task files divide the work; they do
 | [02: benchmark baseline](TASK-02-BENCHMARK-BASELINE.md) | Done. Package-local runner and recorded standard Messenger SQLite baseline, including failures | 01 |
 | [03: async SQLite queue](TASK-03-ASYNC-SQLITE-QUEUE.md) | Done. Durable engine, atomic claims, receipts, persisted delayed availability | 01 |
 | [04: broker and client](TASK-04-BROKER-AND-CLIENT.md) | Done for the approved SIGTERM/SIGKILL scope. Bounded sockets and foreground service | 03 |
-| [05: delayed wakeups](TASK-05-DELAYED-WAKEUPS.md) | Implemented. Bounded WAIT, deadline scheduling, restart and cancellation. PR #6 under review | 04 |
-| [06: Messenger adapter](TASK-06-MESSENGER-ADAPTER.md) | Real worker integration, serializers, DelayStamp, retry/idle mapping | 05 |
+| [05: delayed wakeups](TASK-05-DELAYED-WAKEUPS.md) | Done. Bounded WAIT, deadline scheduling, restart and cancellation. PR #6 merged | 04 |
+| [06: Messenger adapter](TASK-06-MESSENGER-ADAPTER.md) | Implemented, PR #7 awaiting user review; not merged. Native consume, serializers, delay/retry mapping. QA 350/2098; isolated 8.0 adapter/native 68/327 | 05 |
 | [07: failure and lifecycle proof](TASK-07-FAILURE-AND-LIFECYCLE-PROOF.md) | Remaining cross-component fault cases and independent safety review | 06 |
 | [08: benchmark and MVP acceptance](TASK-08-BENCHMARK-AND-MVP-ACCEPTANCE.md) | Actual A/B comparison, documentation, package acceptance | 02 and 07 |
 
@@ -266,9 +266,9 @@ The package stays `ineersa/sqlite-queue` with `Ineersa\SqliteQueue\` mapped to `
 
 The supported matrix is PHP `^8.5` and Symfony Messenger `^8.0`, verified on PHP 8.5.10 and
 v8.1.7. PHP 8.4.25 passes the driver suite but is not supported; PHP 8.6 and later, and
-Symfony 9 and later, are unverified. Messenger stays a development dependency until the
-adapter lands, then becomes an optional runtime requirement so the engine and client still run
-without Symfony.
+Symfony 9 and later, are unverified. Console, Messenger, and Clock are runtime dependencies.
+FrameworkBundle is optional for standalone APIs and required for application integration.
+Native integration also passed isolated Symfony 8.0 tests; see Task 06 evidence.
 
 The foreground command is `sqlite-queue broker`. Client send, immediate receive, acknowledge,
 reject, close, and bounded wait are documented in [broker usage](../../docs/broker.md). No
@@ -329,7 +329,9 @@ connection with no replay. In the inspected Symfony worker, the idle event is fo
 remaining configured sleep interval. Waking promptly and then sleeping for the rest of that
 interval defeats part of the design. Recheck the selected version and integrate through
 supported facilities without a busy loop, skipped worker limits, or hidden changes to unrelated
-transports. Task 05 does not implement the Messenger adapter.
+transports. Task 06 implements native consume idle WAIT with zero native sleep for one literal
+receiver, while explicit positive sleep, multiple receivers, and regex-like names retain polling.
+Non-signal idle stops can incur one 1,000ms WAIT budget. See the [Messenger reference](../../docs/messenger.md).
 
 Batch receive is deferred. Do not promise a batch API to satisfy a hypothetical future Symfony version. Preserve the actual supported receiver contract and validate compatibility with a real worker.
 

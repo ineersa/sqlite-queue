@@ -33,14 +33,14 @@ final class BrokerFactory
     private const int RELEASE_BUDGET_SECONDS = 5;
 
     /**
-     * @param int                    $visibilityTimeout redelivery delay in milliseconds; 5000 is the approved product default
+     * @param int                    $visibilityTimeout redelivery delay in milliseconds; defaults to Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS
      * @param (\Closure(): int)|null $clock             deterministic millisecond clock for tests; the wall clock otherwise
      * @param ?Cancellation          $cancellation      cooperative cancellation for the blocking startup only; serving cancellation stays on Broker::run()
      */
     public function __construct(
         private readonly string $database,
         private readonly string $endpoint,
-        private readonly int $visibilityTimeout = 5000,
+        private readonly int $visibilityTimeout = Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS,
         private readonly ?\Closure $clock = null,
         private readonly ?Cancellation $cancellation = null,
     ) {

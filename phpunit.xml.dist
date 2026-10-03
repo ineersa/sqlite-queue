@@ -11,6 +11,9 @@
         <testsuite name="broker">
             <directory>tests/Broker</directory>
         </testsuite>
+        <testsuite name="messenger">
+            <directory>tests/Messenger</directory>
+        </testsuite>
         <testsuite name="queue">
             <directory>tests/Queue</directory>
         </testsuite>
