@@ -41,6 +41,12 @@ framework:
             sync_probe:
                 dsn: 'in-memory://'
                 serializer: messenger.transport.native_php_serializer
+            async-high:
+                dsn: '%env(NATIVE_ASYNC_DSN)%'
+                serializer: messenger.transport.native_php_serializer
+            'async:high':
+                dsn: '%env(NATIVE_ASYNC_DSN)%'
+                serializer: messenger.transport.native_php_serializer
             'async.alpha':
                 dsn: '%env(NATIVE_ASYNC_DSN)%'
                 serializer: messenger.transport.native_php_serializer

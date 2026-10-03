@@ -112,7 +112,8 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         // Symfony 8.1 interprets receiver arguments as anchored regular expressions.
         // Symfony 8.0 uses literal names; use the same conservative activation on both.
         // Do not change its sleep default when one name could select several receivers.
-        if (preg_quote($name, '{') !== $name) {
+        // In {^name$}, '-' and ':' are literal. Only operators and delimiters exclude WAIT.
+        if (false !== strpbrk($name, '.\\+*?[]^$(){}|')) {
             return;
         }
         if (!$this->receiverLocator->has($name)) {

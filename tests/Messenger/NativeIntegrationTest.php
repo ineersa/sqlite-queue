@@ -24,6 +24,7 @@ use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeProbeMe
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\NativeKernel;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\RequiresOperatingSystem;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
@@ -197,6 +198,47 @@ final class NativeIntegrationTest extends TestCase
             $this->assertSame(0, $consume->await(new TimeoutCancellation(self::SAFETY_SECONDS)));
             $this->assertSame(['woke'], NativeProbeMessageHandler::$handled);
             $this->assertSame([], $this->clock?->sleepCalls ?? []);
+        });
+    }
+
+    public static function literalReceiverInvocations(): iterable
+    {
+        yield 'hyphen, default sleep' => ['async-high', []];
+        yield 'hyphen, zero sleep' => ['async-high', ['--sleep' => '0']];
+        yield 'colon, default sleep' => ['async:high', []];
+        yield 'colon, zero sleep' => ['async:high', ['--sleep' => '0']];
+    }
+
+    #[DataProvider('literalReceiverInvocations')]
+    public function testLiteralReceiverRegistersWaitBeforePublication(string $receiver, array $options): void
+    {
+        $this->runAsync(function () use ($receiver, $options): void {
+            $this->startBroker();
+            $started = new DeferredFuture();
+            $this->eventDispatcher()->addListener(WorkerStartedEvent::class, static function (WorkerStartedEvent $event) use ($started): void {
+                $started->complete($event->getWorker());
+            });
+            $original = $this->consumeCommand()->getDefinition()->getOption('sleep')->getDefault();
+            $consume = async(fn (): int => $this->runConsume($options + [
+                'command' => 'messenger:consume',
+                'receivers' => [$receiver],
+                '--limit' => '1',
+            ]));
+            try {
+                $this->awaitNotifierWaiters(1);
+                $this->assertSame(1, $this->notifierWaiterCount());
+                $this->assertSame(1_000, $this->activeWaitDurationMilliseconds());
+                $this->publisher()->send(new Envelope(new NativeProbeMessage($receiver)));
+                $this->assertSame(0, $consume->await(new TimeoutCancellation(self::SAFETY_SECONDS)));
+                $this->assertSame([$receiver], NativeProbeMessageHandler::$handled);
+                $this->assertSame([], $this->clock->sleepCalls);
+                $this->assertSame($original, $this->consumeCommand()->getDefinition()->getOption('sleep')->getDefault());
+            } finally {
+                if ($started->isComplete()) {
+                    $started->getFuture()->await()->stop();
+                }
+                $consume->await(new TimeoutCancellation(self::SAFETY_SECONDS));
+            }
         });
     }
 
