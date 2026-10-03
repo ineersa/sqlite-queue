@@ -30,6 +30,8 @@ final class GatingSocket implements Socket, \IteratorAggregate
         private readonly Socket $inner,
         private readonly WriteGate $gate,
         private readonly int $thresholdBytes,
+        // Small mutation replies can be gated without blocking initial client acquisition.
+        private readonly bool $skipHello = false,
     ) {
     }
 
@@ -40,7 +42,7 @@ final class GatingSocket implements Socket, \IteratorAggregate
 
     public function write(string $bytes): void
     {
-        if (\strlen($bytes) > $this->thresholdBytes) {
+        if (\strlen($bytes) > $this->thresholdBytes && (!$this->skipHello || !str_contains($bytes, '"max_payload"'))) {
             $this->gate->markEntered(\strlen($bytes));
             $this->gate->released()->await();
             if ($this->closed || $this->inner->isClosed()) {

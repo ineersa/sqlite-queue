@@ -23,6 +23,8 @@ final class GatingServerSocket implements ServerSocket
         private readonly ServerSocket $inner,
         private readonly WriteGate $gate,
         private readonly int $thresholdBytes,
+        // Opt-in handshake bypass permits barriers on small mutation confirmations.
+        private readonly bool $skipHello = false,
     ) {
     }
 
@@ -33,7 +35,7 @@ final class GatingServerSocket implements ServerSocket
             return null;
         }
 
-        return new GatingSocket($socket, $this->gate, $this->thresholdBytes);
+        return new GatingSocket($socket, $this->gate, $this->thresholdBytes, $this->skipHello);
     }
 
     public function getAddress(): SocketAddress

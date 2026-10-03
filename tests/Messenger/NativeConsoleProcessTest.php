@@ -16,6 +16,7 @@ use Ineersa\SqliteQueue\Client;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeProbeMessage;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\RequiresOperatingSystem;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
@@ -32,6 +33,7 @@ final class NativeConsoleProcessTest extends TestCase
     private const int SAFETY_SECONDS = 15;
     // Keep reservations live until explicit settlement, independent of subprocess scheduling.
     private const int BROKER_NOW_MILLISECONDS = 1_700_000_000_000;
+    private int $now = self::BROKER_NOW_MILLISECONDS;
 
     // Resources may be absent after failed setup; the CLI-broker case has no in-process broker.
     private ?IsolatedDatabase $fixture = null;
@@ -168,6 +170,71 @@ final class NativeConsoleProcessTest extends TestCase
         $this->assertOwnedGone();
     }
 
+    public static function activeHandlerDeaths(): iterable
+    {
+        yield 'consumer killed after effect' => [false];
+        yield 'persistence killed during handler' => [true];
+    }
+
+    #[DataProvider('activeHandlerDeaths')]
+    public function testActiveHandlerDeathPreservesEffectAndUnsettledDelivery(bool $killPersistence): void
+    {
+        $this->startBroker();
+        $publisher = (new \Ineersa\SqliteQueue\Messenger\TransportFactory())->createTransport(
+            'sqlite-queue://jobs?endpoint='.rawurlencode($this->endpoint()), [], new PhpSerializer(),
+        );
+        try {
+            $publisher->send(new Envelope(new Fixtures\NativeApp\Message\NativeEffectMessage('effect')));
+        } finally {
+            $publisher->close();
+        }
+        $consumer = $this->console(['messenger:consume', 'async', '--limit=1', '--quiet']);
+        $ready = (new BufferedReader($consumer->getStdout()))->readUntil("\n", new TimeoutCancellation(self::SAFETY_SECONDS));
+        $this->assertSame('effect-recorded', $ready);
+        $this->assertSame("effect\n", file_get_contents($this->project().'/effect.log'));
+        $database = new \SQLite3($this->database());
+        try {
+            $expiry = $database->querySingle('SELECT reserved_until FROM queue_messages');
+            $this->assertSame($this->now + \Ineersa\SqliteQueue\Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS, $expiry);
+        } finally {
+            $database->close();
+        }
+        if ($killPersistence) {
+            $tree = ProcessTree::ownedBy(getmypid());
+            $this->assertCount(1, $tree['workers']);
+            $this->assertTrue(posix_kill($tree['workers'][0], \SIGKILL));
+            $this->assertNotSame(0, $this->brokerRun->await(new TimeoutCancellation(self::SAFETY_SECONDS)));
+            $this->assertFileDoesNotExist($this->endpoint());
+            foreach ([...$tree['workers'], ...$tree['launchers']] as $pid) {
+                $this->assertArrayNotHasKey($pid, ProcessTree::snapshot());
+            }
+            $consumer->getStdin()->write("release\n");
+            $this->assertNotSame(0, $consumer->join(new TimeoutCancellation(self::SAFETY_SECONDS)));
+            $diagnostics = $this->errors[$consumer->getPid()]->await(new TimeoutCancellation(self::SAFETY_SECONDS));
+            $this->assertStringContainsString('queue broker', $diagnostics);
+            $this->startBroker();
+        } else {
+            $this->assertTrue(posix_kill($consumer->getPid(), \SIGKILL));
+            $this->assertNotSame(0, $consumer->join(new TimeoutCancellation(self::SAFETY_SECONDS)));
+        }
+        $this->assertOwnedGone();
+        $this->assertSame(1, $this->messageCount());
+        $client = Client::connect($this->endpoint());
+        try {
+            $this->assertNull($client->receive('jobs'));
+            $this->now = $expiry;
+            $delivery = $client->receive('jobs');
+            $this->assertNotNull($delivery);
+            $envelope = (new PhpSerializer())->decode(['body' => $delivery->body, 'headers' => json_decode($delivery->headers, true, 32, \JSON_THROW_ON_ERROR)]);
+            $this->assertSame('effect', $envelope->getMessage()->body);
+            $client->acknowledge($delivery->receipt);
+            $this->assertSame(0, $this->messageCount());
+            $this->assertSame("effect\n", file_get_contents($this->project().'/effect.log'));
+        } finally {
+            $client->close();
+        }
+    }
+
     /** @param list<string> $arguments */
     private function console(array $arguments): Process
     {
@@ -199,7 +266,7 @@ final class NativeConsoleProcessTest extends TestCase
         $broker = (new BrokerFactory(
             $this->database(),
             $this->endpoint(),
-            clock: static fn (): int => self::BROKER_NOW_MILLISECONDS,
+            clock: fn (): int => $this->now,
         ))->create();
         $this->broker = $broker;
         $ready = new DeferredFuture();
