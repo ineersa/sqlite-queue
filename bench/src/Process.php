@@ -62,7 +62,10 @@ final class Process
     {
         $inherited = array_keys(getenv() + $_ENV);
 
-        return $overrides + ['PATH' => '/usr/bin:/bin', 'LANG' => 'C', 'TZ' => 'UTC'] + array_fill_keys($inherited, false);
+        $xdebugMode = getenv('XDEBUG_MODE');
+        $runtime = false === $xdebugMode ? [] : ['XDEBUG_MODE' => $xdebugMode];
+
+        return $overrides + $runtime + ['PATH' => '/usr/bin:/bin', 'LANG' => 'C', 'TZ' => 'UTC'] + array_fill_keys($inherited, false);
     }
 
     /**
@@ -138,6 +141,13 @@ final class Process
     public function pid(): int
     {
         return $this->pid;
+    }
+
+    public function terminate(): void
+    {
+        if ($this->isRunning()) {
+            $this->process->signal(\SIGTERM);
+        }
     }
 
     public function role(): string

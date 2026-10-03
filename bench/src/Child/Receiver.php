@@ -4,9 +4,10 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Bench\Child;
 
-use Doctrine\DBAL\Connection;
-use Ineersa\SqliteQueue\Bench\Baseline;
+use Ineersa\SqliteQueue\Bench\Backend;
 use Ineersa\SqliteQueue\Bench\BenchMessage;
+use Ineersa\SqliteQueue\Bench\Config;
+use Ineersa\SqliteQueue\Messenger\Transport;
 use Symfony\Component\Messenger\Envelope;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
 use Symfony\Component\Messenger\Transport\Receiver\ReceiverInterface;
@@ -16,9 +17,9 @@ use Symfony\Component\Messenger\Transport\TransportInterface;
 final class Receiver implements ReceiverInterface
 {
     /**
-     * @var array{polls: int, empty_polls: int, fetched: int, poll_ms: float}
+     * @var array{polls: int, empty_polls: int, fetched: int, poll_ms: float, waits: int, wait_ms: float}
      */
-    public private(set) array $polls = ['polls' => 0, 'empty_polls' => 0, 'fetched' => 0, 'poll_ms' => 0.0];
+    public private(set) array $polls = ['polls' => 0, 'empty_polls' => 0, 'fetched' => 0, 'poll_ms' => 0.0, 'waits' => 0, 'wait_ms' => 0.0];
     public private(set) bool $failed = false;
     /**
      * @var array<string, array{t_handler_ns: int, handler_wall: float, payload_ok: bool}>
@@ -34,15 +35,37 @@ final class Receiver implements ReceiverInterface
      * @param list<string> $queues
      */
     public function __construct(
-        private readonly Connection $connection,
+        private readonly Session $session,
         array $queues,
         private readonly Recorder $recorder,
         private readonly string $directory,
         private readonly int $index,
-        private readonly bool $roundtrip = false,
+        private readonly bool $roundtrip,
+        private readonly Backend $backend,
     ) {
         foreach ($queues as $queue) {
-            $this->transports[$queue] = Baseline::transport($connection, $queue);
+            $this->transports[$queue] = $session->transport($queue);
+        }
+    }
+
+    /** Multi-queue consumers retain polling; the broker has no multi-queue WAIT. */
+    public function waitsForNotifications(): bool
+    {
+        return Backend::Broker === $this->backend && 1 === \count($this->transports);
+    }
+
+    public function wait(): void
+    {
+        foreach ($this->transports as $transport) {
+            if ($transport instanceof Transport) {
+                $start = hrtime(true);
+                ++$this->polls['waits'];
+                try {
+                    $transport->wait(Config::NOTIFICATION_WAIT_MILLISECONDS, new \Amp\NullCancellation());
+                } finally {
+                    $this->polls['wait_ms'] += (hrtime(true) - $start) / 1e6;
+                }
+            }
         }
     }
 
@@ -106,8 +129,7 @@ final class Receiver implements ReceiverInterface
         ];
         // The receiver has committed by this point. No transaction is held during the handler.
         $rowId = $envelope->last(TransportMessageIdStamp::class)?->getId();
-        $stored = $this->connection->fetchOne('SELECT available_at FROM messenger_messages WHERE id = ?', [$rowId]);
-        $deadline = false === $stored ? null : (float) (new \DateTimeImmutable((string) $stored, new \DateTimeZone('UTC')))->format('U.u');
+        $deadline = null === $rowId ? null : $this->backend->deadline($this->session->connection, $rowId);
         $start = hrtime(true);
         $error = null;
         try {

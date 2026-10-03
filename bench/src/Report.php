@@ -20,6 +20,9 @@ final class Report
                 continue;
             }
             $name = $run['workload']['name'];
+            if (isset($metadata['backends'])) {
+                $name = $run['workload']['backend'].'/'.$name;
+            }
             foreach (['send_ms', 'publish_to_handler_ms', 'ack_ms', 'full_cycle_ms', 'delayed_lateness_ms'] as $metric) {
                 if (isset($run['metrics'][$metric])) {
                     $variation[$name][$metric][] = ['repetition' => $run['repetition'], 'status' => $run['status']] + $run['metrics'][$metric];
@@ -27,7 +30,7 @@ final class Report
             }
         }
 
-        return ['schema_version' => Config::SCHEMA_VERSION, 'comparison' => ['status' => 'incomplete_baseline_only', 'candidate' => null],
+        return ['schema_version' => Config::SCHEMA_VERSION, 'comparison' => isset($metadata['backends']) ? Comparison::build($runs, $metadata['scheduled_runs']) : ['status' => 'incomplete_baseline_only', 'candidate' => null],
             'baseline_status' => [] !== $runs && \count($runs) === ($metadata['scheduled_runs'] ?? \count($runs)) && array_all($runs, static fn (array $r): bool => 'complete' === $r['status']) ? 'complete' : 'incomplete',
             'unexecuted_runs' => max(0, ($metadata['scheduled_runs'] ?? \count($runs)) - \count($runs)),
             'metadata' => $metadata, 'runs' => $runs, 'per_run_variation' => $variation];
@@ -40,7 +43,18 @@ final class Report
     {
         file_put_contents($directory.'/summary.json', json_encode($report, \JSON_PRETTY_PRINT | \JSON_THROW_ON_ERROR));
         $text = "# SQLite baseline\n\nBaseline only. The candidate has not been measured. A/B comparison is incomplete.\n\n";
+        if (isset($report['metadata']['backends'])) {
+            $text = "# SQLite paired comparison\n\nComparison: ".$report['comparison']['status'].'. '.$report['comparison']['reason']."\n\n";
+            $text .= $report['metadata']['acceptance']."\n\n";
+            if (isset($report['metadata']['method_revision'])) {
+                $text .= 'Method revision: '.$report['metadata']['method_revision'].". Do not combine captures from different revisions.\n\n";
+                $text .= 'Doctrine transaction mode: '.$report['metadata']['settings']['doctrine_transaction_mode'].". Standard Doctrine transport; no custom empty-poll optimization. Broker writes remain serialized with immediate transactions.\n\n";
+            }
+        }
         $text .= 'Baseline status: '.$report['baseline_status'].". All scheduled runs, including warmup and failures, are retained.\n\n";
+        if (isset($report['metadata']['php']['runtime_profile'])) {
+            $text .= 'Effective Xdebug mode: '.$report['metadata']['php']['xdebug_mode'].'. XDEBUG_MODE override: '.($report['metadata']['php']['xdebug_mode_override'] ?? 'unset').". Compare only matching runtime profiles.\n\n";
+        }
         $text .= "| Workload/run | Status | Metric, ms | n | p50 | p95 | p99 | max | Tail evidence |\n| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |\n";
         foreach ($report['runs'] as $run) {
             foreach ($run['metrics'] as $metric => $values) {
@@ -48,7 +62,7 @@ final class Report
                     continue;
                 }
                 $numbers = array_map(static fn ($v): string => null === $v ? 'n/a' : \sprintf('%.3f', $v), [$values['p50'], $values['p95'], $values['p99'], $values['max']]);
-                $text .= '| '.$run['workload']['name'].'/'.$run['repetition'].' | '.$run['status'].' | '.$metric.' | '.$values['count'].' | '.implode(' | ', $numbers).' | '.$values['tail']." |\n";
+                $text .= '| '.($run['workload']['backend'] ?? 'doctrine').'/'.$run['workload']['name'].'/'.$run['repetition'].' | '.$run['status'].' | '.$metric.' | '.$values['count'].' | '.implode(' | ', $numbers).' | '.$values['tail']." |\n";
             }
             if ([] !== $run['incomplete_reasons']) {
                 $text .= "\nFailure: ".implode('; ', $run['incomplete_reasons'])."\n\n";
@@ -59,7 +73,7 @@ final class Report
             $i = $run['integrity'];
             $text .= \sprintf(
                 "| %s/%s | %d | %d | %d | %d | %s | %s | %s |\n",
-                $run['workload']['name'],
+                ($run['workload']['backend'] ?? 'doctrine').'/'.$run['workload']['name'],
                 $run['repetition'],
                 $i['sends_confirmed'],
                 $i['acks'],

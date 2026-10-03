@@ -26,13 +26,14 @@ final class Stats
         $deliveries = [];
         $failures = [];
         $durability = [];
+        $runtimeProfiles = [];
         $feet = [];
         $corrupt = 0;
         $records = 0;
         $processes = [];
         $clockChecks = [];
         $duplicateSends = 0;
-        $pollTotals = ['polls' => 0, 'empty_polls' => 0, 'fetched' => 0, 'poll_ms' => 0.0];
+        $pollTotals = ['polls' => 0, 'empty_polls' => 0, 'fetched' => 0, 'poll_ms' => 0.0, 'waits' => 0, 'wait_ms' => 0.0];
 
         foreach ($sources as $source) {
             $file = SampleStore::read($source['path']);
@@ -47,6 +48,9 @@ final class Stats
 
                 switch ($kind) {
                     case 'header':
+                        if (\is_array($record['runtime_profile'] ?? null)) {
+                            $runtimeProfiles[] = $record['runtime_profile'] + ['role' => $source['role'], 'proc' => $record['proc'] ?? null];
+                        }
                         if (\is_array($record['durability'] ?? null)) {
                             $durability[] = $record['durability'] + [
                                 'role' => $source['role'],
@@ -90,7 +94,7 @@ final class Stats
                     case 'foot':
                         $feet[] = $record;
                         $totals = \is_array($record['poll_totals'] ?? null) ? $record['poll_totals'] : [];
-                        foreach (['polls', 'empty_polls', 'fetched', 'poll_ms'] as $key) {
+                        foreach (['polls', 'empty_polls', 'fetched', 'poll_ms', 'waits', 'wait_ms'] as $key) {
                             $pollTotals[$key] += (float) ($totals[$key] ?? 0);
                         }
                         break;
@@ -166,6 +170,7 @@ final class Stats
             }
             foreach (['small', 'large'] as $key) {
                 $metrics['by_payload'][$key]['full_cycle_ms'] = self::percentiles([]);
+                $metrics['by_payload'][$key]['publish_to_handler_ms'] = self::percentiles([]);
             }
         }
 
@@ -193,6 +198,7 @@ final class Stats
             'throughput' => $clocksValid ? self::throughput($sends, $deliveries) : null,
             'integrity' => $integrity,
             'durability' => $durabilityCheck + ['observations' => $durability],
+            'runtime_profiles' => $runtimeProfiles,
             'polls' => $pollTotals,
             'resources' => $facts['resources'] ?? null,
             'idle_window' => $facts['idle_window'] ?? null,
@@ -278,7 +284,7 @@ final class Stats
         $requestedLatenessMs = [];
         $quantizationMs = [];
         $probes = [];
-        $byPayload = ['small' => ['send_ms' => [], 'cycle_ms' => []], 'large' => ['send_ms' => [], 'cycle_ms' => []]];
+        $byPayload = ['small' => ['send_ms' => [], 'cycle_ms' => [], 'pickup_ms' => []], 'large' => ['send_ms' => [], 'cycle_ms' => [], 'pickup_ms' => []]];
         $delivered = [];
 
         foreach ($sends as $msg => $send) {
@@ -320,6 +326,8 @@ final class Stats
                 }
                 if ($confirmed && is_numeric($delivery['t_handler_ns'] ?? null)) {
                     $publishToHandlerMs[] = ((int) $delivery['t_handler_ns'] - (int) $send['t_invoke_ns']) / 1e6;
+                    $size = (int) ($send['size'] ?? 0);
+                    $byPayload[$size <= Config::SMALL_PAYLOAD_BYTES ? 'small' : 'large']['pickup_ms'][] = ((int) $delivery['t_handler_ns'] - (int) $send['t_invoke_ns']) / 1e6;
                     $confirmationToHandlerMs[] = ((int) $delivery['t_handler_ns'] - (int) $send['t_confirm_ns']) / 1e6;
                 }
                 if ($confirmed && ($delivery['outcome'] ?? '') === 'ack' && is_numeric($delivery['t_ack_confirm_ns'] ?? null)) {
@@ -353,10 +361,12 @@ final class Stats
 
         $metrics['by_payload'] = [
             'small' => [
+                'publish_to_handler_ms' => self::percentiles($byPayload['small']['pickup_ms']),
                 'send_ms' => self::percentiles($byPayload['small']['send_ms']),
                 'full_cycle_ms' => self::percentiles($byPayload['small']['cycle_ms']),
             ],
             'large' => [
+                'publish_to_handler_ms' => self::percentiles($byPayload['large']['pickup_ms']),
                 'send_ms' => self::percentiles($byPayload['large']['send_ms']),
                 'full_cycle_ms' => self::percentiles($byPayload['large']['cycle_ms']),
             ],

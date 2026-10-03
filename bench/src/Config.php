@@ -7,13 +7,15 @@ namespace Ineersa\SqliteQueue\Bench;
 /**
  * Frozen benchmark budgets and workload descriptors.
  *
- * The budgets below were fixed before any candidate existed. Changing them invalidates
- * comparisons with previously recorded baselines, so change them only together with the
- * method note in `bench/README.md` and a new baseline run.
+ * Original workload budgets predate the candidate. The paired-v2 concurrent budget of 3000
+ * was declared before the first paired measurements. The user approved immediate Doctrine
+ * transactions for paired-v3-immediate. Do not mix captures from these method revisions.
  */
 final class Config
 {
-    public const SCHEMA_VERSION = 1;
+    public const SCHEMA_VERSION = 2;
+
+    public const string METHOD_REVISION = 'paired-v3-immediate';
 
     /** Small payload size in bytes, representative of a local application message. */
     public const SMALL_PAYLOAD_BYTES = 256;
@@ -32,6 +34,9 @@ final class Config
 
     /** Worker polling sleep when no message is available, in microseconds. Recorded, not inferred. */
     public const POLL_SLEEP_US = 1000;
+
+    /** Bounded single-queue notification wait, matching native integration. */
+    public const NOTIFICATION_WAIT_MILLISECONDS = 1000;
 
     /** Bounded SQLite lock wait for the baseline, in milliseconds. The DBAL/PDO default is 60000. */
     public const BUSY_TIMEOUT_MS = 5000;
@@ -101,7 +106,8 @@ final class Config
                 'name' => 'concurrent',
                 'title' => 'Concurrent publishers and consumers on one queue',
                 'queues' => ['bench_concurrent'],
-                'publishers' => [['count' => 50], ['count' => 50], ['count' => 50]],
+                // Paired v2 budget declared before candidate measurements: 1500 per payload.
+                'publishers' => [['count' => 1000], ['count' => 1000], ['count' => 1000]],
                 'consumers' => 2,
                 'pacing_us' => 0,
                 'timeout_s' => 90,

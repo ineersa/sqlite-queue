@@ -41,8 +41,9 @@ See [Package contracts](docs/contracts.md) for the full guarantees and limits.
 - [Broker protocol](docs/broker-protocol.md): framing, limits, errors, and connection recovery.
 - [Queue engine](docs/queue-engine.md): PHP APIs, schema, and reservation checks.
 - [SQLite driver behavior](docs/driver-verification.md): process model and transaction restrictions.
-- [Benchmark runner](bench/README.md): run the Doctrine SQLite baseline.
+- [Benchmark runner](bench/README.md): run paired Doctrine SQLite and broker Messenger workloads.
 - [Benchmark method](docs/benchmark-method.md) and [baseline results](docs/benchmark-baseline.md): measurement definitions and limitations. These results do not establish a broker performance advantage.
+- [Doctrine and broker comparison](docs/benchmark-comparison.md): measured results, failures, and the archived paired capture.
 
 ## Development
 

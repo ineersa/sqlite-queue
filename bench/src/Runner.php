@@ -16,6 +16,10 @@ final class Runner
     private array $producers = [];
     /** @var list<Process> */
     private array $consumers = [];
+    /** @var list<Process> Broker infrastructure is accounted but has no message sample stream. */
+    private array $infrastructure = [];
+    /** @var list<string> Only successfully created private directories may be removed. */
+    private array $socketDirectories = [];
     private ?Connection $connection = null;
     private readonly Resources $resources;
     private int $deadline;
@@ -52,8 +56,11 @@ final class Runner
         ];
 
         try {
+            $startup = hrtime(true);
             $this->initializeDatabase();
             $this->startChildren();
+            $this->facts['startup_ms'] = (hrtime(true) - $startup) / 1e6;
+            $this->facts['pickup'] = Backend::Broker === $this->backend() && 1 === \count($this->workload['queues']) ? 'notification_wait_1000ms' : 'poll_1000us';
             $this->releaseWorkload();
             $this->awaitPublication();
             $this->awaitDrain();
@@ -83,9 +90,35 @@ final class Runner
 
     private function initializeDatabase(): void
     {
+        if (Backend::Broker === $this->backend()) {
+            if (!mkdir(\dirname(Backend::endpoint($this->directory)), 0700)) {
+                throw new \RuntimeException('Cannot create private benchmark socket directory.');
+            }
+            $this->socketDirectories[] = \dirname(Backend::endpoint($this->directory));
+            $broker = Process::spawn('broker', '0', [\PHP_BINARY, Config::rootDir().'/bin/benchmark', 'broker', $this->directory], [], $this->directory);
+            $this->infrastructure[] = $broker;
+            $this->facts['broker_readiness'] = $broker->waitForReady(Config::STARTUP_TIMEOUT_S);
+            $this->facts['broker_runtime_profiles'] = json_decode(file_get_contents($this->directory.'/broker-runtime.json'), true, 512, \JSON_THROW_ON_ERROR);
+            $durability = json_decode(file_get_contents($this->directory.'/broker-durability.json'), true, 512, \JSON_THROW_ON_ERROR);
+            $this->facts['broker_durability'] = $durability;
+            if (!\is_array($durability) || !Baseline::isDurabilityEquivalent($durability)) {
+                throw new \RuntimeException('Broker worker durability mismatch.');
+            }
+            if (Config::BUSY_TIMEOUT_MS !== $durability['busy_timeout'] || 1000 !== $durability['wal_autocheckpoint']) {
+                throw new \RuntimeException('Broker worker checkpoint/lock policy mismatch.');
+            }
+            $this->resources->sample();
+        }
         $this->connection = Baseline::connect($this->directory.'/queue.sqlite');
-        Baseline::transport($this->connection, $this->workload['queues'][0])->setup();
+        if (Backend::Doctrine === $this->backend()) {
+            Baseline::transport($this->connection, $this->workload['queues'][0])->setup();
+        }
         $this->facts['setup_durability'] = Baseline::durability($this->connection);
+    }
+
+    private function backend(): Backend
+    {
+        return Backend::from($this->workload['backend'] ?? Backend::Doctrine->value);
     }
 
     private function startChildren(): void
@@ -187,7 +220,7 @@ final class Runner
     private function awaitDrain(): void
     {
         // Only inspect inventory after publication. Do not add DB reads to the publishing window.
-        while (0 !== array_sum(Baseline::inventory($this->connection))) {
+        while (0 !== array_sum($this->backend()->inventory($this->connection))) {
             if (!$this->anyRunning($this->consumers)) {
                 throw new \RuntimeException('All consumers exited with work pending.');
             }
@@ -220,12 +253,23 @@ final class Runner
             $process->wait(3.0);
         }
         $this->resources->sample();
+        foreach ($this->infrastructure as $process) {
+            $process->terminate();
+            if (0 !== $process->wait(Config::KILL_GRACE_S + 1)) {
+                $this->recordError(new \RuntimeException('Broker infrastructure failed: '.$process->errorTail()));
+            }
+            if (is_file($this->directory.'/broker-final.json')) {
+                $this->facts['broker_final_resources'] = json_decode(file_get_contents($this->directory.'/broker-final.json'), true, 512, \JSON_THROW_ON_ERROR);
+            } else {
+                $this->recordError(new \RuntimeException('Missing broker final resource accounting.'));
+            }
+        }
         if (null === $this->connection) {
             return;
         }
 
         try {
-            $this->facts['inventory'] = Baseline::inventory($this->connection);
+            $this->facts['inventory'] = $this->backend()->inventory($this->connection);
             $this->facts['checkpoint'] = Baseline::checkpoint($this->connection);
         } catch (\Throwable $error) {
             $this->recordError($error);
@@ -253,6 +297,10 @@ final class Runner
         $result['workload'] = $this->workload;
         $result['directory'] = $this->directory;
         file_put_contents($this->directory.'/result.json', json_encode($result, \JSON_PRETTY_PRINT | \JSON_THROW_ON_ERROR));
+
+        if ([] === $this->facts['survivors']) {
+            (new \Symfony\Component\Filesystem\Filesystem())->remove($this->socketDirectories);
+        }
 
         foreach (['queue.sqlite', 'queue.sqlite-wal', 'queue.sqlite-shm'] as $file) {
             $path = $this->directory.'/'.$file;
