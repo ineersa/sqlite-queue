@@ -70,11 +70,24 @@ function test_broker(#[AsOption(description: 'PHPUnit test-name filter.')] ?stri
 #[AsTask(name: 'bench', namespace: '', description: 'Capture a benchmark; save the capture path and progress in the task log.')]
 function bench(
     #[AsOption(description: 'Run smoke workloads, not a performance capture.')] bool $smoke = false,
-    #[AsOption(description: 'Workload name or all.')] string $workload = 'all',
+    #[AsOption(description: 'Allow dirty source snapshots, labelled as a pilot.')] bool $pilot = false,
+    #[AsOption(description: 'Roundtrip, calibration, idle, delayed, fixed-rate, application or retention.')] string $workload = 'roundtrip',
+    #[AsOption(description: 'Measured window in seconds.')] float $duration = 60,
+    #[AsOption(description: 'Predeclared paired repetitions.')] int $repetitions = 5,
+    #[AsOption(description: 'Fixed-rate arrivals per second.')] float $rate = 20,
+    #[AsOption(description: 'Maximum outstanding fixed-rate messages.')] int $capacity = 64,
+    #[AsOption(description: 'Application synchronous handler work, 0..10000 milliseconds.')] int $handlerMs = 100,
+    #[AsOption(description: 'Retention cycles, 20..1000.')] int $cycles = 20,
+    #[AsOption(description: 'Messages per retention cycle, 1..10000.')] int $cycleMessages = 2,
+    #[AsOption(description: 'Retention settling seconds, positive and at most 60.')] float $settling = 0.1,
+    #[AsOption(description: 'Delayed scenario DelayStamp, 1..30000 milliseconds.')] int $delay = 2000,
 ): int {
-    $command = [\PHP_BINARY, 'bin/benchmark', 'run', '--no-ansi', '--no-interaction', '--workload='.$workload];
+    $command = [\PHP_BINARY, 'bin/benchmark', 'run', '--no-ansi', '--no-interaction', '--workload='.$workload, '--duration='.$duration, '--repetitions='.$repetitions, '--delay='.$delay, '--rate='.$rate, '--capacity='.$capacity, '--handler-ms='.$handlerMs, '--cycles='.$cycles, '--cycle-messages='.$cycleMessages, '--settling='.$settling];
     if ($smoke) {
         $command[] = '--smoke';
+    }
+    if ($pilot) {
+        $command[] = '--pilot';
     }
 
     return report('bench', $command, timeout: null);

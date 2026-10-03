@@ -12,9 +12,9 @@ Historical capture command at revision `13a43bc`:
 
 The benchmark source hashes match revision `13a43bc`. Capture metadata records parent revision `688353e` and a dirty worktree; the recorded file hashes, rather than that parent revision alone, identify the measured source. The archive also records the Composer lock hash.
 
-The runner was later refactored into a Symfony Console application. The current command is `php bin/benchmark run`. The archived capture remains evidence for `13a43bc`, not a measurement of the refactored CLI. Workload budgets and timing definitions are unchanged, but new measurements must record the new runner and dependency hashes. Do not relabel the old timings as results from the refactor.
+The current native-Messenger runner uses different workload contracts and measurement boundaries. This capture remains historical evidence for `13a43bc`. Do not pool its timings with current measurements.
 
-The original artifact directory is `var/bench/20260928-010402-4cda6aa2/`. The [retained archive](../bench/results/baseline-v1-20260928.tar.gz) contains all 24 repetition directories, raw JSONL samples, logs, configuration, `summary.json`, and `report.md`. It contains no queue database files.
+The original artifact directory is `var/bench/20260928-010402-4cda6aa2/`. The archive `baseline-v1-20260928.tar.gz` contains all 24 repetition directories, raw JSONL samples, logs, configuration, `summary.json`, and `report.md`. It contains no queue database files. Raw archives are no longer tracked in Git. The originating machine retains its local copy; the archive also remains in historical commits.
 
 Archive SHA-256:
 
@@ -24,7 +24,7 @@ b3fab5e7acbc1042ab034c6719d50f9dc4d16a94017951ef1a522db8ca7ba756
 
 The capture used PHP 8.5.10, SQLite 3.45.1, Symfony Messenger and Doctrine Messenger 8.1.7, and Doctrine DBAL 4.5.0. The machine had an Intel Core i5-13400F, with the database directory on ext4 at `/dev/nvme0n1p2`. Xdebug 3.5.3 was loaded in `develop` mode; CLI OPcache was disabled. Full configuration and machine observations are in `summary.json`.
 
-See [method v1](benchmark-method.md) for sample budgets, timing definitions, polling, durability, and fairness requirements. This was a local development-machine capture, not a controlled hardware certification.
+See the measurement method at revision `13a43bc` for the historical budgets and definitions. This was a local development-machine capture, not a controlled hardware certification.
 
 ## Outcomes
 

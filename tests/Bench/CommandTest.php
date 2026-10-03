@@ -6,10 +6,11 @@ namespace Ineersa\SqliteQueue\Tests\Bench;
 
 use Ineersa\SqliteQueue\Bench\Command\ClockProbeCommand;
 use Ineersa\SqliteQueue\Bench\Command\RunCommand;
-use Ineersa\SqliteQueue\Bench\Command\WorkerCommand;
+use Ineersa\SqliteQueue\Bench\Manifest;
 use Ineersa\SqliteQueue\Bench\Process;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Console\Application;
+use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\Console\Tester\ApplicationTester;
 use Symfony\Component\Console\Tester\CommandTester;
 use Symfony\Component\Process\Process as SymfonyProcess;
@@ -20,7 +21,6 @@ final class CommandTest extends TestCase
     {
         $application = new Application('SQLite queue benchmark');
         $application->addCommand(new RunCommand());
-        $application->addCommand(new WorkerCommand());
         $application->addCommand(new ClockProbeCommand());
         $application->setAutoExit(false);
         $tester = new ApplicationTester($application);
@@ -29,15 +29,25 @@ final class CommandTest extends TestCase
         $this->assertStringContainsString('--smoke', $tester->getDisplay());
         $this->assertStringContainsString('--workload', $tester->getDisplay());
         $this->assertStringContainsString('roundtrip', $tester->getDisplay());
-        $this->assertTrue($application->find('worker')->isHidden());
         $this->assertTrue($application->find('clock-probe')->isHidden());
     }
 
-    public function testWorkerRejectsInvalidRoleBeforeOpeningAFile(): void
+    public function testUnsupportedScenarioDoesNotStartAnyProcesses(): void
     {
-        $tester = new CommandTester(new WorkerCommand());
+        $tester = new CommandTester(new RunCommand());
         $this->expectException(\InvalidArgumentException::class);
-        $tester->execute(['config' => '/does/not/exist', 'role' => 'unknown', 'index' => '0']);
+        $tester->execute(['--smoke' => true, '--workload' => 'concurrent']);
+    }
+
+    public function testFormalDefaultsAndDirtyUnrelatedFilesAreExplicit(): void
+    {
+        $command = new RunCommand();
+        $options = RunCommand::options(new ArrayInput([], $command->getDefinition()));
+        $this->assertSame(60.0, $options->durationSeconds);
+        $this->assertSame(5, $options->repetitions);
+        $this->assertCount(10, $options->schedule());
+        $this->expectException(\RuntimeException::class);
+        Manifest::assertSourceMode($options, '?? unrelated-user-file');
     }
 
     public function testClockProbeIsATestableConsoleCommand(): void

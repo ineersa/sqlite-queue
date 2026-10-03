@@ -1,0 +1,23 @@
+framework:
+    secret: 'package-owned-diagnostic-v4'
+    php_errors:
+        log: false
+    messenger:
+        default_bus: messenger.bus.application
+        buses:
+            messenger.bus.application: ~
+        transports:
+            async:
+                dsn: '%env(BENCH_DSN)%'
+                serializer: messenger.transport.native_php_serializer
+                retry_strategy:
+                    max_retries: 0
+            results:
+                dsn: '%env(BENCH_RESULT_DSN)%'
+                serializer: messenger.transport.native_php_serializer
+                retry_strategy:
+                    max_retries: 0
+        routing:
+            Ineersa\SqliteQueue\Bench\ProbeMessage: async
+            Ineersa\SqliteQueue\Bench\ApplicationMessage: async
+            Ineersa\SqliteQueue\Bench\ResultMessage: results

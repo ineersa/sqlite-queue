@@ -1,35 +1,45 @@
-# Compare the SQLite transports
+# Run the Messenger benchmark
 
-Install development dependencies with `composer install`. Use PHP 8.5 on Linux with `/proc`, `getconf`, `ext-pdo_sqlite`, `ext-posix`, and `ext-pcntl` available.
+The benchmark boots a Symfony application, publishes through its configured message bus, and starts stock `messenger:consume` workers. It compares the current broker transport with stock Doctrine using native PDO SQLite immediate transactions. It does not change production queue behavior.
 
-Run all six workloads from the checkout:
+## Check the wiring
 
-```sh
-	XDEBUG_MODE=off php bin/benchmark run
-```
-
-Do not run other benchmarks or builds at the same time. The command creates a private, unique directory under `var/bench/` and prints its path. It uses fresh file-backed databases on that filesystem, never a database supplied through environment variables. It removes its database files after each repetition and retains evidence files.
-
-Read `report.md` for per-run percentiles. Read `summary.json` for configuration, versions, integrity, resources, throughput, and individual-run variation. Each repetition has `config.json`, `result.json`, child logs, and raw `samples/*.jsonl` files. Keep the whole directory to reproduce the analysis.
-
-The command runs paired Doctrine and broker backends with alternating order, one warmup, and three measured repetitions each. Exit code 0 means every scheduled repetition completed without accounting errors. Exit code 1 means a repetition failed or was interrupted. A successful exit does not itself establish a speedup. Read the comparison verdict and resource tradeoffs.
-
-For a short execution check, use:
+Install dependencies with `composer install`, then run a small correctness capture:
 
 ```sh
-	php bin/benchmark run --smoke
+	XDEBUG_MODE=off vendor/bin/castor bench --smoke --workload=roundtrip
 ```
 
-Smoke uses four messages per publisher or prefill queue and one pair per workload. Do not use smoke results as performance evidence. To run one workload, add `--workload=idle`, or another name from [the method](../docs/benchmark-method.md). Use `--workload=concurrent` for the tail-capable 3000-message workload. A full capture has 48 backend repetitions.
+Smoke runs are not performance evidence. Other selectable workloads are `idle`, `fixed-rate`, `application`, `delayed`, `retention`, and `calibration`.
 
-For repository task reports, use `vendor/bin/castor bench` with the same options. Keep every repetition, including SQLite lock failures. The runner does not retry an incomplete repetition to obtain a favorable result.
+## Run a pilot
 
-Single-queue broker consumers use notification waits. Multi-queue consumers retain polling. Both use the same serializer, payload verification, visibility timeout, and WAL/FULL durability. Broker startup and its SQLite child are included in process accounting. Socket files use an owned private directory under `/tmp` to stay below Unix path limits. Databases remain under `var/bench/` for both backends.
+Pilots allow a dirty checkout and preserve a source snapshot. They are separate from formal comparisons.
 
-Current reports use method `paired-v3-immediate`. Standard Doctrine receives use immediate transactions through PHP 8.5's native PDO SQLite option. The runner verifies and records the effective mode. No custom empty-poll optimization is enabled. Keep older DEFERRED captures separate, including their lock failures. Do not mix revisions in a comparison.
+```sh
+	XDEBUG_MODE=off vendor/bin/castor bench --pilot --duration=2 --repetitions=1 --workload=application --rate=5 --capacity=16 --handler-ms=100
+```
 
-For production-like measurements through Castor, use `XDEBUG_MODE=off vendor/bin/castor bench`. The override reaches both backends and their children. Reports distinguish effective modes from the INI default and verify worker inheritance at startup. Keep earlier develop-mode captures as diagnostic evidence, not production capacity. Do not rerun failed repetitions until they pass.
+The application workload has an execution consumer that waits synchronously for the configured handler duration and publishes a correlated result. A second consumer handles the result. This models execution-to-control routing without calling an external service.
 
-Use `php bin/benchmark run --help` for options. Performance workloads are separate from correctness tests. See [the method](../docs/benchmark-method.md) for timing definitions and [the recorded baseline](../docs/benchmark-baseline.md) for results and comparison limits.
+## Run a declared comparison
 
-On SIGINT or SIGTERM, the coordinator stops its children and writes the available results. Unexecuted repetitions remain counted as missing. A forced kill of the coordinator cannot provide completed cleanup evidence.
+Formal runs require a clean Git checkout. Choose the complete configuration before looking at outcomes. Defaults are five paired repetitions and 60-second windows.
+
+```sh
+	XDEBUG_MODE=off vendor/bin/castor bench --workload=fixed-rate --duration=60 --repetitions=5 --rate=20 --capacity=64
+	XDEBUG_MODE=off vendor/bin/castor bench --workload=application --duration=60 --repetitions=5 --rate=5 --capacity=16 --handler-ms=100
+	XDEBUG_MODE=off vendor/bin/castor bench --workload=retention --cycles=20 --cycle-messages=20 --settling=0.25 --repetitions=5
+```
+
+Do not run compared backends concurrently or run builds during measurement. Every planned repetition remains in the report. Exit code 1 can mean a public operation failed, integrity or telemetry coverage failed, or the generator could not maintain the planned arrivals. Do not retry until green.
+
+Use `vendor/bin/castor bench --help` for task options or `php bin/benchmark run --help` for the underlying command.
+
+## Inspect a capture
+
+Each command prints its directory under `var/bench/`. Start with `report.md`, `summary.json`, and `manifest.json`. Per-run artifacts include configuration, operation streams, phase/resource records, expected cohorts, errors, and post-drain analysis. Database evidence is retained after owned processes stop. Remove old captures yourself when no longer needed.
+
+Raw captures and `bench/results/` are ignored by Git. Older archives remain on the originating machine and in historical commits, not in new checkouts. Publish compact readable findings and capture identifiers in [the comparison](../docs/benchmark-comparison.md), rather than committing binary archives.
+
+Read [the measurement method](../docs/benchmark-method.md) before interpreting the numbers. Resource accounting is partial, internal SQLite diagnostics are unavailable, and a short stable retention series is not proof of leak-free operation.

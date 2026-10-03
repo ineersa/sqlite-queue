@@ -3,6 +3,7 @@
 /.phpunit.cache
 /.idea/
 /var/
+/bench/results/
 
 # Per-suite test cache dirs (generated during castor test)
 /.hatfield/cache-*/
