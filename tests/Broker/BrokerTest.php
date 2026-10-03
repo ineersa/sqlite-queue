@@ -19,6 +19,7 @@ use Ineersa\SqliteQueue\Exception\TransportException;
 use Ineersa\SqliteQueue\Protocol\ErrorCode;
 use Ineersa\SqliteQueue\Protocol\Frame;
 use Ineersa\SqliteQueue\Protocol\Limits;
+use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Tests\Broker\Fixtures\GatingServerSocket;
 use Ineersa\SqliteQueue\Tests\Broker\Fixtures\WriteGate;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
@@ -136,6 +137,55 @@ final class BrokerTest extends TestCase
                 $gate->release();
                 $peer->close();
             }
+        });
+    }
+
+    public static function lostConfirmationOperations(): iterable
+    {
+        yield 'send' => [false];
+        yield 'claim' => [true];
+    }
+
+    #[DataProvider('lostConfirmationOperations')]
+    public function testCommittedMutationSurvivesLostReply(bool $claim): void
+    {
+        $this->runAsync(function () use ($claim): void {
+            $gate = new WriteGate();
+            $this->startBrokerWithGatedServer($gate, 0, true);
+            $database = new \SQLite3($this->database->path());
+            if ($claim) {
+                $this->assertTrue($database->exec("INSERT INTO queue_messages (queue, body, headers, available_at) VALUES ('jobs', x'7061796c6f6164', x'', ".$this->now.')'));
+            }
+            $client = $this->connectClient();
+            $cancel = new DeferredCancellation();
+            $mutation = async(static fn () => $claim ? $client->receive('jobs', $cancel->getCancellation()) : $client->send('jobs', 'payload', cancellation: $cancel->getCancellation()));
+            try {
+                $gate->entered()->await(new TimeoutCancellation(5));
+                $this->assertFalse($mutation->isComplete());
+                $this->assertSame(1, $database->querySingle('SELECT count(*) FROM queue_messages'));
+                $expiry = $database->querySingle('SELECT reserved_until FROM queue_messages');
+                $this->assertSame($claim ? $this->now + Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS : null, $expiry);
+                $cancel->cancel();
+                try {
+                    $mutation->await(new TimeoutCancellation(5));
+                    $this->fail('Lost reply must not confirm the mutation.');
+                } catch (TransportException) {
+                }
+            } finally {
+                $gate->release();
+                $database->close();
+            }
+            $replacement = $this->connectClient();
+            if ($claim) {
+                $this->assertNull($replacement->receive('jobs'));
+                $this->now = $expiry;
+            }
+            $delivery = $replacement->receive('jobs');
+            $this->assertSame('payload', $delivery->body);
+            $replacement->acknowledge($delivery->receipt);
+            $this->assertNull($replacement->receive('jobs'));
+            $this->expectException(TransportException::class);
+            $client->send('jobs', 'must not replay');
         });
     }
 
@@ -1093,7 +1143,7 @@ final class BrokerTest extends TestCase
      * Rebuilds a factory-created broker with a gating server so one oversized response write
      * stays pending until WriteGate::release(). No production hooks.
      */
-    private function startBrokerWithGatedServer(WriteGate $gate, int $thresholdBytes): void
+    private function startBrokerWithGatedServer(WriteGate $gate, int $thresholdBytes, bool $skipHello = false): void
     {
         $database = $this->database ?? throw new \LogicException('Missing test database.');
         $this->endpoint = $database->path('queue.sock');
@@ -1103,7 +1153,7 @@ final class BrokerTest extends TestCase
         foreach ($constructor->getParameters() as $parameter) {
             $arguments[] = (new \ReflectionProperty(Broker::class, $parameter->getName()))->getValue($original);
         }
-        $arguments[0] = new GatingServerSocket($arguments[0], $gate, $thresholdBytes);
+        $arguments[0] = new GatingServerSocket($arguments[0], $gate, $thresholdBytes, $skipHello);
         $this->broker = (new \ReflectionClass(Broker::class))->newInstanceArgs($arguments);
         $ready = new DeferredFuture();
         $this->brokerFuture = async(fn (): int => $this->broker->run(static function (array $event) use ($ready): void {

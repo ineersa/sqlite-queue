@@ -1,6 +1,6 @@
 # Task 07: cross-component failure and lifecycle proof
 
-Status: TODO
+Status: IMPLEMENTED — pending independent review
 Repository: `/home/ineersa/projects/sqlite-queue`
 Dependencies: [Task 06](TASK-06-MESSENGER-ADAPTER.md)
 Read first: [PLAN.md](PLAN.md), sections 5–8 and 10–11.
@@ -46,3 +46,29 @@ No hostile live-session experiments, content inspection, generic fuzzing platfor
 Run the relevant concurrent correctness lanes when concurrency is part of the contract. Use barriers and bounded process events, preserving diagnostics on failure. A solo green run cannot resolve a known contention flake.
 
 Record the completed contract-to-test map, commands/results, and remaining limitations. Obtain independent review of failure semantics and implementation scope before performance acceptance in Task 08.
+
+## Audit evidence
+
+Four cases fill the two missing cross-component boundaries. No production changes were needed.
+
+| Contract | Automated evidence and tested boundary |
+| --- | --- |
+| Lost send/claim confirmation | `BrokerTest::testCommittedMutationSurvivesLostReply`, send and claim cases: gate the real broker reply after commit, inspect persisted state, cancel the client before releasing the reply. The failed client stays closed; one sent row survives; a lost claim stays reserved until controlled expiry and then redelivers. Existing `ClientTest::testServerCloseWithoutConfirmationFailsTheCallAndNeverReplays` and `TransportTest::testPeerFailureDoesNotReplaySend` cover wire/adapter no-replay. |
+| Consumer exit after effect | `NativeConsoleProcessTest::testActiveHandlerDeathPreservesEffectAndUnsettledDelivery`, consumer case: native handler records an effect and signals a pipe barrier, consumer receives SIGKILL before returning, reservation survives until controlled expiry. Redelivery does not erase the effect. |
+| Persistence death during handler | The same test's persistence case kills the recorded SQLite worker after the handler effect barrier. Broker exits nonzero and releases endpoint/descendants. Releasing the handler exposes failed ACK and nonzero native consumer exit. Reopening the broker preserves the reservation until its original expiry. |
+| Commit ordering, serialization, rollback | `QueueTest::testNoConfirmationOrInterleavingBeforeCommit` and `testCommitFailureRollsBackAndReleasesOperation` cover all mutation variants with real SQLite and deterministic commit barriers/failures. |
+| Atomic claim and receipt identity | `QueueTest::testConcurrentReceiversAcrossConnectionsCannotShareDelivery`, `testStaleForeignDisconnectedAndPreviousEpochReceipts`, and receipt-specific validation cases; `BrokerTest::testSpecificReceiptRejectionsPreserveTheSession` and transport receipt tests cover public propagation. |
+| Storage failures and close | `QueueTest::testDatabaseFullLeavesConfirmedDataAndFailedOrUsableOwnership`, worker-death, initialization-close, in-flight close, and recursive-close tests; `BrokerTest::testStorageFailureStopsWithoutAPreBudgetErrorWrite`. FULL uses real SQLite's page limit and validates reopen consistency. |
+| Durable delayed eligibility and notifier races | `QueueTest::testDelayedOrderingAndRestartPreserveOriginalDeadlines`; notifier registration, earlier deadline, cancellation, stale-query, and rebuild tests; `BrokerProcessTest::testControlledClockRestartPreservesFutureAndOverdueDeadlines`; `NativeIntegrationTest::testRestartPreservesDelayedDeliveryForNativeConsume`. |
+| Socket limits and resource teardown | Frame truncation/bounds tests; broker malformed-session and gated slow-writer tests; process startup/conflicting-owner/shutdown cases; notifier timer cleanup; `BrokerProcessTest::testGracefulShutdownWithPendingWaitPreservesFutureMessage`. |
+| Native Messenger failures/shutdown | `NativeConsoleProcessTest::testSigtermDuringWaitFlushesDeferredBatchAndAcksDurably`; native retry/decode-failure tests; configured Doctrine failure transport exhaustion and native retry recovery. |
+
+### Validation
+
+- `vendor/bin/castor test --filter='BrokerTest|NativeConsoleProcessTest'`: passed, 62 tests / 594 assertions; both full affected classes, not isolated new cases.
+- `vendor/bin/castor cs:fix && vendor/bin/castor qa`: passed, 368 tests / 2,210 assertions; zero PHPStan errors.
+- No broad experiments, production hooks, sleep-based correctness assertions, reviewer launch, or benchmark run.
+
+### Limits
+
+The effect is an observable file write, not proof of an external service transaction or exactly-once behavior. Consumer death and persistence-child death are tested; abrupt broker SIGKILL during a handler is not separately duplicated. Existing receipt fencing tests cover prior epoch/owner identity. Disk-full evidence uses SQLite `max_page_count`, not physical disk exhaustion or arbitrary OS I/O faults. Power-loss guarantees and the historical SIGSTOP-worker signal caveat remain outside this proof. Existing graceful stop/restart and startup rollback cases are reused rather than adding a timing-based stress loop. Independent review remains pending before performance acceptance.
