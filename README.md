@@ -1,9 +1,9 @@
 # sqlite-queue
 
-A reusable PHP queue broker and client backed by SQLite. Symfony Messenger integration is planned.
+A reusable PHP queue broker and client backed by SQLite, with a Symfony Messenger transport adapter.
 
-This checkout includes the async SQLite engine, foreground broker, socket client with bounded WAIT, driver verification, and a standalone Doctrine SQLite benchmark baseline.
-The Symfony Messenger adapter is not implemented yet. See [docs/contracts.md](docs/contracts.md) for the settled package contracts and [docs/driver-verification.md](docs/driver-verification.md) for the measured driver behavior later tasks depend on. The [queue engine reference](docs/queue-engine.md) describes the storage API, schema, and receipt lifecycle. See [Run the broker and use the client](docs/broker.md) for foreground startup, receive, and WAIT.
+This checkout includes the async SQLite engine, foreground broker, socket client with bounded WAIT, Messenger adapter, driver verification, and a standalone Doctrine SQLite benchmark baseline.
+See [docs/contracts.md](docs/contracts.md) for the settled package contracts and [docs/driver-verification.md](docs/driver-verification.md) for the measured driver behavior later tasks depend on. The [queue engine reference](docs/queue-engine.md) describes the storage API, schema, and receipt lifecycle. See [Run the broker and use the client](docs/broker.md) for foreground startup, receive, and WAIT. See [docs/messenger.md](docs/messenger.md) for the native Messenger transport reference and [setup guide](docs/messenger-setup.md).
 
 ## Requirements
 
@@ -15,14 +15,14 @@ The Symfony Messenger adapter is not implemented yet. See [docs/contracts.md](do
 - Development installation also requires `ext-pdo_sqlite`, `ext-posix`, and `ext-pcntl` for the benchmark. The benchmark requires Linux `/proc`.
 
 `fabpot/amphp-sqlite3` requires PHP 8.4, and the supported range starts at 8.5. Symfony
-Messenger is needed only for the transport adapter, and only Symfony 8.x is supported.
+Messenger, Console, and Clock are runtime dependencies. Only Symfony 8.x is supported. FrameworkBundle is optional unless using the Symfony application integration.
 
 ## Install
 
-The package is not published. Install dependencies in this checkout:
+The package is not published. For application installation, configure a Composer VCS or path repository first. See [Messenger setup](docs/messenger-setup.md). Install dependencies in this checkout:
 
 ```bash
-composer install
+	composer install
 ```
 
 ## Development
@@ -36,8 +36,8 @@ See [AGENTS.md](AGENTS.md) for Castor commands, validation rules, and report pat
 | Package setup, dependency matrix, driver verification | Done in Task 01 |
 | Queue engine and schema | Done in Task 03, including durable delayed availability |
 | Foreground `sqlite-queue broker` and PHP client | Done in Task 04 for the approved SIGTERM/SIGKILL scope. Immediate receive, ACK, reject, and close. |
-| Delayed wakeups | Implemented in Task 05. Bounded WAIT, deadline scheduling, and restart/cancellation proof. Pending final QA and PR. |
-| Symfony Messenger adapter | Not started, Task 06 |
+| Delayed wakeups | Done in Task 05. Bounded WAIT, deadline scheduling, and restart/cancellation proof. |
+| Symfony Messenger adapter | Implemented in Task 06, awaiting PR/user review, not merged. Native consume integration; QA 335 tests/2,028 assertions. Isolated Symfony 8.0 adapter/native tests: 53/257. |
 | Benchmark baseline | Task 02 complete, including recorded lock failures and comparison limits |
 | A/B comparison | Not started, Task 08. No broker performance result. |
 
@@ -55,17 +55,19 @@ Runtime:
 | `amphp/parallel` | `^2.3` | Observe the persistence process supplied by the SQLite driver. |
 | `symfony/lock` | `^8.0` | Exclusive database and endpoint ownership. Required by the broker. |
 | `symfony/filesystem` | `^8.0` | Private file and socket handling for broker ownership. Required by the broker. |
+| `symfony/console` | `^8.0` | Broker CLI. |
+| `symfony/messenger` | `^8.0` | Transport and native consumer integration. |
+| `symfony/clock` | `^8.0` | Consumer time-limit clock. |
 
 Development:
 
 | Package | Constraint | Role |
 | --- | --- | --- |
 | `phpunit/phpunit` | `^13.2` | Test runner. |
-| `symfony/messenger` | `^8.0` | Symfony compatibility probe, and the adapter in a later task. |
 | `symfony/doctrine-messenger` | `^8.0` | Standard SQLite benchmark transport. |
 | `symfony/event-dispatcher` | `^8.0` | Worker lifecycle events in the benchmark. |
 | `doctrine/dbal` | `^4.3` | Benchmark SQLite connections. |
-| `symfony/console` | `^8.0` | Benchmark commands and the optional broker CLI. |
+| `symfony/framework-bundle` | `^8.0` | Optional application integration; native-command test kernel. |
 | `symfony/process` | `^8.0` | Owned benchmark subprocesses. |
 
 Doctrine DBAL, the Symfony Messenger SQLite transport, and its benchmark dependencies stay
@@ -74,16 +76,17 @@ out of the runtime requirements.
 ## Layout
 
 ```text
-src/            queue engine, broker, framing, and PHP client
-tests/Queue/    file-backed storage-engine tests
-tests/Broker/   protocol, client, ownership, and broker lifecycle tests
-tests/Driver/   async-driver verification tests
-tests/Support/  isolated test database and process-tree helpers
-tests/Bench/    deterministic benchmark accounting and process checks
-bench/          standalone Doctrine SQLite baseline runner
-bin/benchmark   Symfony Console entry point
-bin/sqlite-queue foreground broker command
-docs/           package contracts and driver verification evidence
+	src/            queue engine, broker, framing, PHP client, and Messenger adapter
+	tests/Queue/    file-backed storage-engine tests
+	tests/Broker/   protocol, client, ownership, and broker lifecycle tests
+	tests/Messenger Messenger transport and native command process tests
+	tests/Driver/   async-driver verification tests
+	tests/Support/  isolated test database and process-tree helpers
+	tests/Bench/    deterministic benchmark accounting and process checks
+	bench/          standalone Doctrine SQLite baseline runner
+	bin/benchmark   Symfony Console entry point
+	bin/sqlite-queue foreground broker command
+	docs/           package contracts and driver verification evidence
 ```
 
 ## Documentation
@@ -91,6 +94,8 @@ docs/           package contracts and driver verification evidence
 - [docs/contracts.md](docs/contracts.md): support matrix, public boundary, storage and
   delivery contracts, protocol shape.
 - [docs/broker.md](docs/broker.md): run the broker and use the PHP client.
+- [docs/messenger.md](docs/messenger.md): native transport, idle waits, serializers, and failure behavior.
+- [docs/messenger-setup.md](docs/messenger-setup.md): install through a VCS/path repository, configure, start, and consume.
 - [docs/broker-protocol.md](docs/broker-protocol.md): wire format, limits, ownership, and recovery semantics.
 - [docs/driver-verification.md](docs/driver-verification.md): measured async-driver behavior
   and the commands that reproduce it.

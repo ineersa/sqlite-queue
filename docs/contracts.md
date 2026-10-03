@@ -1,8 +1,7 @@
 # Package contracts
 
 This reference records the contracts settled in Task 01. Later tasks must implement them
-without re-deciding them. It does not publish PHP or wire signatures. Those land with the
-client in Task 04 and the adapter in Task 06.
+without re-deciding them. PHP and wire APIs are documented in the broker and Messenger references.
 
 Evidence for the driver behavior behind these contracts is in
 [driver-verification.md](driver-verification.md).
@@ -15,15 +14,16 @@ Evidence for the driver behavior behind these contracts is in
 | `ext-sqlite3` | required | SQLite library 3.45.1 |
 | `fabpot/amphp-sqlite3` | `^1.0` | v1.0.0, revision `1ee168273e29af037a5c4576349ff89e3a3b5fd` |
 | `revolt/event-loop` | `^1.0` | v1.0.9 |
-| `symfony/messenger` | `^8.0`, optional | Resolution only: v8.1.7 resolves, the adapter does not exist yet |
+| `symfony/messenger` | `^8.0`, runtime | Current native integration and isolated 8.0.15 tests |
 
 PHP 8.4.25 passed the driver suite while the constraint allowed it but is outside the supported
 range; the committed lock requires PHP >= 8.5, so the suite does not run there. PHP 8.6 and
 later are unverified. Symfony 7.4 resolves with the driver, and the package does not support
-it. The core engine and client run without Symfony installed; the broker requires
-`symfony/lock` and `symfony/filesystem` at runtime for exclusive ownership; `symfony/messenger`
-stays a development dependency until the adapter in Task 06 moves it to an optional runtime
-requirement.
+it. Core APIs do not boot a Symfony application. Console, Messenger, Clock, Lock, and
+Filesystem are runtime dependencies. FrameworkBundle is optional for standalone use and
+required for bundle integration. Task 06 is implemented awaiting PR/user review, not merged.
+Current-tree QA passed with 335 tests and 2,028 assertions. Isolated Symfony 8.0 adapter and
+native-command tests passed with 53 tests and 257 assertions. See [Messenger reference](messenger.md).
 
 Doctrine DBAL and the Symfony Messenger Doctrine SQLite transport are benchmark-only. The
 package supports one async SQLite client, with no multi-driver abstraction.
@@ -194,5 +194,5 @@ sets `synchronous`, so neither establishes the cost of the FULL setting used her
 
 ## Decisions left open
 
-- Messenger mapping details, including decode failure and worker idle integration: Task 06.
+- Messenger mapping details, including versioned decode failure and native idle integration: [Messenger reference](messenger.md).
 - Measured cost of synchronous FULL against the baseline durability: Task 02 and Task 08.

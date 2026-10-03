@@ -1,6 +1,6 @@
 # Run the broker and use the client
 
-The broker supports immediate receive and bounded WAIT. The Symfony Messenger adapter remains Task 06 work.
+The broker supports immediate receive and bounded WAIT. The [Symfony Messenger adapter](messenger.md) integrates with native `messenger:consume`.
 
 ## Start the foreground broker
 
@@ -81,7 +81,7 @@ if (null !== $delivery) {
 
 The default visibility timeout is 5,000 milliseconds. An unacknowledged reservation becomes eligible again at its persisted deadline. Closing a client does not shorten that deadline. For custom visibility, construct a `BrokerFactory` with that timeout and call `create()` to receive a fully initialized `Broker`. For an application-owned cancellation token, pass it to `Broker::run()` rather than adding a supervisor to this package.
 
-Task 06 must map this wait API onto Symfony Messenger worker idle handling so a readiness hint is not followed by an unnecessary remaining sleep, while still respecting cancellation, shutdown, and worker limits. That adapter is not implemented here.
+The Messenger bundle maps WAIT onto native consumer idle events for one literal receiver when `--sleep` is omitted or zero. See [Messenger idle behavior and limits](messenger.md#native-consume-idle-behavior).
 
 ## Recover from a failed exchange
 

@@ -1,6 +1,6 @@
 # Task 06: Symfony Messenger transport adapter
 
-Status: TODO
+Status: IMPLEMENTED — awaiting PR and user review; not merged
 Repository: `/home/ineersa/projects/sqlite-queue`
 Dependencies: [Task 05](TASK-05-DELAYED-WAKEUPS.md)
 Read first: [PLAN.md](PLAN.md), sections 5–8 and 10.
@@ -28,17 +28,25 @@ The engine must remain usable without booting a Symfony application. Choose the 
 
 ## Acceptance criteria
 
-- [ ] A normal Symfony Messenger worker sends, receives, handles, and ACKs through the actual broker adapter.
-- [ ] Serializer body/headers and retry/delay stamps round-trip without corruption or silent loss.
-- [ ] Stale/foreign receipts cannot ACK/reject another reservation through the adapter.
-- [ ] Delayed messages wake idle workers and retain availability across broker restart.
-- [ ] Handler failure/retry/reject follows the documented Messenger mapping without duplicate retry mechanisms.
-- [ ] Decode and transport failures produce the supported visible failure/cleanup behavior.
-- [ ] A notification is not followed by an unnecessary full/remainder idle sleep; waiting still respects cancellation, shutdown, and worker limits without busy spinning.
-- [ ] The documented example and tests run in this package without a consuming application installed.
+- [x] A normal Symfony Messenger worker sends, receives, handles, and ACKs through the actual broker adapter.
+- [x] Serializer body/headers and retry/delay stamps round-trip without corruption or silent loss.
+- [x] Stale/foreign receipts cannot ACK/reject another reservation through the adapter.
+- [x] Delayed messages wake idle workers and retain availability across broker restart.
+- [x] Handler failure/retry/reject follows the documented Messenger mapping without duplicate retry mechanisms.
+- [x] Decode and transport failures produce the supported visible failure/cleanup behavior.
+- [x] A notification is not followed by an unnecessary full/remainder idle sleep; waiting still respects cancellation, shutdown, and worker limits without busy spinning.
+- [x] The documented example and tests run in this package without a consuming application installed.
 
 ## Validation and handoff
 
 Use focused adapter tests plus real Messenger worker/broker integration, not only manually invoked listeners or a fake transport. Assert the specific envelope/delivery behavior, not handler prose. Verify delayed retry mapping and cancellation at their actual boundaries.
 
 Provide the concrete adapter configuration to Tasks 07 and 08. Keep task-local tests green before the broader failure proof.
+
+## Implementation evidence
+
+The bundle registers the transport factory and broker command. Native `messenger:consume` uses bounded WAIT for one literal receiver with omitted or zero sleep. No custom consume command or manual Worker construction is required. `DeliveryReceiptStamp` binds settlement to the delivery and transport.
+
+Current-tree `vendor/bin/castor cs:fix` then `vendor/bin/castor qa` passed: 335 tests, 2,028 assertions. Isolated Symfony 8.0 adapter/native-command tests passed: 53 tests, 257 assertions; production-source PHPStan passed. The isolated matrix used FrameworkBundle, Console, Messenger, and DependencyInjection 8.0.15, and Clock 8.0.8. Castor ran externally because its dependencies cannot resolve with Console 8.0.
+
+[Configuration example](../../docs/examples/messenger.yaml), [setup guide](../../docs/messenger-setup.md), and [reference](../../docs/messenger.md) cover native usage. Explicit positive sleep, multiple receivers, and regex-like names retain polling. Non-signal idle stops can incur one 1,000ms WAIT budget. No lease keepalive is provided. Task 07 failure audit and Task 08 performance comparison remain separate work.
