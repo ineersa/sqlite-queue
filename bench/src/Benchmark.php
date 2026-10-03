@@ -27,20 +27,22 @@ final readonly class Benchmark
         $progress('Artifacts: '.$directory);
         foreach ($workloads as $workload) {
             for ($index = $smoke ? 1 : 0; $index <= ($smoke ? 1 : Config::MEASURED_REPETITIONS); ++$index) {
-                if ($this->cancellation->isRequested()) {
-                    break 2;
-                }
-
                 $name = 0 === $index ? 'warmup' : 'run-'.$index;
-                $runner = new Runner(
-                    $directory.'/'.$workload['name'].'-'.$name,
-                    $workload,
-                    $this->cancellation,
-                );
-                $run = $runner->run($name, 0 === $index, $metadata['clock_probe']);
-                $runs[] = $run;
-                Report::write($directory, Report::build($runs, $metadata));
-                $progress($workload['name'].'/'.$name.': '.$run['status']);
+                foreach (Schedule::order($index) as $backend) {
+                    if ($this->cancellation->isRequested()) {
+                        break 3;
+                    }
+                    $pairedWorkload = $workload + ['backend' => $backend->value, 'runtime_profile' => $metadata['php']['runtime_profile']];
+                    $runner = new Runner(
+                        $directory.'/'.$backend->value.'-'.$workload['name'].'-'.$name,
+                        $pairedWorkload,
+                        $this->cancellation,
+                    );
+                    $run = $runner->run($name, 0 === $index, $metadata['clock_probe']);
+                    $runs[] = $run;
+                    Report::write($directory, Report::build($runs, $metadata));
+                    $progress($backend->value.'/'.$workload['name'].'/'.$name.': '.$run['status']);
+                }
             }
         }
 
@@ -112,15 +114,22 @@ final readonly class Benchmark
         ProcessTree::setPageSizeBytes($kernelClock['page_size_bytes']);
 
         $metadata['clock_probe'] = ClockProbe::run();
-        $metadata['scheduled_runs'] = $workloadCount * ($smoke ? 1 : Config::WARMUP_REPETITIONS + Config::MEASURED_REPETITIONS);
-        $metadata['profile'] = $smoke ? 'smoke_not_performance' : 'baseline-v1';
+        $metadata['scheduled_runs'] = 2 * $workloadCount * ($smoke ? 1 : Config::WARMUP_REPETITIONS + Config::MEASURED_REPETITIONS);
+        $metadata['profile'] = $smoke ? 'smoke_not_performance' : Config::METHOD_REVISION;
+        $metadata['method_revision'] = Config::METHOD_REVISION;
+        $metadata['backends'] = array_column(Backend::cases(), 'value');
+        $metadata['acceptance'] = 'Win requires complete pairs, >=1000 samples per payload per repetition, and every concurrent broker p95/p99 below the best Doctrine repetition. Reverse separation is regression; overlapping ranges neutral; failures or insufficient tails inconclusive. No pooling.';
         $metadata['runner'] = 'symfony-console';
         $metadata['settings'] = [
             'warmup_repetitions' => $smoke ? 0 : Config::WARMUP_REPETITIONS,
             'measured_repetitions' => $smoke ? 1 : Config::MEASURED_REPETITIONS,
             'payload_bytes' => [Config::SMALL_PAYLOAD_BYTES, Config::LARGE_PAYLOAD_BYTES],
             'poll_sleep_us' => Config::POLL_SLEEP_US,
+            'notification_wait_ms' => Config::NOTIFICATION_WAIT_MILLISECONDS,
             'busy_timeout_ms' => Config::BUSY_TIMEOUT_MS,
+            'doctrine_transaction_mode' => 'immediate',
+            'doctrine_native_transaction_mode' => \Pdo\Sqlite::TRANSACTION_MODE_IMMEDIATE,
+            'doctrine_empty_poll_optimization' => false,
             'redeliver_timeout_s' => Config::REDELIVER_TIMEOUT_S,
             'coordinator_progress_interval_us' => Config::PROGRESS_INTERVAL_US,
             'percentiles' => Config::PERCENTILE_METHOD,

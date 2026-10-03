@@ -20,6 +20,7 @@ final class Machine
         $clock = self::clock();
         $loadAverage = \function_exists('sys_getloadavg') ? sys_getloadavg() : false;
         $xdebugVersion = phpversion('xdebug');
+        $runtime = RuntimeProfile::current();
 
         return [
             'machine' => [
@@ -36,7 +37,10 @@ final class Machine
                 'timezone' => date_default_timezone_get(),
                 'opcache_cli' => \function_exists('opcache_get_status') && false !== @opcache_get_status(false),
                 'xdebug_version' => false === $xdebugVersion ? null : $xdebugVersion,
-                'xdebug_mode' => \ini_get('xdebug.mode'),
+                'xdebug_mode' => [] === $runtime['xdebug_effective_modes'] ? 'off' : implode(',', $runtime['xdebug_effective_modes']),
+                'xdebug_ini_mode' => $runtime['xdebug_ini_mode'],
+                'xdebug_mode_override' => $runtime['xdebug_mode_override'],
+                'runtime_profile' => $runtime,
                 'ini_file' => php_ini_loaded_file(),
                 'extensions' => [
                     'sqlite3' => \extension_loaded('sqlite3'),

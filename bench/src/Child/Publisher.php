@@ -4,7 +4,6 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Bench\Child;
 
-use Ineersa\SqliteQueue\Bench\Baseline;
 use Ineersa\SqliteQueue\Bench\BenchMessage;
 use Ineersa\SqliteQueue\Bench\Config;
 use Symfony\Component\Messenger\Envelope;
@@ -70,7 +69,7 @@ final class Publisher
             $queue,
             Config::payloadSize($position),
         );
-        $transport = $this->transports[$queue] ??= Baseline::transport($this->session->connection, $queue);
+        $transport = $this->transports[$queue] ??= $this->session->transport($queue);
         $invokedAt = hrtime(true);
         $invokedWall = microtime(true);
         $error = null;

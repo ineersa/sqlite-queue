@@ -25,6 +25,7 @@ final class Baseline
         $connection = DriverManager::getConnection([
             'driver' => 'pdo_sqlite',
             'path' => $databasePath,
+            'driverOptions' => [\Pdo\Sqlite::ATTR_TRANSACTION_MODE => \Pdo\Sqlite::TRANSACTION_MODE_IMMEDIATE],
         ]);
 
         // WAL is persistent per database file; synchronous and busy_timeout are per connection
@@ -38,14 +39,24 @@ final class Baseline
     }
 
     /**
-     * @return array{journal_mode: string, synchronous: int, busy_timeout: int, wal_autocheckpoint: int, database: string, file_backed: bool}
+     * @return array{journal_mode: string, synchronous: int, busy_timeout: int, wal_autocheckpoint: int, database: string, file_backed: bool, transaction_mode: string, native_transaction_mode: int}
      */
     public static function durability(DbalConnection $connection): array
     {
         $parameters = $connection->getParams();
         $database = (string) ($parameters['path'] ?? ':memory:');
+        $native = $connection->getNativeConnection();
+        if (!$native instanceof \Pdo\Sqlite) {
+            throw new \RuntimeException('Benchmark baseline requires native PDO SQLite.');
+        }
+        $mode = $native->getAttribute(\Pdo\Sqlite::ATTR_TRANSACTION_MODE);
+        if (\Pdo\Sqlite::TRANSACTION_MODE_IMMEDIATE !== $mode) {
+            throw new \RuntimeException('Benchmark baseline requires immediate transactions.');
+        }
 
         return [
+            'transaction_mode' => 'immediate',
+            'native_transaction_mode' => $mode,
             'journal_mode' => strtolower((string) $connection->executeQuery('PRAGMA journal_mode')->fetchOne()),
             'synchronous' => (int) $connection->executeQuery('PRAGMA synchronous')->fetchOne(),
             'busy_timeout' => (int) $connection->executeQuery('PRAGMA busy_timeout')->fetchOne(),

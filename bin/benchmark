@@ -3,6 +3,7 @@
 
 declare(strict_types=1);
 
+use Ineersa\SqliteQueue\Bench\Command\BrokerCommand;
 use Ineersa\SqliteQueue\Bench\Command\ClockProbeCommand;
 use Ineersa\SqliteQueue\Bench\Command\RunCommand;
 use Ineersa\SqliteQueue\Bench\Command\WorkerCommand;
@@ -14,4 +15,5 @@ $application = new Application('SQLite queue benchmark');
 $application->addCommand(new RunCommand());
 $application->addCommand(new WorkerCommand());
 $application->addCommand(new ClockProbeCommand());
+$application->addCommand(new BrokerCommand());
 $application->run();

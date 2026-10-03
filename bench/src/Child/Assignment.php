@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Bench\Child;
 
+use Ineersa\SqliteQueue\Bench\Backend;
+
 final readonly class Assignment
 {
     /**
@@ -39,6 +41,11 @@ final readonly class Assignment
     public function label(): string
     {
         return $this->role->value.'-'.$this->index;
+    }
+
+    public function backend(): Backend
+    {
+        return Backend::from($this->workload['backend'] ?? Backend::Doctrine->value);
     }
 
     public function path(string $relative): string

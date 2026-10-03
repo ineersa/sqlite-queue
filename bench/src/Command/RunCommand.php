@@ -15,7 +15,7 @@ use Symfony\Component\Console\Input\InputOption;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Style\SymfonyStyle;
 
-#[AsCommand(name: 'run', description: 'Capture the standard Doctrine SQLite baseline.')]
+#[AsCommand(name: 'run', description: 'Capture paired Doctrine SQLite and broker Messenger runs.')]
 final class RunCommand extends Command implements SignalableCommandInterface
 {
     private readonly Cancellation $cancellation;
@@ -59,14 +59,14 @@ final class RunCommand extends Command implements SignalableCommandInterface
             $io->text(...),
         );
 
-        $io->note('Baseline only. The broker candidate has not been measured.');
+        $io->note('Paired comparison: '.$report['comparison']['status'].'.');
         if ('complete' !== $report['baseline_status']) {
             $io->warning('The capture contains failed or unexecuted repetitions. Their evidence has been retained.');
 
             return Command::FAILURE;
         }
 
-        $io->success('Every scheduled baseline repetition completed.');
+        $io->success('Every scheduled backend repetition completed.');
 
         return Command::SUCCESS;
     }

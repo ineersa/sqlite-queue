@@ -7,6 +7,9 @@ namespace Ineersa\SqliteQueue\Bench\Child;
 use Doctrine\DBAL\Connection;
 use Ineersa\SqliteQueue\Bench\Baseline;
 use Ineersa\SqliteQueue\Bench\Config;
+use Ineersa\SqliteQueue\Bench\RuntimeProfile;
+use Symfony\Component\Messenger\Transport\CloseableTransportInterface;
+use Symfony\Component\Messenger\Transport\TransportInterface;
 
 /** Owns one worker's connection, start barrier, and evidence lifecycle. */
 final class Session
@@ -19,6 +22,9 @@ final class Session
      */
     public array $pollTotals = [];
 
+    /** @var array<string, TransportInterface> */
+    private array $transports = [];
+
     public function __construct(public readonly Assignment $assignment)
     {
         $this->recorder = new Recorder(
@@ -28,17 +34,38 @@ final class Session
         );
     }
 
+    public function transport(string $queue): TransportInterface
+    {
+        return $this->transports[$queue];
+    }
+
     /** @param callable(): void $work */
     public function execute(callable $work): void
     {
         $exitCode = 0;
         try {
+            $profile = $this->assignment->workload['runtime_profile'] ?? null;
+            if (!\is_array($profile)) {
+                throw new \RuntimeException('Worker assignment requires a runtime profile.');
+            }
+            RuntimeProfile::verifyCurrent($profile);
             $this->connection = Baseline::connect($this->assignment->database);
             $durability = Baseline::durability($this->connection);
             if (!Baseline::isDurabilityEquivalent($durability)) {
                 throw new \RuntimeException('Worker durability mismatch.');
             }
-            $this->recorder->header(['durability' => $durability]);
+            $this->recorder->header(['durability' => $durability, 'runtime_profile' => RuntimeProfile::current()]);
+            foreach ($this->assignment->workload['queues'] as $queue) {
+                $transport = $this->assignment->backend()->transport($this->connection, $this->assignment->directory, $queue);
+                $this->transports[$queue] = $transport;
+                // Acquisition/setup is cold-start work, before the go barrier on an empty DB.
+                foreach ($transport->get() as $_) {
+                    throw new \RuntimeException('Unexpected message during startup.');
+                }
+                if ($transport instanceof \Ineersa\SqliteQueue\Messenger\Transport) {
+                    $transport->wait(0, new \Amp\NullCancellation());
+                }
+            }
             $this->awaitStart();
             $work();
         } catch (\Throwable $error) {
@@ -46,6 +73,11 @@ final class Session
             $this->recorder->error($this->assignment->role->value, $error);
             throw $error;
         } finally {
+            foreach ($this->transports as $transport) {
+                if ($transport instanceof CloseableTransportInterface) {
+                    $transport->close();
+                }
+            }
             if (isset($this->connection)) {
                 $this->connection->close();
             }
