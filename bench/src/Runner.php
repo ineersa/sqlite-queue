@@ -39,28 +39,18 @@ final class Runner
         }
         foreach ($schedule as $entry) {
             try {
-                $result = $this->runBackend($root, $directory.'/'.$entry['id'], Backend::from($entry['backend']), TelemetryLevel::from($entry['telemetry']), $entry['resource_snapshots']);
+                $result = $this->runBackend($root, $directory.'/'.$entry['id'], Backend::from($entry['backend']));
             } catch (\Throwable $error) {
                 $result = ['execution_status' => ExecutionStatus::Failed->value, 'integrity_status' => IntegrityStatus::Unknown->value, 'accounting_status' => AccountingStatus::Partial->value, 'failure' => $error::class.': '.$error->getMessage()];
             }
             $results[$entry['id']] = $entry + $result;
             Runtime::saveJson($directory.'/'.$entry['id'].'/result.json', $results[$entry['id']]);
         }
-        $calibration = Scenario::Calibration === $this->options->scenario ? Calibration::summarize($results, $this->options) : ['status' => 'not-requested'];
-        Runtime::saveJson($directory.'/summary.json', ['method' => Config::METHOD_REVISION, 'configuration' => $this->options->configuration(), 'schedule' => $schedule, 'results' => $results, 'calibration' => $calibration, 'coverage' => Scenario::Application === $this->options->scenario ? 'one execution queue and one result queue, each with a native consumer; bounded workflows; phase-boundary resources; exact WAIT counters and lower-driver diagnostics unavailable' : 'one consumed queue; bounded outstanding messages for fixed-rate, one in flight otherwise; phase-boundary resources; exact WAIT counters and lower-driver diagnostics unavailable']);
+        Runtime::saveJson($directory.'/summary.json', ['method' => Config::METHOD_REVISION, 'configuration' => $this->options->configuration(), 'schedule' => $schedule, 'results' => $results, 'coverage' => Scenario::Application === $this->options->scenario ? 'one execution queue and one result queue, each with a native consumer; bounded workflows; phase-boundary resources; exact WAIT counters and lower-driver diagnostics unavailable' : 'one consumed queue; bounded outstanding messages for fixed-rate, one in flight otherwise; phase-boundary resources; exact WAIT counters and lower-driver diagnostics unavailable']);
         $topology = Scenario::Application === $this->options->scenario ? 'One publisher, one execution consumer and one result/control consumer.' : 'One publisher and one native consumer.';
         $text = '# Native Messenger '.$this->options->scenario->value."\n\nMode: ".$this->options->configuration()['mode'].'. '.$topology." Same workers for warmup and measurement.\n\n| Run | Execution | Integrity | Accounting | Unique completions |\n| --- | --- | --- | --- | ---: |\n";
         foreach ($results as $id => $result) {
             $text .= '| '.$id.' | '.$result['execution_status'].' | '.$result['integrity_status'].' | '.$result['accounting_status'].' | '.($result['unique_completions'] ?? 'unknown')." |\n";
-        }
-        if (Scenario::Calibration === $this->options->scenario) {
-            $text .= "\nCalibration budget status: ".$calibration['budget_status'].". Proposed absolute throughput perturbation budget: 5%.\n\n| Backend | Repetition | Component | Perturbation | Coverage |\n| --- | ---: | --- | ---: | --- |\n";
-            foreach ($calibration['comparisons'] as $comparison) {
-                $fraction = $comparison['throughput_perturbation_fraction'];
-                $display = null === $fraction ? 'unavailable' : \sprintf('%.2f%%', $fraction * 100);
-                $text .= '| '.$comparison['backend'].' | '.$comparison['repetition'].' | '.$comparison['component'].' | '.$display.' | '.$comparison['status']." |\n";
-            }
-            $text .= "\nPositive perturbation means reduced instrumented goodput. Short pilots and smoke cannot validate the budget. Serializer, payload validation, control-channel, expected-ID journal and periodic sampler overhead remain unisolated. This is not whole-system overhead validation.\n";
         }
         if (Scenario::Idle === $this->options->scenario) {
             $text .= "\nThe declared no-publication interval and isolated-arrival pickup cohort are separate. Idle CPU and IO use boundary snapshots, not periodic peaks. Detailed empty-receive recording contributes to consumer costs. Exact WAIT registration and wake counts are unavailable.\n";
@@ -77,8 +67,8 @@ final class Runner
         if (Scenario::Retention === $this->options->scenario) {
             $text .= "\nRetention keeps the same broker, persistence process and publisher/consumer connections across all declared cycles. Each memory point follows complete ACK drain, settling and an empty-inventory audit. Raw cycle and resource series stream to disk. Endpoint deltas and observed ranges are characterization, not a leak-free verdict. Broker PHP memory and live-state gauges remain unavailable.\n";
         }
-        $text .= "\nProduct-total resource accounting is partial. Publisher and observer share a process, and exited-process accounting is unavailable. Phase-boundary per-role samples are not complete product totals or continuous peaks. Some calibration profiles disable resource sampling.\n";
-        $text .= "\nRead summary.json for the frozen schedule, phase-specific rates, finite cohort timing, latency coverage and calibration. Failed repetitions are retained without retries.\n";
+        $text .= "\nProduct-total resource accounting is partial. Publisher and observer share a process, and exited-process accounting is unavailable. Phase-boundary per-role samples are not complete product totals or continuous peaks.\n";
+        $text .= "\nRead summary.json for the frozen schedule, phase-specific rates, finite cohort timing, latency coverage. Failed repetitions are retained without retries.\n";
         Runtime::saveText($directory.'/report.md', $text);
         ($this->report)(json_encode(['capture' => $directory, 'method' => Config::METHOD_REVISION, 'mode' => $this->options->configuration()['mode']], \JSON_THROW_ON_ERROR));
         foreach ($results as $result) {
@@ -94,7 +84,7 @@ final class Runner
     }
 
     /** @return array<string, mixed> */
-    private function runBackend(string $root, string $directory, Backend $backend, TelemetryLevel $telemetry, bool $resourcesEnabled): array
+    private function runBackend(string $root, string $directory, Backend $backend): array
     {
         $filesystem = new Filesystem();
         $filesystem->mkdir($directory, 0700);
@@ -114,14 +104,12 @@ final class Runner
         $units = new ChildProcess(['getconf', 'PAGESIZE'], timeout: Config::STARTUP_TIMEOUT_S);
         $units->mustRun();
         $pageBytes = (int) trim($units->getOutput());
-        $resources = new Resources(Clock::system(), static fn (string $path): string|false => @file_get_contents($path), static fn (string $bytes): bool => file_put_contents($directory.'/resources.jsonl', $bytes, \FILE_APPEND) === \strlen($bytes), $ticks, $pageBytes, false);
+        $resources = new Resources(Clock::system(), static fn (string $path): string|false => @file_get_contents($path), static fn (string $bytes): bool => file_put_contents($directory.'/resources.jsonl', $bytes, \FILE_APPEND) === \strlen($bytes), $ticks, $pageBytes);
         $resources->register(Role::ObserverPublisher, (int) getmypid());
         $phases = [];
-        $boundary = static function (Phase $phase) use (&$phases, $resources, $resourcesEnabled): int {
+        $boundary = static function (Phase $phase) use (&$phases, $resources): int {
             $timestamp = $phases[$phase->value] = hrtime(true);
-            if ($resourcesEnabled) {
-                $resources->capture($phase->value, true);
-            }
+            $resources->capture($phase->value);
 
             return $timestamp;
         };
@@ -167,7 +155,6 @@ final class Runner
             $environment = ['BENCH_PROJECT' => $directory, 'BENCH_DATABASE' => $database, 'BENCH_DSN' => Backend::Broker === $backend ? 'sqlite-queue://async?endpoint='.$short.'/broker.sock' : 'doctrine-benchmark://async', 'BENCH_CONTROL' => $short.'/control.sock', 'BENCH_RUN' => basename(\dirname($directory)), 'BENCH_ROLE' => 'consumer', 'BENCH_TELEMETRY' => $directory.'/consumer.operations.jsonl'];
             $environment['BENCH_RUNTIME_PROFILE'] = json_encode(RuntimeProfile::current(), \JSON_THROW_ON_ERROR);
             $environment['BENCH_RECEIVER'] = 'async';
-            $environment['BENCH_TELEMETRY_LEVEL'] = $telemetry->value;
             $environment['BENCH_RESULT_DSN'] = Backend::Broker === $backend ? 'sqlite-queue://results?endpoint='.$short.'/broker.sock' : 'doctrine-benchmark://results';
             $consumer->setEnv(Process::environment($environment));
             $consumer->start();
@@ -220,10 +207,7 @@ final class Runner
             if (Scenario::Application === $this->options->scenario) {
                 $actorControls[Role::ResultsConsumer->value] = $control;
             }
-            $snapshot = static function (Phase $phase, array $context = []) use ($actorControls, $resources, $resourcesEnabled): void {
-                if (!$resourcesEnabled) {
-                    return;
-                }
+            $snapshot = static function (Phase $phase, array $context = []) use ($actorControls, $resources): void {
                 $actors = [];
                 foreach ($actorControls as $role => $actorControl) {
                     $id = 'snapshot:'.$phase->value;
@@ -234,7 +218,7 @@ final class Runner
                     }
                     $actors[$role] = $actor;
                 }
-                $resources->capture($phase->value, true, $actors, $context);
+                $resources->capture($phase->value, $actors, $context);
             };
             $boundary(Phase::Connected);
             $snapshot(Phase::Connected);
@@ -390,7 +374,7 @@ final class Runner
                 $accounting['idle']['declared_seconds'] = $this->options->idleSeconds();
                 $accounting['idle']['actual_resource_boundary_end_ns'] = $idleWindow['actual_end'];
                 $accounting['idle']['readiness'] = $idleWindow['readiness'];
-                $accounting['idle']['observer_coverage'] = 'detailed empty-receive traces contribute to consumer CPU and IO; idle-specific instrumentation calibration unavailable';
+                $accounting['idle']['observer_coverage'] = 'detailed empty-receive traces contribute to consumer CPU and IO; idle-specific observer perturbation has not been isolated';
                 $accounting['pickup'] = ['count' => self::WAKEUP_MESSAGES, 'readiness' => $pickupProofs, 'coverage' => 'isolated arrivals after prior ACK and worker idle; no backlog latency or idle-interval goodput claim'];
                 if (IntegrityStatus::Pass->value !== $accounting['idle']['integrity_status']) {
                     $accounting['integrity_status'] = IntegrityStatus::Fail->value;
@@ -441,27 +425,15 @@ final class Runner
                 $accounting['accounting_status'] = AccountingStatus::Partial->value;
             }
             $accounting['telemetry_footers'] = [];
-            $aggregatedEmpty = 0;
             foreach (Scenario::Application === $this->options->scenario ? ['publisher', 'consumer', 'results'] : ['publisher', 'consumer'] as $role) {
                 $counters = json_decode((string) file_get_contents($directory.'/'.$role.'.operations.jsonl.counters.json'), true, flags: \JSON_THROW_ON_ERROR);
                 $accounting['telemetry_footers'][$role] = $counters;
-                if (\is_array($counters)) {
-                    foreach ([$measurementPhase->value, Phase::Drain->value] as $phase) {
-                        $value = $counters['aggregated_empty_attempts_by_phase'][$phase] ?? 0;
-                        if (\is_int($value)) {
-                            $aggregatedEmpty += $value;
-                        }
-                    }
-                }
                 if (!\is_array($counters) || 0 !== ($counters['lost_records'] ?? -1) || 0 !== ($counters['write_failures'] ?? -1)) {
                     $accounting['accounting_status'] = AccountingStatus::Partial->value;
                 }
             }
             $execution = ExecutionStatus::Complete;
-            $accounting['receive_attempts'] += $aggregatedEmpty;
-            $accounting['receive_empty'] += $aggregatedEmpty;
-            $accounting['receive_empty_aggregated'] = $aggregatedEmpty;
-            $accounting['empty_receive_latency_coverage'] = TelemetryLevel::Essential === $telemetry ? 'unavailable: counts aggregated in footer' : 'detailed operation spans retained';
+            $accounting['empty_receive_latency_coverage'] = 'detailed operation spans retained';
             if (Scenario::Delayed === $this->options->scenario) {
                 foreach (['requested_delivery_lateness_ms', 'requested_handler_lateness_ms'] as $metric) {
                     if ($accounting['latencies'][$metric]['count'] !== $accounting['expected']) {
@@ -573,7 +545,7 @@ final class Runner
             }
         }
         try {
-            $accounting['resources'] = $resourcesEnabled ? Resources::summarize(Recorder::read($directory.'/resources.jsonl')) : ['coverage' => 'disabled by calibration profile'];
+            $accounting['resources'] = Resources::summarize(Recorder::read($directory.'/resources.jsonl'));
             if (Scenario::Retention === $this->options->scenario && is_file($directory.'/resources.jsonl')) {
                 $accounting['retention'] = ($accounting['retention'] ?? []) + RetentionAnalysis::summarize(Recorder::read($directory.'/resources.jsonl'));
                 $accounting['retention']['configuration'] = $this->options->configuration();
@@ -583,13 +555,12 @@ final class Runner
             $accounting['accounting_status'] = AccountingStatus::Partial->value;
         }
         if (isset($accounting['idle'])) {
-            $accounting['idle'] = IdleMetrics::reconcileFooter($accounting['idle'], $terminal['footers']['consumer'] ?? [], $telemetry);
             $accounting['idle']['resources_by_role'] = $accounting['resources']['phase_roles'][Phase::Idle->value] ?? [];
             $accounting['idle']['resource_coverage'] = 'CPU and IO differences between idle and idle-end role snapshots; boundaries may bracket the declared clock window imperfectly; no periodic memory peak';
         }
         $accounting['resources']['coverage_details'] = $resources->coverage();
-        $accounting['resources']['sampling_policy'] = $resourcesEnabled ? 'phase boundaries only; periodic sampling disabled' : 'disabled';
-        $accounting['resources']['actor_php_policy'] = 'when resource snapshots are enabled: consumer connected, post-warmup and post-drain snapshots; coordinator current at each boundary; broker and persistence unavailable';
+        $accounting['resources']['sampling_policy'] = 'always-on phase boundaries only';
+        $accounting['resources']['actor_php_policy'] = 'consumer connected, post-warmup and post-drain snapshots; coordinator current at each boundary; broker and persistence unavailable';
         if (0 !== $resources->coverage()['lost_samples']) {
             $accounting['accounting_status'] = AccountingStatus::Partial->value;
         }

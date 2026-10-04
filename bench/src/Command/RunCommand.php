@@ -24,7 +24,7 @@ final class RunCommand extends Command
         $workload = $input->getOption('workload');
         $scenario = \is_string($workload) ? Scenario::tryFrom($workload) : null;
         if (null === $scenario) {
-            throw new \InvalidArgumentException('Unsupported workload. Use roundtrip, calibration, idle, delayed, fixed-rate, application or retention.');
+            throw new \InvalidArgumentException('Unsupported workload. Use roundtrip, idle, delayed, fixed-rate, application or retention.');
         }
         $duration = $input->getOption('duration');
         if (!\is_string($duration) || !is_numeric($duration)) {
@@ -71,7 +71,7 @@ final class RunCommand extends Command
 
     protected function configure(): void
     {
-        $this->setDescription('Run native Messenger roundtrip measurements or instrumentation calibration.')
+        $this->setDescription('Run native Messenger workload measurements.')
             ->addOption('smoke', null, InputOption::VALUE_NONE, 'Tiny fixed cohorts, not performance evidence.')
             ->addOption('pilot', null, InputOption::VALUE_NONE, 'Allow dirty sources and label the capture as a pilot.')
             ->addOption('duration', null, InputOption::VALUE_REQUIRED, 'Fixed measured window in seconds.', (string) RunOptionsDTO::DEFAULT_DURATION_SECONDS)
@@ -83,7 +83,7 @@ final class RunCommand extends Command
             ->addOption('cycles', null, InputOption::VALUE_REQUIRED, 'Retention cycles, 20..1000.', (string) RunOptionsDTO::DEFAULT_CYCLES)
             ->addOption('cycle-messages', null, InputOption::VALUE_REQUIRED, 'Messages per retention cycle, 1..10000.', (string) RunOptionsDTO::DEFAULT_CYCLE_MESSAGES)
             ->addOption('settling', null, InputOption::VALUE_REQUIRED, 'Retention settling seconds, positive and at most 60.', (string) RunOptionsDTO::DEFAULT_SETTLING_SECONDS)
-            ->addOption('workload', null, InputOption::VALUE_REQUIRED, 'roundtrip, calibration, idle, delayed, fixed-rate, application or retention.', 'roundtrip');
+            ->addOption('workload', null, InputOption::VALUE_REQUIRED, 'roundtrip, idle, delayed, fixed-rate, application or retention.', 'roundtrip');
     }
 
     protected function execute(InputInterface $input, OutputInterface $output): int

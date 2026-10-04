@@ -73,7 +73,7 @@ final class FixedRateTest extends TestCase
         $this->assertSame(7.5, $options->rate);
         $this->assertSame(3, $options->capacity);
         $this->assertSame(60.0, $options->fixedRateSeconds());
-        $this->assertCount(10, $options->schedule());
+        $this->assertCount(2, $options->schedule());
         $this->assertSame('one synchronous publisher in coordinator, one native consumer', $options->configuration()['topology']);
         $smoke = new RunOptionsDTO(Scenario::FixedRate, true, false, 60, 5);
         $this->assertSame(0.2, $smoke->fixedRateSeconds());

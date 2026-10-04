@@ -13,12 +13,9 @@ final class Recorder
     private int $lost = 0;
     private int $writeFailures = 0;
     private int $sequence = 0;
-    /** @var array<string, int> */
-    private array $suppressedEmpty = [];
 
     /** @param \Closure(string): bool $write */
-    // Full is the normal trace. Essential preserves every message identity and failure, aggregating empty attempts.
-    public function __construct(private readonly \Closure $write, private readonly int $capacity, private readonly string $run, private readonly string $role, private readonly TelemetryLevel $level = TelemetryLevel::Detailed)
+    public function __construct(private readonly \Closure $write, private readonly int $capacity, private readonly string $run, private readonly string $role)
     {
         if ($capacity < 1) {
             throw new \InvalidArgumentException('Telemetry capacity must be positive.');
@@ -37,11 +34,6 @@ final class Recorder
      */
     public function record(Operation $operation, Outcome $outcome, Phase $phase, string $id, string $correlation, int $started, int $ended, string $error, ?int $payloadBytes = null, ?int $activeNanoseconds = null, ?int $scheduledNs = null, array $details = [], array $eligibility = []): void
     {
-        if (TelemetryLevel::Essential === $this->level && Operation::Receive === $operation && Outcome::Empty === $outcome) {
-            $this->suppressedEmpty[$phase->value] = ($this->suppressedEmpty[$phase->value] ?? 0) + 1;
-
-            return;
-        }
         $line = json_encode(['run' => $this->run, 'role' => $this->role, 'pid' => getmypid(), 'operation_id' => $id, 'attempt' => 1, 'operation' => $operation->value, 'outcome' => $outcome->value, 'phase' => $phase->value, 'correlation' => $correlation, 'payload_bytes' => $payloadBytes, 'started_ns' => $started, 'ended_ns' => $ended, 'active_ns' => $activeNanoseconds, 'scheduled_ns' => $scheduledNs, 'error_details' => $details, 'eligibility' => $eligibility, 'span_scope' => Operation::Receive === $operation ? 'iterable-lifetime' : 'public-boundary', 'error' => $error, 'unknown_commit' => Outcome::Error === $outcome && \in_array($operation, [Operation::Send, Operation::Ack, Operation::Reject], true)], \JSON_THROW_ON_ERROR)."\n";
         if (\strlen($line) > $this->capacity) {
             ++$this->lost;
@@ -74,7 +66,7 @@ final class Recorder
     /** @return array<string, mixed> */
     public function counters(): array
     {
-        return ['lost_records' => $this->lost, 'write_failures' => $this->writeFailures, 'buffered_bytes' => \strlen($this->buffer), 'aggregated_empty_attempts_by_phase' => $this->suppressedEmpty];
+        return ['lost_records' => $this->lost, 'write_failures' => $this->writeFailures, 'buffered_bytes' => \strlen($this->buffer)];
     }
 
     /** @return \Generator<int, array<string, mixed>> */

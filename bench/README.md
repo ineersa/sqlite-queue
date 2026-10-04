@@ -10,7 +10,7 @@ Install dependencies with `composer install`, then run a small correctness captu
 	XDEBUG_MODE=off vendor/bin/castor bench --smoke --workload=roundtrip
 ```
 
-Smoke runs are not performance evidence. Other selectable workloads are `idle`, `fixed-rate`, `application`, `delayed`, `retention`, and `calibration`.
+Smoke runs are not performance evidence. Other selectable workloads are `idle`, `fixed-rate`, `application`, `delayed`, and `retention`.
 
 ## Run a pilot
 
@@ -24,12 +24,12 @@ The application workload has an execution consumer that waits synchronously for 
 
 ## Run a declared comparison
 
-Formal runs require a clean Git checkout. Choose the complete configuration before looking at outcomes. Defaults are five paired repetitions and 60-second windows.
+Formal runs require a clean Git checkout. Choose the complete configuration before looking at outcomes. Defaults are one pair and 60 seconds per backend, about two minutes plus setup for time-based workloads. Recording and resource collection use one fixed policy, without instrumentation profiles.
 
 ```sh
-	XDEBUG_MODE=off vendor/bin/castor bench --workload=fixed-rate --duration=60 --repetitions=5 --rate=20 --capacity=64
-	XDEBUG_MODE=off vendor/bin/castor bench --workload=application --duration=60 --repetitions=5 --rate=5 --capacity=16 --handler-ms=100
-	XDEBUG_MODE=off vendor/bin/castor bench --workload=retention --cycles=20 --cycle-messages=20 --settling=0.25 --repetitions=5
+	XDEBUG_MODE=off vendor/bin/castor bench --workload=fixed-rate --duration=60 --repetitions=1 --rate=20 --capacity=64
+	XDEBUG_MODE=off vendor/bin/castor bench --workload=application --duration=60 --repetitions=1 --rate=5 --capacity=16 --handler-ms=100
+	XDEBUG_MODE=off vendor/bin/castor bench --workload=retention --cycles=20 --cycle-messages=20 --settling=0.25 --repetitions=1
 ```
 
 Do not run compared backends concurrently or run builds during measurement. Every planned repetition remains in the report. Exit code 1 can mean a public operation failed, integrity or telemetry coverage failed, or the generator could not maintain the planned arrivals. Do not retry until green.

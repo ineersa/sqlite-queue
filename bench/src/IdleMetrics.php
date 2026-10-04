@@ -7,27 +7,6 @@ namespace Ineersa\SqliteQueue\Bench;
 /** Half-open idle window. Attempts are counted at public receive return, not WAIT entry. */
 final class IdleMetrics
 {
-    /** @param array<string, mixed> $summary
-     * @param array<string, mixed> $consumerFooter
-     *
-     * @return array<string, mixed>
-     */
-    public static function reconcileFooter(array $summary, array $consumerFooter, TelemetryLevel $level): array
-    {
-        if (TelemetryLevel::Detailed === $level) {
-            $summary['receive_counter_coverage'] = 'detailed receive-return boundaries in the declared window';
-
-            return $summary;
-        }
-        $aggregated = $consumerFooter['aggregated_empty_attempts_by_phase'][Phase::Idle->value] ?? null;
-        $summary['phase_aggregated_empty_attempts'] = \is_int($aggregated) && $aggregated >= 0 ? $aggregated : null;
-        $summary['receive_attempts'] = null;
-        $summary['receive_empty'] = null;
-        $summary['receive_counter_coverage'] = 'unavailable for the exact window: Essential phase totals have no per-attempt timestamps; idle-phase aggregate is reported separately';
-
-        return $summary;
-    }
-
     /** @param iterable<array<string, mixed>> $events
      * @return array<string, mixed>
      */
@@ -60,6 +39,6 @@ final class IdleMetrics
             }
         }
 
-        return $counts + ['start_ns' => $start, 'end_ns' => $end, 'window_seconds' => ($end - $start) / 1e9, 'counter_scope' => 'consumer public receive returns in [start,end); publisher attempts at invocation', 'wait_registrations' => null, 'wait_wakes' => null, 'wait_timeouts' => null, 'wait_counters_coverage' => 'unavailable; native bundle WAIT is not replaced or internally instrumented', 'integrity_status' => 0 === $counts['publication_attempts'] && 0 === $counts['unexpected_work_records'] && 0 === $counts['receive_errors'] ? IntegrityStatus::Pass->value : IntegrityStatus::Fail->value];
+        return $counts + ['start_ns' => $start, 'end_ns' => $end, 'window_seconds' => ($end - $start) / 1e9, 'receive_counter_coverage' => 'detailed receive-return boundaries in the declared window', 'counter_scope' => 'consumer public receive returns in [start,end); publisher attempts at invocation', 'wait_registrations' => null, 'wait_wakes' => null, 'wait_timeouts' => null, 'wait_counters_coverage' => 'unavailable; native bundle WAIT is not replaced or internally instrumented', 'integrity_status' => 0 === $counts['publication_attempts'] && 0 === $counts['unexpected_work_records'] && 0 === $counts['receive_errors'] ? IntegrityStatus::Pass->value : IntegrityStatus::Fail->value];
     }
 }

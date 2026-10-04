@@ -6,12 +6,11 @@ namespace Ineersa\SqliteQueue\Bench\DTO;
 
 use Ineersa\SqliteQueue\Bench\Backend;
 use Ineersa\SqliteQueue\Bench\Scenario;
-use Ineersa\SqliteQueue\Bench\TelemetryLevel;
 
 final readonly class RunOptionsDTO
 {
     public const DEFAULT_DURATION_SECONDS = 60.0;
-    public const DEFAULT_REPETITIONS = 5;
+    public const DEFAULT_REPETITIONS = 1;
     public const DRAIN_TIMEOUT_SECONDS = 15;
     public const WARMUP_TIMEOUT_SECONDS = 20;
     public const DEFAULT_DELAY_MILLISECONDS = 2000;
@@ -31,11 +30,11 @@ final readonly class RunOptionsDTO
     public const MAX_SETTLING_SECONDS = 60.0;
     public const SMOKE_IDLE_SECONDS = 0.1;
 
-    // Defaults define the standard delayed, fixed-rate and application profiles; other scenarios do not apply them.
+    // Defaults define the standard delayed, fixed-rate and application settings; other scenarios do not apply them.
     public function __construct(public Scenario $scenario, public bool $smoke, public bool $pilot, public float $durationSeconds, public int $repetitions, public int $delayMilliseconds = self::DEFAULT_DELAY_MILLISECONDS, public float $rate = self::DEFAULT_RATE, public int $capacity = self::DEFAULT_CAPACITY, public int $handlerMilliseconds = self::DEFAULT_HANDLER_MILLISECONDS, public int $cycles = self::DEFAULT_CYCLES, public int $cycleMessages = self::DEFAULT_CYCLE_MESSAGES, public float $settlingSeconds = self::DEFAULT_SETTLING_SECONDS)
     {
-        if (!\in_array($scenario, [Scenario::Roundtrip, Scenario::Calibration, Scenario::Idle, Scenario::Delayed, Scenario::FixedRate, Scenario::Application, Scenario::Retention], true)) {
-            throw new \InvalidArgumentException('Only roundtrip, calibration, idle, delayed, fixed-rate, application and retention are implemented.');
+        if (!\in_array($scenario, [Scenario::Roundtrip, Scenario::Idle, Scenario::Delayed, Scenario::FixedRate, Scenario::Application, Scenario::Retention], true)) {
+            throw new \InvalidArgumentException('Only roundtrip, idle, delayed, fixed-rate, application and retention are implemented.');
         }
         if ($cycles < self::DEFAULT_CYCLES) {
             throw new \InvalidArgumentException('Retention requires at least 20 cycles.');
@@ -102,23 +101,16 @@ final readonly class RunOptionsDTO
         }
     }
 
-    /** @return list<array{id: string, backend: string, repetition: int, telemetry: string, scenario: string, resource_snapshots: bool}> */
+    /** @return list<array{id: string, backend: string, repetition: int, scenario: string}> */
     public function schedule(): array
     {
         $schedule = [];
-        $profiles = Scenario::Calibration === $this->scenario ? [[TelemetryLevel::Detailed, true], [TelemetryLevel::Essential, false], [TelemetryLevel::Detailed, false], [TelemetryLevel::Essential, true]] : [[TelemetryLevel::Detailed, true]];
         $repetitions = $this->smoke ? 1 : $this->repetitions;
         for ($repetition = 1; $repetition <= $repetitions; ++$repetition) {
             $backends = 1 === $repetition % 2 ? [Backend::Doctrine, Backend::Broker] : [Backend::Broker, Backend::Doctrine];
-            $orderedProfiles = 1 === $repetition % 2 ? $profiles : array_reverse($profiles);
-            foreach ($orderedProfiles as [$telemetry, $resources]) {
-                foreach ($backends as $backend) {
-                    $id = $backend->value.'-'.$repetition.'-'.$telemetry->value.'-'.($resources ? 'resources' : 'no-resources');
-                    if ($this->smoke && Scenario::Calibration !== $this->scenario) {
-                        $id = $backend->value;
-                    }
-                    $schedule[] = ['id' => $id, 'backend' => $backend->value, 'repetition' => $repetition, 'telemetry' => $telemetry->value, 'scenario' => $this->scenario->value, 'resource_snapshots' => $resources];
-                }
+            foreach ($backends as $backend) {
+                $id = $this->smoke ? $backend->value : $backend->value.'-'.$repetition;
+                $schedule[] = ['id' => $id, 'backend' => $backend->value, 'repetition' => $repetition, 'scenario' => $this->scenario->value];
             }
         }
 
@@ -135,7 +127,7 @@ final readonly class RunOptionsDTO
             return ['scenario' => $this->scenario->value, 'mode' => $this->smoke ? 'smoke' : ($this->pilot ? 'pilot' : 'formal'), 'duration_seconds' => $this->fixedRateSeconds(), 'repetitions' => $this->smoke ? 1 : $this->repetitions, 'rate' => $this->rate, 'capacity' => $this->capacity, 'handler_milliseconds' => $this->handlerMilliseconds, 'application_interpretation' => Scenario::Application === $this->scenario ? 'synthetic synchronous external-wait followed by Messenger result dispatch; not production or keepalive reproduction' : null, 'topology' => Scenario::Application === $this->scenario ? 'one synchronous publisher, one execution consumer, one result/control consumer' : 'one synchronous publisher in coordinator, one native consumer', 'arrival_schedule' => 'start + floor(index * 1e9 / rate), exclusive window end', 'capacity_unit' => Scenario::Application === $this->scenario ? 'workflows awaiting result ACK; execution ACK verified after drain' : 'messages awaiting ACK', 'overflow_policy' => 'drop overdue arrivals beyond available outstanding capacity; never shift schedule'];
         }
 
-        return ['scenario' => $this->scenario->value, 'mode' => $this->smoke ? 'smoke' : ($this->pilot ? 'pilot' : 'formal'), 'duration_seconds' => $this->durationSeconds, 'repetitions' => $this->smoke ? 1 : $this->repetitions, 'in_flight_limit' => 1, 'delay_milliseconds' => $this->delayMilliseconds, 'delay_applies' => Scenario::Delayed === $this->scenario, 'idle_seconds' => Scenario::Idle === $this->scenario ? $this->idleSeconds() : null, 'finite_cohort_messages' => $this->finiteCohortMessages(), 'duration_scope' => Scenario::Idle === $this->scenario ? 'no-publication interval, followed by separate finite pickup cohort' : 'fixed measurement window outside smoke', 'telemetry_profiles' => 'detailed=operation records; essential suppresses only empty receive records, preserving exact message integrity', 'phase_budgets_seconds' => ['startup' => \Ineersa\SqliteQueue\Bench\Config::STARTUP_TIMEOUT_S, 'warmup' => $this->warmupTimeoutSeconds(), 'measure' => $this->durationSeconds, 'drain' => $this->drainTimeoutSeconds(), 'audit' => \Ineersa\SqliteQueue\Bench\Config::STARTUP_TIMEOUT_S, 'shutdown' => \Ineersa\SqliteQueue\Bench\Config::KILL_GRACE_S], 'measurement_deadline_policy' => 'no new publish after the fixed window; synchronous API calls retain their own communication or busy timeouts; an outstanding completion drains separately'];
+        return ['scenario' => $this->scenario->value, 'mode' => $this->smoke ? 'smoke' : ($this->pilot ? 'pilot' : 'formal'), 'duration_seconds' => $this->durationSeconds, 'repetitions' => $this->smoke ? 1 : $this->repetitions, 'in_flight_limit' => 1, 'delay_milliseconds' => $this->delayMilliseconds, 'delay_applies' => Scenario::Delayed === $this->scenario, 'idle_seconds' => Scenario::Idle === $this->scenario ? $this->idleSeconds() : null, 'finite_cohort_messages' => $this->finiteCohortMessages(), 'duration_scope' => Scenario::Idle === $this->scenario ? 'no-publication interval, followed by separate finite pickup cohort' : 'fixed measurement window outside smoke', 'telemetry_policy' => 'all operation records, including empty receive attempts; bounded buffering', 'phase_budgets_seconds' => ['startup' => \Ineersa\SqliteQueue\Bench\Config::STARTUP_TIMEOUT_S, 'warmup' => $this->warmupTimeoutSeconds(), 'measure' => $this->durationSeconds, 'drain' => $this->drainTimeoutSeconds(), 'audit' => \Ineersa\SqliteQueue\Bench\Config::STARTUP_TIMEOUT_S, 'shutdown' => \Ineersa\SqliteQueue\Bench\Config::KILL_GRACE_S], 'measurement_deadline_policy' => 'no new publish after the fixed window; synchronous API calls retain their own communication or busy timeouts; an outstanding completion drains separately'];
     }
 
     public function processTimeoutSeconds(): float

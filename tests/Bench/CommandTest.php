@@ -44,8 +44,8 @@ final class CommandTest extends TestCase
         $command = new RunCommand();
         $options = RunCommand::options(new ArrayInput([], $command->getDefinition()));
         $this->assertSame(60.0, $options->durationSeconds);
-        $this->assertSame(5, $options->repetitions);
-        $this->assertCount(10, $options->schedule());
+        $this->assertSame(1, $options->repetitions);
+        $this->assertCount(2, $options->schedule());
         $this->expectException(\RuntimeException::class);
         Manifest::assertSourceMode($options, '?? unrelated-user-file');
     }

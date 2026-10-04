@@ -12,7 +12,6 @@ enum Scenario: string
     case Application = 'application';
     case Delayed = 'delayed';
     case Retention = 'retention';
-    case Calibration = 'calibration';
 
     /** @return list<self> */
     public static function core(): array

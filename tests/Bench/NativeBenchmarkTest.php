@@ -193,28 +193,4 @@ final class NativeBenchmarkTest extends TestCase
             $this->assertFileExists($directory.'/'.$id.'/config.json');
         }
     }
-
-    public function testCalibrationSmokeRetainsAllProfilesAndIntegrity(): void
-    {
-        $root = \dirname(__DIR__, 2);
-        $process = new Process([\PHP_BINARY, $root.'/bin/benchmark', 'run', '--smoke', '--workload=calibration'], $root, timeout: 120);
-        $process->mustRun();
-        $output = json_decode(trim($process->getOutput()), true, flags: \JSON_THROW_ON_ERROR);
-        $summary = json_decode(file_get_contents($output['capture'].'/summary.json'), true, flags: \JSON_THROW_ON_ERROR);
-        $this->assertCount(8, $summary['schedule']);
-        $this->assertCount(8, $summary['results']);
-        $this->assertCount(6, $summary['calibration']['comparisons']);
-        $this->assertSame('insufficient-duration-or-repetitions', $summary['calibration']['budget_status']);
-        foreach ($summary['results'] as $id => $run) {
-            $this->assertSame('complete', $run['execution_status']);
-            $this->assertSame('pass', $run['integrity_status']);
-            $this->assertSame('complete', $run['accounting_status']);
-            $this->assertSame(4, $run['unique_completions']);
-            $this->assertSame(4, $run['latencies']['full_cycle_ms']['count']);
-            if (!$run['resource_snapshots']) {
-                $this->assertFileDoesNotExist($output['capture'].'/'.$id.'/resources.jsonl');
-                $this->assertSame('disabled', $run['resources']['sampling_policy']);
-            }
-        }
-    }
 }

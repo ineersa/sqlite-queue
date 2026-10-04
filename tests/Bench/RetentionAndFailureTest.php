@@ -175,7 +175,7 @@ final class RetentionAndFailureTest extends TestCase
         }
         file_put_contents($directory.'/consumer.operations.jsonl', implode("\n", $consumer)."\n");
         foreach (['publisher', 'consumer'] as $role) {
-            file_put_contents($directory.'/'.$role.'.operations.jsonl.counters.json', json_encode(['finalized' => true, 'lost_records' => 0, 'write_failures' => 0, 'buffered_bytes' => 0, 'aggregated_empty_attempts_by_phase' => []], \JSON_THROW_ON_ERROR));
+            file_put_contents($directory.'/'.$role.'.operations.jsonl.counters.json', json_encode(['finalized' => true, 'lost_records' => 0, 'write_failures' => 0, 'buffered_bytes' => 0], \JSON_THROW_ON_ERROR));
         }
 
         return $directory;

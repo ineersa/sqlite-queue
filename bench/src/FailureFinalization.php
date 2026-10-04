@@ -62,18 +62,6 @@ final class FailureFinalization
         $terminal = self::terminalFooters($directory, $roles);
         $footers = $terminal['footers'];
         $issues = array_replace_recursive($issues, $terminal['issues']);
-        $aggregatedEmpty = 0;
-        foreach ($footers as $footer) {
-            foreach ([$phase->value, ...(Phase::Warmup === $phase ? [] : [Phase::Drain->value])] as $key) {
-                $value = $footer['aggregated_empty_attempts_by_phase'][$key] ?? 0;
-                if (\is_int($value)) {
-                    $aggregatedEmpty += $value;
-                }
-            }
-        }
-        $accounting['receive_attempts'] += $aggregatedEmpty;
-        $accounting['receive_empty'] += $aggregatedEmpty;
-        $accounting['receive_empty_aggregated'] = $aggregatedEmpty;
         $accounting['telemetry_footers'] = $footers;
         $accounting['accounting_status'] = [] === $issues ? AccountingStatus::Complete->value : AccountingStatus::Partial->value;
         if ([] !== $issues && IntegrityStatus::Pass->value === $accounting['integrity_status']) {

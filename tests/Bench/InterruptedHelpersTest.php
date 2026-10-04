@@ -45,14 +45,14 @@ final class InterruptedHelpersTest extends TestCase
             $rows[] = json_decode($line, true, flags: \JSON_THROW_ON_ERROR);
 
             return true;
-        }, 100, 4096, false);
+        }, 100, 4096);
         $resources->register(Role::Consumer, 123);
-        $resources->capture('baseline', true);
+        $resources->capture('baseline');
         $this->assertSame(2, $rows[0]['user_seconds']);
         $this->assertSame(12288, $rows[0]['rss_bytes']);
         $this->assertNull($rows[0]['pss_bytes']);
         $start = 11;
-        $resources->capture('drain', true);
+        $resources->capture('drain');
         $this->assertSame('pid-reused', $rows[1]['coverage']);
         $this->assertNull($rows[1]['rss_bytes']);
     }

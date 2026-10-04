@@ -71,9 +71,9 @@ function test_broker(#[AsOption(description: 'PHPUnit test-name filter.')] ?stri
 function bench(
     #[AsOption(description: 'Run smoke workloads, not a performance capture.')] bool $smoke = false,
     #[AsOption(description: 'Allow dirty source snapshots, labelled as a pilot.')] bool $pilot = false,
-    #[AsOption(description: 'Roundtrip, calibration, idle, delayed, fixed-rate, application or retention.')] string $workload = 'roundtrip',
+    #[AsOption(description: 'Roundtrip, idle, delayed, fixed-rate, application or retention.')] string $workload = 'roundtrip',
     #[AsOption(description: 'Measured window in seconds.')] float $duration = 60,
-    #[AsOption(description: 'Predeclared paired repetitions.')] int $repetitions = 5,
+    #[AsOption(description: 'Predeclared paired repetitions.')] int $repetitions = 1,
     #[AsOption(description: 'Fixed-rate arrivals per second.')] float $rate = 20,
     #[AsOption(description: 'Maximum outstanding fixed-rate messages.')] int $capacity = 64,
     #[AsOption(description: 'Application synchronous handler work, 0..10000 milliseconds.')] int $handlerMs = 100,

@@ -7,16 +7,14 @@ namespace Ineersa\SqliteQueue\Bench;
 /** Fixed known-role registry. Records stream to disk; no whole-host scan or retained series. */
 final class Resources
 {
-    public const SAMPLE_INTERVAL_NS = 200000000;
     /** @var array<string, array{pid: int, start_ticks: int}> */
     private array $registry = [];
-    private int $next = 0;
     private int $lost = 0;
 
     /** @param \Closure(string): (string|false) $read
      * @param \Closure(string): bool $write
      */
-    public function __construct(private readonly Clock $clock, private readonly \Closure $read, private readonly \Closure $write, private readonly int $ticksPerSecond, private readonly int $pageBytes, private readonly bool $periodic)
+    public function __construct(private readonly Clock $clock, private readonly \Closure $read, private readonly \Closure $write, private readonly int $ticksPerSecond, private readonly int $pageBytes)
     {
         if ($ticksPerSecond < 1) {
             throw new \InvalidArgumentException('CPU tick frequency must be positive.');
@@ -35,22 +33,13 @@ final class Resources
         $this->registry[$role->value] = ['pid' => $pid, 'start_ticks' => $stat['start_ticks']];
     }
 
-    public function tick(string $phase): void
-    {
-        $now = $this->clock->now();
-        if ($this->periodic && $now >= $this->next) {
-            $this->capture($phase, false);
-            $this->next = $now + self::SAMPLE_INTERVAL_NS;
-        }
-    }
-
     /** @param array<string, array<string, mixed>> $actors Cooperative PHP snapshots, empty when unavailable
      * @param array<string, mixed> $context optional fixed-size cycle metadata, absent outside retention
      */
-    public function capture(string $phase, bool $detailed, array $actors = [], array $context = []): void
+    public function capture(string $phase, array $actors = [], array $context = []): void
     {
         foreach ($this->registry as $role => $identity) {
-            $row = $this->snapshot($role, $identity, $phase, $detailed);
+            $row = $this->snapshot($role, $identity, $phase);
             $actor = $actors[$role] ?? [];
             if (($actor['pid'] ?? null) === $identity['pid'] && 'observed' === $row['coverage']) {
                 foreach (['used_bytes' => 'php_used_bytes', 'reserved_bytes' => 'php_reserved_bytes', 'peak_bytes' => 'php_peak_bytes'] as $field => $target) {
@@ -65,7 +54,7 @@ final class Resources
     /** @return array<string, mixed> */
     public function coverage(): array
     {
-        return ['registry' => $this->registry, 'lost_samples' => $this->lost, 'interval_milliseconds' => self::SAMPLE_INTERVAL_NS / 1000000, 'pss_policy' => 'phase-only', 'product_total' => 'partial: publisher and observer share a process', 'process_exit_accounting' => 'unavailable', 'broker_php_and_gauges' => 'unavailable'];
+        return ['registry' => $this->registry, 'lost_samples' => $this->lost, 'sampling_policy' => 'phase boundaries only', 'pss_policy' => 'phase-only', 'product_total' => 'partial: publisher and observer share a process', 'process_exit_accounting' => 'unavailable', 'broker_php_and_gauges' => 'unavailable'];
     }
 
     /** @param iterable<array<string, mixed>> $rows
@@ -124,7 +113,7 @@ final class Resources
     /** @param array{pid: int, start_ticks: int} $identity
      * @return array<string, mixed>
      */
-    private function snapshot(string $role, array $identity, string $phase, bool $detailed): array
+    private function snapshot(string $role, array $identity, string $phase): array
     {
         $pid = $identity['pid'];
         $stat = $this->stat($pid);
@@ -151,19 +140,17 @@ final class Resources
             }
             $row['io'] = $values;
         }
-        if ($detailed) {
-            $smaps = ($this->read)('/proc/'.$pid.'/smaps_rollup');
-            if (false !== $smaps) {
-                $private = [];
-                foreach (['Pss', 'Private_Clean', 'Private_Dirty'] as $field) {
-                    if (preg_match('/^'.$field.':\s+([0-9]+) kB$/m', $smaps, $match)) {
-                        $private[$field] = (int) $match[1] * 1024;
-                    }
+        $smaps = ($this->read)('/proc/'.$pid.'/smaps_rollup');
+        if (false !== $smaps) {
+            $private = [];
+            foreach (['Pss', 'Private_Clean', 'Private_Dirty'] as $field) {
+                if (preg_match('/^'.$field.':\s+([0-9]+) kB$/m', $smaps, $match)) {
+                    $private[$field] = (int) $match[1] * 1024;
                 }
-                $row['pss_bytes'] = $private['Pss'] ?? null;
-                if (isset($private['Private_Clean'], $private['Private_Dirty'])) {
-                    $row['private_bytes'] = $private['Private_Clean'] + $private['Private_Dirty'];
-                }
+            }
+            $row['pss_bytes'] = $private['Pss'] ?? null;
+            if (isset($private['Private_Clean'], $private['Private_Dirty'])) {
+                $row['private_bytes'] = $private['Private_Clean'] + $private['Private_Dirty'];
             }
         }
         if (Role::ObserverPublisher->value === $role) {
