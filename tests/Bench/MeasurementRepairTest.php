@@ -9,7 +9,6 @@ use Ineersa\SqliteQueue\Bench\CohortJournal;
 use Ineersa\SqliteQueue\Bench\Command\AuditCommand;
 use Ineersa\SqliteQueue\Bench\Control;
 use Ineersa\SqliteQueue\Bench\DTO\RunOptionsDTO;
-use Ineersa\SqliteQueue\Bench\IdleMetrics;
 use Ineersa\SqliteQueue\Bench\Phase;
 use Ineersa\SqliteQueue\Bench\Recorder;
 use Ineersa\SqliteQueue\Bench\Runner;
@@ -21,7 +20,7 @@ use Symfony\Component\Messenger\MessageBusInterface;
 
 final class MeasurementRepairTest extends TestCase
 {
-    public function testNormalRecorderRetainsEveryEmptyIdleReceiveAttempt(): void
+    public function testCommonRecorderAggregatesEveryEmptyIdleReceiveAttempt(): void
     {
         $bytes = '';
         $recorder = new Recorder(static function (string $chunk) use (&$bytes): bool {
@@ -33,12 +32,12 @@ final class MeasurementRepairTest extends TestCase
             $recorder->record(\Ineersa\SqliteQueue\Bench\Operation::Receive, \Ineersa\SqliteQueue\Bench\Outcome::Empty, Phase::Idle, $recorder->nextId(), '', 100, 110 + $index, '');
         }
         $recorder->flush();
-        $events = array_map(static fn (string $line): array => json_decode($line, true, flags: \JSON_THROW_ON_ERROR), explode("\n", trim($bytes)));
-        $summary = IdleMetrics::summarize($events, 100, 200);
-        $this->assertCount(3, $events);
-        $this->assertSame(3, $summary['receive_attempts']);
-        $this->assertSame(3, $summary['receive_empty']);
-        $this->assertSame('detailed receive-return boundaries in the declared window', $summary['receive_counter_coverage']);
+        $this->assertSame('', $bytes);
+        $aggregate = $recorder->counters()['empty_receives_by_phase']['idle'];
+        $this->assertSame(3, $aggregate['count']);
+        $this->assertSame(33, $aggregate['sum_active_ns']);
+        $this->assertSame(100, $aggregate['first_started_ns']);
+        $this->assertSame(112, $aggregate['last_ended_ns']);
     }
 
     public function testAuditAcquisitionIsStructurallyReadOnlyWithUriCharacters(): void
@@ -90,7 +89,7 @@ final class MeasurementRepairTest extends TestCase
         $control = new Control($pair[0]);
         $bus = $this->createMock(MessageBusInterface::class);
         $bus->expects($this->once())->method('dispatch')->willThrowException(new \RuntimeException('controlled publish failure'));
-        $runner = new Runner(static function (string $line): void {}, new RunOptionsDTO(Scenario::Retention, true, false, 60, 5, cycles: 20, cycleMessages: 1, settlingSeconds: 0.001));
+        $runner = new Runner(static function (string $line): void {}, new RunOptionsDTO(Scenario::Retention, true, 60, \Fabpot\Amp\Sqlite\SqliteSynchronousMode::Normal));
         $bounds = ['phase' => Phase::Warmup, 'start' => 1, 'end' => 2];
         $snapshot = static function (Phase $phase, array $context): void {};
         $boundary = static fn (Phase $phase): int => match ($phase) {

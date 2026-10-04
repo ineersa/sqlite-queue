@@ -4,11 +4,10 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Bench;
 
-/** Declared settings for the currently implemented native roundtrip smoke. */
+/** Shared queue and actor settings for the native comparisons. */
 final class Config
 {
     public const METHOD_REVISION = 'native-messenger-diagnostic';
-    public const SCHEMA_VERSION = 4;
     public const SMALL_PAYLOAD_BYTES = 256;
     public const LARGE_PAYLOAD_BYTES = 16384;
     public const BUSY_TIMEOUT_MS = 5000;
@@ -16,11 +15,5 @@ final class Config
     public const STARTUP_TIMEOUT_S = 20;
     public const KILL_GRACE_S = 5;
     public const EXPECTED_JOURNAL_MODE = 'wal';
-    public const EXPECTED_SYNCHRONOUS = 2;
     public const MESSENGER_TABLE = 'messenger_messages';
-
-    public static function rootDir(): string
-    {
-        return \dirname(__DIR__, 2);
-    }
 }

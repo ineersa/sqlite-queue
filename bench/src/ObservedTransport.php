@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Bench;
 
 use Symfony\Component\Messenger\Envelope;
-use Symfony\Component\Messenger\Stamp\DelayStamp;
 use Symfony\Component\Messenger\Transport\TransportInterface;
 
 /** Observation only. The WAIT subscriber is wired to the original broker transport. */
@@ -21,6 +20,7 @@ final class ObservedTransport implements TransportInterface
     {
         $id = $this->recorder->nextId();
         $start = $this->clock->now();
+        $entryPhase = $this->phase;
         $activeStart = $start;
         $activeNanoseconds = 0;
         $suspended = false;
@@ -54,7 +54,7 @@ final class ObservedTransport implements TransportInterface
             if (!$suspended) {
                 $activeNanoseconds += $end - $activeStart;
             }
-            $this->recorder->record(Operation::Receive, $outcome, $this->phase, $id, '', $start, $end, $error, activeNanoseconds: $activeNanoseconds, details: $details);
+            $this->recorder->record(Operation::Receive, $outcome, Outcome::Empty === $outcome ? $entryPhase : $this->phase, $id, '', $start, $end, $error, activeNanoseconds: $activeNanoseconds, details: $details);
         }
         if (null !== $failure) {
             throw $failure;
@@ -66,8 +66,6 @@ final class ObservedTransport implements TransportInterface
         $message = $this->message($envelope);
         $id = $this->recorder->nextId();
         $start = $this->clock->now();
-        $stamp = $envelope->last(DelayStamp::class);
-        $eligibility = $stamp instanceof DelayStamp ? RequestedEligibility::at($start, (int) floor(microtime(true) * 1000), $stamp->getDelay()) : [];
         $outcome = Outcome::Error;
         $error = '';
         $details = [];
@@ -81,7 +79,7 @@ final class ObservedTransport implements TransportInterface
             $details = ErrorDetails::from($e);
             throw $e;
         } finally {
-            $this->recorder->record(Operation::Send, $outcome, $message->phase, $id, $message->id, $start, $this->clock->now(), $error, \strlen($message->payload), scheduledNs: $message->scheduledNs, details: $details, eligibility: $eligibility);
+            $this->recorder->record(Operation::Send, $outcome, $message->phase, $id, $message->id, $start, $this->clock->now(), $error, \strlen($message->payload), details: $details);
         }
     }
 
@@ -120,7 +118,7 @@ final class ObservedTransport implements TransportInterface
             $details = ErrorDetails::from($e);
             throw $e;
         } finally {
-            $this->recorder->record($operation, $outcome, $message->phase, $id, $message->id, $start, $this->clock->now(), $error, \strlen($message->payload), scheduledNs: $message->scheduledNs, details: $details);
+            $this->recorder->record($operation, $outcome, $message->phase, $id, $message->id, $start, $this->clock->now(), $error, \strlen($message->payload), details: $details);
         }
         // Execution ACK remains telemetry; only the result ACK signals workflow completion.
         if ($message instanceof ApplicationMessage) {

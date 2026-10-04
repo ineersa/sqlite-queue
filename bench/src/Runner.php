@@ -7,7 +7,6 @@ namespace Ineersa\SqliteQueue\Bench;
 use Ineersa\SqliteQueue\Bench\DTO\RunOptionsDTO;
 use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\Messenger\MessageBusInterface;
-use Symfony\Component\Messenger\Stamp\DelayStamp;
 use Symfony\Component\Process\Process as ChildProcess;
 
 /** Tiny characterization foundation only. No capacity or full measurement acceptance claims. */
@@ -18,9 +17,15 @@ final class Runner
     public const SETTLING_SECONDS = 0.1;
     public const WAKEUP_MESSAGES = 2;
 
-    /** @param \Closure(string): void $report */
-    public function __construct(private readonly \Closure $report, private readonly RunOptionsDTO $options)
+    /** @var \Closure(string, string, Backend): array<string, mixed> */
+    private readonly \Closure $executeBackend;
+
+    /** @param \Closure(string): void $report
+     * @param ?\Closure(string, string, Backend): array<string, mixed> $executeBackend isolated slot fixture seam; null selects the real backend runtime
+     */
+    public function __construct(private readonly \Closure $report, private readonly RunOptionsDTO $options, ?\Closure $executeBackend = null)
     {
+        $this->executeBackend = $executeBackend ?? (Scenario::Concurrent === $options->scenario ? (new ConcurrentRun($options))->run(...) : $this->runBackend(...));
     }
 
     public function run(): int
@@ -35,46 +40,53 @@ final class Runner
         foreach ($schedule as $entry) {
             (new Filesystem())->mkdir($directory.'/'.$entry['id'], 0700);
             Runtime::saveJson($directory.'/'.$entry['id'].'/result.json', $entry + ['execution_status' => ExecutionStatus::Scheduled->value, 'failure' => null]);
-            Runtime::saveJson($directory.'/'.$entry['id'].'/config.json', $entry + $this->options->configuration());
         }
         foreach ($schedule as $entry) {
             try {
-                $result = $this->runBackend($root, $directory.'/'.$entry['id'], Backend::from($entry['backend']));
+                $result = ($this->executeBackend)($root, $directory.'/'.$entry['id'], Backend::from($entry['backend']));
             } catch (\Throwable $error) {
                 $result = ['execution_status' => ExecutionStatus::Failed->value, 'integrity_status' => IntegrityStatus::Unknown->value, 'accounting_status' => AccountingStatus::Partial->value, 'failure' => $error::class.': '.$error->getMessage()];
             }
             $results[$entry['id']] = $entry + $result;
             Runtime::saveJson($directory.'/'.$entry['id'].'/result.json', $results[$entry['id']]);
+            Manifest::recordDurability($directory, $entry['id'], $result['owning_connection_durability'] ?? []);
+            if (false === ($result['cleanup']['complete'] ?? false)) {
+                break;
+            }
         }
-        Runtime::saveJson($directory.'/summary.json', ['method' => Config::METHOD_REVISION, 'configuration' => $this->options->configuration(), 'schedule' => $schedule, 'results' => $results, 'coverage' => Scenario::Application === $this->options->scenario ? 'one execution queue and one result queue, each with a native consumer; bounded workflows; phase-boundary resources; exact WAIT counters and lower-driver diagnostics unavailable' : 'one consumed queue; bounded outstanding messages for fixed-rate, one in flight otherwise; phase-boundary resources; exact WAIT counters and lower-driver diagnostics unavailable']);
-        $topology = Scenario::Application === $this->options->scenario ? 'One publisher, one execution consumer and one result/control consumer.' : 'One publisher and one native consumer.';
-        $text = '# Native Messenger '.$this->options->scenario->value."\n\nMode: ".$this->options->configuration()['mode'].'. '.$topology." Same workers for warmup and measurement.\n\n| Run | Execution | Integrity | Accounting | Unique completions |\n| --- | --- | --- | --- | ---: |\n";
+        $coverage = match ($this->options->scenario) {
+            Scenario::Concurrent => 'three publishers, two native consumers on one queue; fixed finite cohort; phase boundaries; exact WAIT counters and lower-driver diagnostics unavailable',
+            Scenario::Application => 'one execution queue and one result queue, each with a native consumer; bounded workflows; phase-boundary resources; exact WAIT counters and lower-driver diagnostics unavailable',
+            default => 'one consumed queue; bounded outstanding messages for application, one in flight otherwise; phase-boundary resources; exact WAIT counters and lower-driver diagnostics unavailable',
+        };
+        Runtime::saveJson($directory.'/summary.json', ['method' => Config::METHOD_REVISION, 'configuration' => $this->options->configuration(), 'schedule' => $schedule, 'results' => $results, 'coverage' => $coverage]);
+        $topology = match ($this->options->scenario) {
+            Scenario::Concurrent => 'Three publisher processes and two native consumers on one queue. Finite cohort release through final required ACK, not sustained capacity.',
+            Scenario::Application => 'One publisher, one execution consumer and one result/control consumer.',
+            default => 'One publisher and one native consumer.',
+        };
+        $text = '# Native Messenger '.$this->options->scenario->value."\n\nMode: ".$this->options->configuration()['mode'].'. WAL synchronous: '.$this->options->synchronous->value.'. '.$topology." Same workers for warmup and measurement.\n\n| Run | Execution | Integrity | Accounting | Unique completions |\n| --- | --- | --- | --- | ---: |\n";
         foreach ($results as $id => $result) {
             $text .= '| '.$id.' | '.$result['execution_status'].' | '.$result['integrity_status'].' | '.$result['accounting_status'].' | '.($result['unique_completions'] ?? 'unknown')." |\n";
         }
         if (Scenario::Idle === $this->options->scenario) {
-            $text .= "\nThe declared no-publication interval and isolated-arrival pickup cohort are separate. Idle CPU and IO use boundary snapshots, not periodic peaks. Detailed empty-receive recording contributes to consumer costs. Exact WAIT registration and wake counts are unavailable.\n";
+            $text .= "\nThe declared no-publication interval and isolated-arrival pickup cohort are separate. Idle CPU and IO use boundary snapshots, not periodic peaks. Empty receives use fixed per-phase count and active-duration histograms; these are actor-phase counts, not exact parent-window events. Exact WAIT registration and wake counts are unavailable.\n";
         }
-        if (\in_array($this->options->scenario, [Scenario::FixedRate, Scenario::Application], true)) {
-            $text .= "\nArrivals use an absolute monotonic schedule. Overflow and window-expired arrivals are unsent generator work, not transport loss. A synchronous publisher and bounded outstanding capacity can fail the offered-load objective even with successful transport integrity. See per-run generator status and window rates.\n";
+        if (Scenario::Application === $this->options->scenario) {
+            $text .= "\nApplication publishes at a fixed target of five workflows per second with 100ms handler work. Stalled sends are not followed by catch-up bursts. Actual public attempt and completion counts remain reported.\n";
         }
-        if (Scenario::Delayed === $this->options->scenario) {
-            $text .= "\nDelayStamp publications target only async. Requested-deadline error uses per-send wall and monotonic anchors. Stored-deadline lateness is unavailable without observer SQL. Doctrine integer-second delay conversion is not broker millisecond eligibility; negative requested errors are retained. No precision probe or second consumed queue is included.\n";
-        }
+
         if (Scenario::Application === $this->options->scenario) {
             $text .= "\nSynthetic application-shaped workflow, not production or keepalive-failure reproduction. The execution handler synchronously waits for the declared handler milliseconds, dispatches a correlated result through Messenger, and the separate result/control worker handles and ACKs it. Workflow counts require both messages to settle cleanly; total message ACKs are separate. No LLM or network request runs.\n";
         }
         if (Scenario::Retention === $this->options->scenario) {
-            $text .= "\nRetention keeps the same broker, persistence process and publisher/consumer connections across all declared cycles. Each memory point follows complete ACK drain, settling and an empty-inventory audit. Raw cycle and resource series stream to disk. Endpoint deltas and observed ranges are characterization, not a leak-free verdict. Broker PHP memory and live-state gauges remain unavailable.\n";
+            $text .= "\nRetention keeps the same broker, persistence process and publisher/consumer connections across all declared cycles. Each memory point follows complete ACK drain, settling and an empty-inventory audit. Raw cycle and resource series stream to disk. Smoke uses two cycles of two messages and is only a control-path check. Non-smoke endpoint deltas and observed ranges are characterization, not a leak-free verdict. Broker PHP memory and live-state gauges remain unavailable.\n";
         }
         $text .= "\nProduct-total resource accounting is partial. Publisher and observer share a process, and exited-process accounting is unavailable. Phase-boundary per-role samples are not complete product totals or continuous peaks.\n";
-        $text .= "\nRead summary.json for the frozen schedule, phase-specific rates, finite cohort timing, latency coverage. Failed repetitions are retained without retries.\n";
+        $text .= "\nRead summary.json for the frozen schedule, phase-specific rates, finite cohort timing, latency coverage. Failures are retained without retries.\n";
         Runtime::saveText($directory.'/report.md', $text);
         ($this->report)(json_encode(['capture' => $directory, 'method' => Config::METHOD_REVISION, 'mode' => $this->options->configuration()['mode']], \JSON_THROW_ON_ERROR));
         foreach ($results as $result) {
-            if (GeneratorStatus::Insufficient->value === ($result['generator']['status'] ?? null)) {
-                return 1;
-            }
             if (ExecutionStatus::Complete->value !== $result['execution_status'] || IntegrityStatus::Pass->value !== $result['integrity_status'] || AccountingStatus::Complete->value !== $result['accounting_status']) {
                 return 1;
             }
@@ -89,7 +101,6 @@ final class Runner
         $filesystem = new Filesystem();
         $filesystem->mkdir($directory, 0700);
         $filesystem->mirror(__DIR__.'/config', $directory.'/config');
-        $filesystem->dumpFile($directory.'/runtime-config.json', json_encode(['backend' => $backend->value, 'scenario' => $this->options->scenario->value, 'in_flight_limit' => \in_array($this->options->scenario, [Scenario::FixedRate, Scenario::Application], true) ? $this->options->capacity : 1, 'warmup_messages' => self::WARMUP_MESSAGES, 'measured_messages' => Scenario::Retention === $this->options->scenario ? $this->options->cycles * $this->options->cycleMessages : (\in_array($this->options->scenario, [Scenario::FixedRate, Scenario::Application], true) ? (new Arrivals(0, (int) ($this->options->fixedRateSeconds() * 1e9), $this->options->rate))->count() : $this->options->finiteCohortMessages()), 'poll_sleep_seconds' => Backend::Doctrine === $backend ? 0.001 : null, 'broker_wait' => Backend::Broker === $backend ? 'native-bundle' : null, 'diagnostic_sql_during_measure_and_drain' => false, 'database_retention' => 'retain after safe cleanup; no checkpoint or deletion'], \JSON_PRETTY_PRINT | \JSON_THROW_ON_ERROR));
         $short = '/tmp/sqbench-'.bin2hex(random_bytes(6));
         $filesystem->mkdir($short, 0700);
         $database = $directory.'/queue.sqlite';
@@ -114,7 +125,7 @@ final class Runner
             return $timestamp;
         };
         $boundary(Phase::Boot);
-        $broker = new ChildProcess([\PHP_BINARY, $root.'/bin/sqlite-queue', 'broker', '--database='.$database, '--endpoint='.$short.'/broker.sock', '--redeliver-timeout='.Config::REDELIVER_TIMEOUT_S, '--no-ansi'], env: Process::environment(), timeout: $this->options->processTimeoutSeconds());
+        $broker = new ChildProcess([\PHP_BINARY, $root.'/bin/sqlite-queue', 'broker', '--database='.$database, '--endpoint='.$short.'/broker.sock', '--redeliver-timeout='.Config::REDELIVER_TIMEOUT_S, '--synchronous='.$this->options->synchronous->value, '--no-ansi'], env: Process::environment(), timeout: $this->options->processTimeoutSeconds());
         $consumerArguments = [\PHP_BINARY, __DIR__.'/console.php', 'messenger:consume', 'async', '--no-ansi', '--no-interaction'];
         if (Backend::Doctrine === $backend) {
             $consumerArguments[] = '--sleep=0.001';
@@ -124,6 +135,7 @@ final class Runner
         $execution = ExecutionStatus::Failed;
         $failure = '';
         $accounting = [];
+        $durability = []; // No owning-connection evidence exists if acquisition fails.
         $release = [];
         $previousEnvironment = [];
         $resultActors = [];
@@ -148,12 +160,15 @@ final class Runner
                 if (!\is_array($readyData) || !\is_int($readyData['pid'] ?? null) || !\is_int($readyData['persistence_pid'] ?? null)) {
                     throw new \RuntimeException('Broker readiness lacks resource identities.');
                 }
+                if (($readyData['synchronous_effective'] ?? null) !== $this->options->synchronous->value) {
+                    throw new \RuntimeException('Broker owning connection synchronous readback does not match the selected mode.');
+                }
                 $resources->register(Role::Broker, $readyData['pid']);
                 $resources->register(Role::Persistence, $readyData['persistence_pid']);
                 Runtime::saveJson($directory.'/broker.ready.json', $readyData);
             }
             $environment = ['BENCH_PROJECT' => $directory, 'BENCH_DATABASE' => $database, 'BENCH_DSN' => Backend::Broker === $backend ? 'sqlite-queue://async?endpoint='.$short.'/broker.sock' : 'doctrine-benchmark://async', 'BENCH_CONTROL' => $short.'/control.sock', 'BENCH_RUN' => basename(\dirname($directory)), 'BENCH_ROLE' => 'consumer', 'BENCH_TELEMETRY' => $directory.'/consumer.operations.jsonl'];
-            $environment['BENCH_RUNTIME_PROFILE'] = json_encode(RuntimeProfile::current(), \JSON_THROW_ON_ERROR);
+            $environment['BENCH_SYNCHRONOUS'] = $this->options->synchronous->value;
             $environment['BENCH_RECEIVER'] = 'async';
             $environment['BENCH_RESULT_DSN'] = Backend::Broker === $backend ? 'sqlite-queue://results?endpoint='.$short.'/broker.sock' : 'doctrine-benchmark://results';
             $consumer->setEnv(Process::environment($environment));
@@ -231,6 +246,10 @@ final class Runner
             $recorder->flush();
             $warmupEnd = $boundary(Phase::Reset);
             $this->phaseBarrier($actorControls, Phase::Reset, hrtime(true) + Config::STARTUP_TIMEOUT_S * 1000000000);
+            $durability = $this->owningDurability($directory, $backend);
+            Runtime::saveJson($directory.'/durability.json', $durability);
+
+            Manifest::recordDurability(\dirname($directory), basename($directory), $durability);
             $snapshot(Phase::Reset);
             $journal = CohortJournal::create($directory.'/expected-ids.txt');
             $release[] = $journal->close(...);
@@ -257,9 +276,9 @@ final class Runner
                 }
             }
             $start = $boundary($measurementPhase);
-            $windowEnd = $start + (int) ((\in_array($this->options->scenario, [Scenario::FixedRate, Scenario::Application], true) ? $this->options->fixedRateSeconds() : $this->options->durationSeconds) * 1e9);
+            $windowEnd = $start + (int) ((Scenario::Application === $this->options->scenario ? $this->options->applicationSeconds() : $this->options->durationSeconds) * 1e9);
             $analysisBounds = ['phase' => $measurementPhase, 'start' => $start];
-            if (\in_array($this->options->scenario, [Scenario::FixedRate, Scenario::Application], true) || (!$this->options->smoke && Scenario::Retention !== $this->options->scenario && Scenario::Idle !== $this->options->scenario)) {
+            if (Scenario::Application === $this->options->scenario || (!$this->options->smoke && Scenario::Retention !== $this->options->scenario && Scenario::Idle !== $this->options->scenario)) {
                 $analysisBounds['end'] = $windowEnd;
             }
             $index = 0;
@@ -267,11 +286,9 @@ final class Runner
             $pending = '';
             $finiteCohort = $this->options->smoke || Scenario::Idle === $this->options->scenario;
             $cohortCount = $this->options->finiteCohortMessages();
-            if (Scenario::Delayed === $this->options->scenario && $finiteCohort) {
-                $control->setTimeoutSeconds($this->options->drainTimeoutSeconds());
-            }
+
             $fixedPending = [];
-            $generator = [];
+
             $retention = [];
             if (Scenario::Retention === $this->options->scenario) {
                 $warmupEvents = static function () use ($directory): \Generator {
@@ -287,13 +304,10 @@ final class Runner
                 $retention = $this->retentionCycles($root, $directory, $database, $backend, $bus, $control, $actorControls, $journal, $recorder, $snapshot, $boundary, $analysisBounds);
                 $start = $retention['start_ns'];
             }
-            if (\in_array($this->options->scenario, [Scenario::FixedRate, Scenario::Application], true)) {
-                Runtime::saveJson($directory.'/arrivals.json', ['start_ns' => $start, 'end_ns' => $windowEnd, 'rate' => $this->options->rate, 'planned_count' => (new Arrivals($start, $windowEnd, $this->options->rate))->count(), 'formula' => 'start_ns + floor(index * 1e9 / rate)', 'capacity' => $this->options->capacity]);
+            if (Scenario::Application === $this->options->scenario) {
+                $fixedPending = $this->application($bus, $control, $journal, $start, $windowEnd);
             }
-            if (\in_array($this->options->scenario, [Scenario::FixedRate, Scenario::Application], true)) {
-                [$fixedPending, $generator] = $this->fixedRate($bus, $control, $journal, $start, $windowEnd);
-            }
-            while (Scenario::Retention !== $this->options->scenario && !\in_array($this->options->scenario, [Scenario::FixedRate, Scenario::Application], true) && (null !== $cohortCount ? $index < $cohortCount : hrtime(true) < $windowEnd)) {
+            while (Scenario::Retention !== $this->options->scenario && Scenario::Application !== $this->options->scenario && (null !== $cohortCount ? $index < $cohortCount : hrtime(true) < $windowEnd)) {
                 $id = $measurementPhase->value.':'.$index;
                 if (Scenario::Idle === $this->options->scenario) {
                     $pickupProofs[$id] = $this->idleBarrier($control, $id);
@@ -310,7 +324,7 @@ final class Runner
                     throw new \RuntimeException('Unexpected measured completion.');
                 }
             }
-            $end = Scenario::Retention === $this->options->scenario ? $retention['end_ns'] : (\in_array($this->options->scenario, [Scenario::FixedRate, Scenario::Application], true) ? $windowEnd : ($finiteCohort ? hrtime(true) : $windowEnd));
+            $end = Scenario::Retention === $this->options->scenario ? $retention['end_ns'] : (Scenario::Application === $this->options->scenario ? $windowEnd : ($finiteCohort ? hrtime(true) : $windowEnd));
             $drainStarted = $boundary(Phase::Drain);
             $drainDeadline = $drainStarted + (int) ($this->options->drainTimeoutSeconds() * 1e9);
             $control->setDeadline($drainDeadline);
@@ -318,7 +332,7 @@ final class Runner
                 $control->setDeadline($drainDeadline);
                 $id = $this->completionId($control->receive());
                 if (!isset($fixedPending[$id])) {
-                    throw new \RuntimeException('Unexpected fixed-rate drain completion.');
+                    throw new \RuntimeException('Unexpected application drain completion.');
                 }
                 unset($fixedPending[$id]);
             }
@@ -354,9 +368,7 @@ final class Runner
             };
             $accounting = Analysis::build($directory.'/analysis.sqlite', $events(), $this->expectedMessages($journal->ids()), $start, $end, $measurementPhase);
             $warmup = Analysis::build($directory.'/warmup-analysis.sqlite', $events(), $this->expectedMessages($warmupIds), $warmupStart, $warmupEnd, Phase::Warmup);
-            if ([] !== $generator) {
-                $accounting['generator'] = $generator;
-            }
+
             if (Scenario::Application === $this->options->scenario) {
                 $accounting = WorkflowAnalysis::apply($directory.'/analysis.sqlite', $accounting, $start, $end);
                 $warmup = WorkflowAnalysis::apply($directory.'/warmup-analysis.sqlite', $warmup, $warmupStart, $warmupEnd);
@@ -374,30 +386,13 @@ final class Runner
                 $accounting['idle']['declared_seconds'] = $this->options->idleSeconds();
                 $accounting['idle']['actual_resource_boundary_end_ns'] = $idleWindow['actual_end'];
                 $accounting['idle']['readiness'] = $idleWindow['readiness'];
-                $accounting['idle']['observer_coverage'] = 'detailed empty-receive traces contribute to consumer CPU and IO; idle-specific observer perturbation has not been isolated';
+                $accounting['idle']['observer_coverage'] = 'fixed per-phase empty receive aggregation; full failures and actual work records; idle-specific observer perturbation has not been isolated';
                 $accounting['pickup'] = ['count' => self::WAKEUP_MESSAGES, 'readiness' => $pickupProofs, 'coverage' => 'isolated arrivals after prior ACK and worker idle; no backlog latency or idle-interval goodput claim'];
                 if (IntegrityStatus::Pass->value !== $accounting['idle']['integrity_status']) {
                     $accounting['integrity_status'] = IntegrityStatus::Fail->value;
                 }
             }
-            if (Scenario::Delayed === $this->options->scenario) {
-                $accounting['delayed'] = [
-                    'queue' => 'async',
-                    'delay_milliseconds' => $this->options->delayMilliseconds,
-                    'requested_deadline_reference' => 'public transport send entry plus requested DelayStamp; anchors in operations and analysis.sqlite',
-                    'anchor_coverage' => 'adjacent wall/monotonic samples, not simultaneous; wall precision is milliseconds; requested error uses monotonic send entry',
-                    'requested_deadline_samples' => $accounting['latencies']['requested_delivery_lateness_ms']['count'],
-                    'stored_deadline_lateness' => null,
-                    'stored_deadline_sample_count' => null,
-                    'stored_deadline_coverage' => 'unavailable: no hot-path observer SQL',
-                    'precision' => Backend::Doctrine === $backend
-                        ? 'stock Doctrine integer-second delay conversion and second-precision stored timestamps; subsecond requested lateness may be negative'
-                        : 'broker millisecond persisted eligibility; stored value not observed',
-                    'precision_probe' => 'not part of this scenario',
-                    'wait_registrations' => null,
-                    'wait_wakes' => null,
-                ];
-            }
+
             $accounting['drain_seconds'] = ($drainEnded - $drainStarted) / 1e9;
             $accounting['fixed_window_end_ns'] = $end;
             $accounting['measurement_started_ns'] = $start;
@@ -434,13 +429,7 @@ final class Runner
             }
             $execution = ExecutionStatus::Complete;
             $accounting['empty_receive_latency_coverage'] = 'detailed operation spans retained';
-            if (Scenario::Delayed === $this->options->scenario) {
-                foreach (['requested_delivery_lateness_ms', 'requested_handler_lateness_ms'] as $metric) {
-                    if ($accounting['latencies'][$metric]['count'] !== $accounting['expected']) {
-                        $accounting['accounting_status'] = AccountingStatus::Partial->value;
-                    }
-                }
-            }
+
             if (0 !== $accounting['public_errors'] || 0 !== $accounting['observer_errors'] || 0 !== $warmup['public_errors'] || 0 !== $warmup['observer_errors']) {
                 $execution = ExecutionStatus::Failed;
                 $failure = 'Recorded public-operation or observer errors.';
@@ -503,7 +492,12 @@ final class Runner
                     $resultWorkersStopped = false;
                 }
             }
-            if (!$consumer->isRunning() && !$broker->isRunning() && $resultWorkersStopped) {
+            $cleanup = $resources->cleanup(static fn (int $pid): bool => posix_kill($pid, \SIGKILL), Config::KILL_GRACE_S);
+            if (!$cleanup['complete']) {
+                $execution = ExecutionStatus::Failed;
+                $failure .= ' Owned process cleanup incomplete; endpoint retained and subsequent runs blocked.';
+            }
+            if ($cleanup['complete'] && !$consumer->isRunning() && !$broker->isRunning() && $resultWorkersStopped) {
                 try {
                     $filesystem->remove($short);
                 } catch (\Throwable $error) {
@@ -540,9 +534,6 @@ final class Runner
             $endBound = $analysisBounds['end'] ?? ($phases['shutdown'] ?? 0);
             $recovered = FailureFinalization::analyze($directory, $roles, $phase, $startBound, $endBound, Scenario::Application === $this->options->scenario);
             $accounting = array_replace($accounting, $recovered);
-            if (is_file($directory.'/arrivals.json') && !isset($accounting['generator'])) {
-                $accounting['generator'] = ['status' => GeneratorStatus::Unknown->value, 'coverage' => 'aborted bounded-dispatch state unavailable; public send attempts remain observed only'];
-            }
         }
         try {
             $accounting['resources'] = Resources::summarize(Recorder::read($directory.'/resources.jsonl'));
@@ -558,16 +549,40 @@ final class Runner
             $accounting['idle']['resources_by_role'] = $accounting['resources']['phase_roles'][Phase::Idle->value] ?? [];
             $accounting['idle']['resource_coverage'] = 'CPU and IO differences between idle and idle-end role snapshots; boundaries may bracket the declared clock window imperfectly; no periodic memory peak';
         }
+        $emptyPhases = [];
+        foreach ($terminal['footers'] as $footer) {
+            foreach ($footer['empty_receives_by_phase'] ?? [] as $phase => $aggregate) {
+                $emptyPhases[$phase] = ($emptyPhases[$phase] ?? 0) + $aggregate['count'];
+            }
+        }
+        $accounting['aggregated_empty_receives_by_phase'] = $emptyPhases;
+        $accounting['receive_counter_scope'] = 'actor phase counts; empty phase sampled at receive entry; error and nonempty records retain boundaries; not exact parent clock-window membership';
+        $accounting['receive_empty'] = ($accounting['receive_empty'] ?? 0) + ($emptyPhases[Phase::Measure->value] ?? 0);
+        $accounting['receive_attempts'] = ($accounting['receive_attempts'] ?? 0) + ($emptyPhases[Phase::Measure->value] ?? 0);
+        if (isset($accounting['idle'])) {
+            $accounting['idle']['phase_empty_receive_aggregates_by_role'] = [];
+            foreach ($terminal['footers'] as $role => $footer) {
+                $accounting['idle']['phase_empty_receive_aggregates_by_role'][$role] = $footer['empty_receives_by_phase'][Phase::Idle->value] ?? null;
+            }
+            $accounting['idle']['phase_empty_receives'] = $emptyPhases[Phase::Idle->value] ?? 0;
+            $accounting['idle']['receive_empty'] = null;
+            $accounting['idle']['receive_attempts'] = null;
+            $accounting['idle']['receive_counter_coverage'] = 'empty counts are exact for actor idle phase, not parent [start,end); detailed errors retain their return boundaries; footer includes first/last receive boundaries and active duration histogram';
+        }
         $accounting['resources']['coverage_details'] = $resources->coverage();
         $accounting['resources']['sampling_policy'] = 'always-on phase boundaries only';
         $accounting['resources']['actor_php_policy'] = 'consumer connected, post-warmup and post-drain snapshots; coordinator current at each boundary; broker and persistence unavailable';
         if (0 !== $resources->coverage()['lost_samples']) {
             $accounting['accounting_status'] = AccountingStatus::Partial->value;
         }
-        $accounting['settling_seconds'] = Scenario::Retention === $this->options->scenario ? $this->options->settlingSeconds : self::SETTLING_SECONDS;
-        $accounting['settling_coverage'] = Scenario::Retention === $this->options->scenario ? 'audited-empty cycle series, same persistent identities, no forced GC; short characterization, not leak-free proof' : 'single bounded post-drain observation, not retention proof';
+        $accounting['settling_seconds'] = Scenario::Retention === $this->options->scenario ? RunOptionsDTO::SETTLING_SECONDS : self::SETTLING_SECONDS;
+        $accounting['settling_coverage'] = Scenario::Retention === $this->options->scenario ? ($this->options->smoke ? 'tiny smoke control-path check only; not retention characterization' : 'audited-empty cycle series, same persistent identities, no forced GC; characterization, not leak-free proof') : 'single bounded post-drain observation, not retention proof';
         $result = $accounting + ['integrity_status' => IntegrityStatus::Unknown->value, 'accounting_status' => AccountingStatus::Partial->value];
+        $result['synchronous_desired'] = $this->options->synchronous->value;
+        $result['owning_connection_durability'] = $durability;
+        $result['configuration'] = $this->options->configuration();
         $result['execution_status'] = $execution->value;
+        $result['cleanup'] = $cleanup;
         $result['failure'] = $failure;
         $result['failure_stage'] = '' === $failure ? null : 'unknown';
         try {
@@ -598,12 +613,11 @@ final class Runner
         $measureBounds = [];
         $clock = Clock::system();
         try {
-            for ($cycle = 0; $cycle <= $this->options->cycles; ++$cycle) {
+            for ($cycle = 0; $cycle <= $this->options->effectiveCycles(); ++$cycle) {
                 $measureStart = $clock->now();
                 $measureEnd = $measureStart;
                 $drainStart = $measureStart;
                 $drainEnd = $measureStart;
-                $clean = true;
                 if ($cycle > 0) {
                     $this->phaseBarrier($actorControls, Phase::Measure, hrtime(true) + Config::STARTUP_TIMEOUT_S * 1000000000);
                     $measureStart = $boundary(Phase::Measure);
@@ -611,7 +625,7 @@ final class Runner
                         $measureBounds['start'] = $measureStart;
                     }
                     try {
-                        for ($index = 0; $index < $this->options->cycleMessages; ++$index) {
+                        for ($index = 0; $index < $this->options->effectiveCycleMessages(); ++$index) {
                             $control->setTimeoutSeconds(Config::STARTUP_TIMEOUT_S);
                             $id = 'cycle:'.$cycle.':'.$index;
                             $journal->append($id);
@@ -629,35 +643,19 @@ final class Runner
                     $drainEnd = hrtime(true);
                     $recorder->flush();
                     $journal->flush();
-                    $prefix = 'cycle:'.$cycle.':';
-                    $events = static function () use ($directory, $prefix): \Generator {
-                        foreach (['publisher', 'consumer'] as $role) {
-                            foreach (Recorder::read($directory.'/'.$role.'.operations.jsonl') as $event) {
-                                if (\is_string($event['correlation'] ?? null) && str_starts_with($event['correlation'], $prefix)) {
-                                    yield $event;
-                                }
-                            }
-                        }
-                    };
-                    $ids = function () use ($prefix): \Generator {
-                        for ($index = 0; $index < $this->options->cycleMessages; ++$index) {
-                            yield $prefix.$index;
-                        }
-                    };
-                    $analysis = Analysis::build($directory.'/cycle-'.$cycle.'-analysis.sqlite', $events(), $ids(), $measureStart, $measureEnd, Phase::Measure);
-                    $historical += $analysis['unique_completions'];
-                    $clean = IntegrityStatus::Pass->value === $analysis['integrity_status'];
+                    // Exact ACK correlations control the cycle; one offline pass verifies all cohorts.
+                    $historical += $this->options->effectiveCycleMessages();
                     $measureSeconds += ($measureEnd - $measureStart) / 1e9;
                     $drainSeconds += ($drainEnd - $drainStart) / 1e9;
                 }
                 $settleStart = $boundary(Phase::Settle);
-                \Amp\delay($this->options->settlingSeconds);
+                \Amp\delay(RunOptionsDTO::SETTLING_SECONDS);
                 $auditStart = $boundary(Phase::Audit);
                 $inventory = $this->inventory($root, $database, $backend);
-                $equivalent = $clean && 0 === $inventory['remaining'] && 0 === $inventory['ready'] && 0 === $inventory['inflight'];
-                $context = ['retention_cycle' => $cycle, 'historical_completions' => $historical, 'warmup_completed_messages' => self::WARMUP_MESSAGES, 'lifetime_completed_messages' => self::WARMUP_MESSAGES + $historical, 'historical_scope' => 'measured cycles; excludes fixed warmup', 'equivalent_empty_point' => $equivalent, 'inventory' => $inventory, 'topology' => $this->options->configuration()['topology']];
+                $equivalent = 0 === $inventory['remaining'] && 0 === $inventory['ready'] && 0 === $inventory['inflight'];
+                $context = ['retention_cycle' => $cycle, 'historical_completions' => $historical, 'warmup_completed_messages' => self::WARMUP_MESSAGES, 'lifetime_completed_messages' => self::WARMUP_MESSAGES + $historical, 'historical_scope' => 'measured cycles; excludes fixed warmup', 'equivalent_empty_point' => $equivalent, 'inventory' => $inventory, 'topology' => 'same publisher, consumer, broker and persistence identities'];
                 $snapshot(Phase::Settle, $context);
-                $record = $context + ['measure_start_ns' => $measureStart, 'measure_end_ns' => $measureEnd, 'drain_start_ns' => $drainStart, 'drain_end_ns' => $drainEnd, 'settle_start_ns' => $settleStart, 'audit_start_ns' => $auditStart, 'observation_ns' => hrtime(true), 'declared_messages' => 0 === $cycle ? 0 : $this->options->cycleMessages];
+                $record = $context + ['measure_start_ns' => $measureStart, 'measure_end_ns' => $measureEnd, 'drain_start_ns' => $drainStart, 'drain_end_ns' => $drainEnd, 'settle_start_ns' => $settleStart, 'audit_start_ns' => $auditStart, 'observation_ns' => hrtime(true), 'declared_messages' => 0 === $cycle ? 0 : $this->options->effectiveCycleMessages()];
                 $line = json_encode($record, \JSON_THROW_ON_ERROR)."\n";
                 if (fwrite($stream, $line) !== \strlen($line)) {
                     throw new \RuntimeException('Cycle ledger write failed.');
@@ -670,7 +668,7 @@ final class Runner
             fclose($stream);
         }
 
-        return ['completed_cycles' => $this->options->cycles, 'historical_completions' => $historical, 'start_ns' => $measureBounds['start'], 'end_ns' => $measureBounds['end'], 'active_measure_seconds' => $measureSeconds, 'active_drain_seconds' => $drainSeconds, 'cycle_series' => 'cycles.jsonl', 'observation_series' => 'resources.jsonl', 'observer_analysis' => 'post-drain per-cycle disk-backed correlation; streams cumulative traces, outside measured windows'];
+        return ['completed_cycles' => $this->options->effectiveCycles(), 'historical_completions' => $historical, 'start_ns' => $measureBounds['start'], 'end_ns' => $measureBounds['end'], 'active_measure_seconds' => $measureSeconds, 'active_drain_seconds' => $drainSeconds, 'cycle_series' => 'cycles.jsonl', 'observation_series' => 'resources.jsonl', 'observer_analysis' => 'one streaming offline pass after all declared cycles; per-cycle state uses exact ACK correlations and post-drain inventory'];
     }
 
     /** @return array<string, mixed> */
@@ -791,61 +789,46 @@ final class Runner
         return $ids;
     }
 
-    /** @return array{array<string, true>, array<string, mixed>} */
-    private function fixedRate(MessageBusInterface $bus, Control $control, CohortJournal $journal, int $start, int $end): array
+    /** @return array<string, true> */
+    private function application(MessageBusInterface $bus, Control $control, CohortJournal $journal, int $start, int $end): array
     {
-        $arrivals = new Arrivals($start, $end, $this->options->rate);
-        $next = 0;
-        $overflow = 0;
-        $attempts = 0;
-        $late = 0;
+        $next = $start;
+        $index = 0;
         $pending = [];
+        $interval = (int) (1e9 / RunOptionsDTO::APPLICATION_RATE);
         while (hrtime(true) < $end) {
             while ($control->hasPacket()) {
                 $id = $this->completionId($control->receive());
                 if (!isset($pending[$id])) {
-                    throw new \RuntimeException('Unexpected fixed-rate completion.');
+                    throw new \RuntimeException('Unexpected application completion.');
                 }
                 unset($pending[$id]);
             }
-            $batch = $arrivals->admit(hrtime(true), $next, $this->options->capacity - \count($pending));
-            $next = $batch['next'];
-            $overflow += $batch['overflow'];
-            foreach ($batch['indices'] as $index) {
-                if (hrtime(true) >= $end) {
-                    break;
-                }
+            if (hrtime(true) >= $next && \count($pending) < RunOptionsDTO::APPLICATION_CAPACITY) {
                 $id = 'measure:'.$index;
                 $journal->append($id);
                 $pending[$id] = true;
-                $scheduled = $arrivals->at($index);
-                if (hrtime(true) > $scheduled) {
-                    ++$late;
-                }
-                ++$attempts;
-                $this->dispatch($bus, $id, Phase::Measure, $index, $scheduled);
+                $this->dispatch($bus, $id, Phase::Measure, $index++);
+                // Never catch up with a burst after a stalled synchronous send.
+                $next = hrtime(true) + $interval;
             }
-            $until = $next < $arrivals->count() ? min($end, $arrivals->at($next)) : $end;
-            $wait = ($until - hrtime(true)) / 1e9;
+            $wait = (min($end, $next) - hrtime(true)) / 1e9;
             if ($wait > 0) {
                 $control->wait($wait);
+            } elseif (\count($pending) >= RunOptionsDTO::APPLICATION_CAPACITY) {
+                $control->wait(min(0.1, ($end - hrtime(true)) / 1e9));
             }
         }
-        $planned = $arrivals->count();
-        $unstarted = $planned - $attempts;
 
-        return [$pending, ['status' => $unstarted > 0 ? GeneratorStatus::Insufficient->value : GeneratorStatus::Met->value, 'planned_arrivals' => $planned, 'attempted_arrivals' => $attempts, 'late_arrivals' => $late, 'unstarted_arrivals' => $unstarted, 'capacity_overflow_arrivals' => $overflow, 'window_expired_unstarted' => $unstarted - $overflow, 'offered_rate' => $planned / (($end - $start) / 1e9), 'attempt_rate' => $attempts / (($end - $start) / 1e9), 'capacity' => $this->options->capacity, 'topology' => $this->options->configuration()['topology'], 'unsent_classification' => 'generator unstarted, not transport loss']];
+        return $pending;
     }
 
-    // Null means a closed-loop or warmup message has no planned open-loop arrival.
-    private function dispatch(MessageBusInterface $bus, string $id, Phase $phase, int $index, ?int $scheduledNs = null): void
+    private function dispatch(MessageBusInterface $bus, string $id, Phase $phase, int $index): void
     {
-        $delay = Scenario::Delayed === $this->options->scenario ? $this->options->delayMilliseconds : 0;
-        $payload = str_repeat('x', 0 === $index % 2 ? Config::SMALL_PAYLOAD_BYTES : Config::LARGE_PAYLOAD_BYTES);
-        $message = Scenario::Application === $this->options->scenario
-            ? new ApplicationMessage($id, $phase, $payload, true, scheduledNs: $scheduledNs, workMilliseconds: $this->options->handlerMilliseconds)
-            : new ProbeMessage($id, $phase, $payload, false, scheduledNs: $scheduledNs, delayMilliseconds: $delay);
-        $bus->dispatch($message, $delay > 0 ? [new DelayStamp($delay)] : []);
+        $payload = Payload::generate($id);
+        $bus->dispatch(Scenario::Application === $this->options->scenario
+            ? new ApplicationMessage($id, $phase, $payload, true, workMilliseconds: RunOptionsDTO::HANDLER_MILLISECONDS)
+            : new ProbeMessage($id, $phase, $payload, false));
     }
 
     /** @return array<string, mixed> */
@@ -859,5 +842,42 @@ final class Runner
         }
 
         return $packet;
+    }
+
+    /** @return array<string, mixed> */
+    private function owningDurability(string $directory, Backend $backend): array
+    {
+        $desired = $this->options->synchronous->value;
+        if (Backend::Broker === $backend) {
+            $ready = json_decode((string) file_get_contents($directory.'/broker.ready.json'), true, flags: \JSON_THROW_ON_ERROR);
+            if (($ready['synchronous_effective'] ?? null) !== $desired) {
+                throw new \RuntimeException('Broker owning connection readback mismatch.');
+            }
+
+            return ['desired' => $desired, 'effective' => $desired, 'authority' => 'broker storage owning connection before readiness', 'pid' => $ready['persistence_pid']];
+        }
+        $expected = ['publisher.operations.jsonl.async.durability.json', 'consumer.operations.jsonl.async.durability.json'];
+        if (Scenario::Application === $this->options->scenario) {
+            $expected[] = 'results.operations.jsonl.results.durability.json';
+        }
+        foreach ($expected as $file) {
+            if (!is_file($directory.'/'.$file)) {
+                throw new \RuntimeException('Missing owning Doctrine connection readback: '.$file);
+            }
+        }
+        $connections = [];
+        $files = glob($directory.'/*.durability.json');
+        if (false === $files) {
+            throw new \RuntimeException('Cannot enumerate owning connection readbacks.');
+        }
+        foreach ($files as $file) {
+            $readback = json_decode((string) file_get_contents($file), true, flags: \JSON_THROW_ON_ERROR);
+            if (($readback['desired'] ?? null) !== $desired || !Baseline::isDurabilityEquivalent($readback['effective'], $this->options->synchronous)) {
+                throw new \RuntimeException('Doctrine owning connection readback mismatch: '.basename($file));
+            }
+            $connections[basename($file)] = $readback;
+        }
+
+        return ['desired' => $desired, 'effective' => $desired, 'connections' => $connections, 'authority' => 'actual Doctrine transport owning connections before measurement'];
     }
 }

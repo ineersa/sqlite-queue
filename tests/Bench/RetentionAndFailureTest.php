@@ -4,51 +4,14 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Tests\Bench;
 
-use Ineersa\SqliteQueue\Bench\Command\RunCommand;
 use Ineersa\SqliteQueue\Bench\FailureFinalization;
 use Ineersa\SqliteQueue\Bench\Phase;
 use Ineersa\SqliteQueue\Bench\RetentionAnalysis;
-use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
-use Symfony\Component\Console\Input\ArrayInput;
 use Symfony\Component\Filesystem\Filesystem;
 
 final class RetentionAndFailureTest extends TestCase
 {
-    public function testRetentionCannotUseFewerThanTwentyCyclesEvenInSmoke(): void
-    {
-        $command = new RunCommand();
-        $options = RunCommand::options(new ArrayInput(['--workload' => 'retention', '--smoke' => true, '--cycles' => '20', '--cycle-messages' => '1', '--settling' => '0.001'], $command->getDefinition()));
-        $this->assertSame(20, $options->cycles);
-        $this->assertSame(1, $options->cycleMessages);
-        $this->assertSame(0.001, $options->settlingSeconds);
-        $this->assertCount(2, $options->schedule());
-        $this->assertSame('matched-empty-state retention characterization; not leak-free proof', $options->configuration()['observation']);
-    }
-
-    #[DataProvider('invalidOptions')]
-    public function testEachRetentionBoundFailsIndependently(array $arguments): void
-    {
-        $command = new RunCommand();
-        $this->expectException(\InvalidArgumentException::class);
-        RunCommand::options(new ArrayInput(['--workload' => 'retention', '--smoke' => true] + $arguments, $command->getDefinition()));
-    }
-
-    public static function invalidOptions(): iterable
-    {
-        yield 'nineteen cycles' => [['--cycles' => '19']];
-        yield 'cycle upper bound' => [['--cycles' => '1001']];
-        yield 'fractional cycles' => [['--cycles' => '20.5']];
-        yield 'zero messages' => [['--cycle-messages' => '0']];
-        yield 'message upper bound' => [['--cycle-messages' => '10001']];
-        yield 'fractional messages' => [['--cycle-messages' => '1.5']];
-        yield 'zero settling' => [['--settling' => '0']];
-        yield 'negative settling' => [['--settling' => '-1']];
-        yield 'nonfinite settling' => [['--settling' => '1e999']];
-        yield 'settling upper bound' => [['--settling' => '61']];
-        yield 'nonnumeric settling' => [['--settling' => 'invalid']];
-    }
-
     public function testStreamingMatchedPointsExcludeInventoryIdentityAndTopologyChanges(): void
     {
         $base = ['role' => 'consumer', 'pid' => 123, 'start_ticks' => 456, 'coverage' => 'observed', 'topology' => 'one publisher, one consumer', 'equivalent_empty_point' => true, 'inventory' => ['remaining' => 0, 'ready' => 0, 'inflight' => 0], 'php_used_bytes' => null];
@@ -175,7 +138,7 @@ final class RetentionAndFailureTest extends TestCase
         }
         file_put_contents($directory.'/consumer.operations.jsonl', implode("\n", $consumer)."\n");
         foreach (['publisher', 'consumer'] as $role) {
-            file_put_contents($directory.'/'.$role.'.operations.jsonl.counters.json', json_encode(['finalized' => true, 'lost_records' => 0, 'write_failures' => 0, 'buffered_bytes' => 0], \JSON_THROW_ON_ERROR));
+            file_put_contents($directory.'/'.$role.'.operations.jsonl.counters.json', json_encode(['finalized' => true, 'lost_records' => 0, 'write_failures' => 0, 'buffered_bytes' => 0, 'empty_receives_by_phase' => [], 'empty_duration_bin_upper_ns' => \Ineersa\SqliteQueue\Bench\Recorder::EMPTY_DURATION_BINS_NS], \JSON_THROW_ON_ERROR));
         }
 
         return $directory;

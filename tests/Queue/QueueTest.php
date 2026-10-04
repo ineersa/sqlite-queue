@@ -643,7 +643,7 @@ final class QueueTest extends DriverTestCase
         $connection = (new SqliteConnector())->connect(new SqliteConfig($this->database->path()));
         try {
             new SqliteQueueStorage($connection);
-            $this->fail('NORMAL durability must not be accepted.');
+            $this->fail('Implicit journal configuration must not be accepted.');
         } catch (\InvalidArgumentException) {
             $this->assertTrue($connection->isClosed());
         } finally {

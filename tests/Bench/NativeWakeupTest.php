@@ -15,15 +15,14 @@ final class NativeWakeupTest extends TestCase
     public function testNativeSingleQueueWakeupSmoke(string $scenario): void
     {
         $root = \dirname(__DIR__, 2);
-        $process = new Process([\PHP_BINARY, $root.'/bin/benchmark', 'run', '--smoke', '--workload='.$scenario, '--delay=100'], $root, timeout: 90);
+        $process = new Process([\PHP_BINARY, $root.'/bin/benchmark', 'run', '--smoke', '--workload='.$scenario], $root, timeout: 90);
         $process->mustRun();
         $output = json_decode(trim($process->getOutput()), true, flags: \JSON_THROW_ON_ERROR);
         $directory = $output['capture'];
         $summary = json_decode(file_get_contents($directory.'/summary.json'), true, flags: \JSON_THROW_ON_ERROR);
         $manifest = json_decode(file_get_contents($directory.'/manifest.json'), true, flags: \JSON_THROW_ON_ERROR);
-        $this->assertCount(2, $manifest['schedule']);
-        $this->assertSame($scenario, $manifest['configuration']['scenario']);
-        $this->assertSame(2, $manifest['measured_messages_per_backend']);
+        $this->assertCount(2, $manifest['results']);
+        $this->assertSame($scenario, $manifest['settings']['workload']);
         foreach (['doctrine', 'broker'] as $backend) {
             $run = $summary['results'][$backend];
             $this->assertSame('complete', $run['execution_status']);
@@ -60,24 +59,6 @@ final class NativeWakeupTest extends TestCase
                 $this->assertArrayHasKey('system_seconds', $delta);
                 $this->assertArrayHasKey('elapsed_seconds', $delta);
                 $this->assertArrayHasKey('io', $delta);
-            } else {
-                $this->assertSame('async', $run['delayed']['queue']);
-                $this->assertSame(100, $run['delayed']['delay_milliseconds']);
-                $this->assertNull($run['delayed']['stored_deadline_lateness']);
-                $this->assertSame(2, $run['latencies']['requested_delivery_lateness_ms']['count']);
-                $this->assertSame(2, $run['latencies']['requested_handler_lateness_ms']['count']);
-                $sendCount = 0;
-                foreach (Recorder::read($directory.'/'.$backend.'/publisher.operations.jsonl') as $event) {
-                    if ('send' !== $event['operation'] || 'measure' !== $event['phase']) {
-                        continue;
-                    }
-                    ++$sendCount;
-                    $anchor = $event['eligibility'];
-                    $this->assertSame(100, $anchor['delay_ms']);
-                    $this->assertSame(100000000, $anchor['requested_monotonic_ns'] - $anchor['anchor_monotonic_ns']);
-                    $this->assertSame(100, $anchor['requested_wall_ms'] - $anchor['anchor_wall_ms']);
-                }
-                $this->assertSame(2, $sendCount);
             }
         }
     }
@@ -85,6 +66,5 @@ final class NativeWakeupTest extends TestCase
     public static function scenarios(): iterable
     {
         yield 'idle' => ['idle'];
-        yield 'delayed' => ['delayed'];
     }
 }

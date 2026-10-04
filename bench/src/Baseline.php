@@ -6,6 +6,8 @@ namespace Ineersa\SqliteQueue\Bench;
 
 use Doctrine\DBAL\Connection as DbalConnection;
 use Doctrine\DBAL\DriverManager;
+use Fabpot\Amp\Sqlite\SqliteSynchronousMode;
+use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Symfony\Component\Messenger\Bridge\Doctrine\Transport\Connection as DoctrineTransportConnection;
 use Symfony\Component\Messenger\Bridge\Doctrine\Transport\DoctrineTransport;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
@@ -19,8 +21,9 @@ use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
  */
 final class Baseline
 {
-    public static function connect(string $databasePath): DbalConnection
+    public static function connect(string $databasePath, SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal): DbalConnection
     {
+        SqliteQueueStorage::validateSynchronousMode($synchronous);
         $connection = DriverManager::getConnection([
             'driver' => 'pdo_sqlite',
             'path' => $databasePath,
@@ -30,7 +33,7 @@ final class Baseline
         // WAL is persistent per database file; synchronous and busy_timeout are per connection
         // and are applied on every connection this benchmark opens.
         $connection->executeStatement('PRAGMA journal_mode='.Config::EXPECTED_JOURNAL_MODE);
-        $connection->executeStatement('PRAGMA synchronous=FULL');
+        $connection->executeStatement('PRAGMA synchronous='.$synchronous->value);
         $connection->executeStatement('PRAGMA busy_timeout='.Config::BUSY_TIMEOUT_MS);
         $connection->executeStatement('PRAGMA wal_autocheckpoint=1000');
 
@@ -68,11 +71,18 @@ final class Baseline
     /**
      * @param array{journal_mode: string, synchronous: int, file_backed: bool} $durability
      */
-    public static function isDurabilityEquivalent(array $durability): bool
+    public static function isDurabilityEquivalent(array $durability, SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal): bool
     {
         return Config::EXPECTED_JOURNAL_MODE === $durability['journal_mode']
-            && Config::EXPECTED_SYNCHRONOUS === $durability['synchronous']
+            && self::synchronousValue($synchronous) === $durability['synchronous']
             && true === $durability['file_backed'];
+    }
+
+    public static function synchronousValue(SqliteSynchronousMode $mode): int
+    {
+        SqliteQueueStorage::validateSynchronousMode($mode);
+
+        return SqliteSynchronousMode::Normal === $mode ? 1 : 2; // SQLite PRAGMA protocol values.
     }
 
     public static function transport(

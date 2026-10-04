@@ -107,6 +107,40 @@ final class FailureFinalization
                         $issues[$role][$field] = $footer[$field];
                     }
                 }
+                if (!\is_array($footer['empty_receives_by_phase'] ?? null)) {
+                    throw new \RuntimeException('Actor footer lacks empty receive aggregates.');
+                }
+                if (($footer['empty_duration_bin_upper_ns'] ?? null) !== Recorder::EMPTY_DURATION_BINS_NS) {
+                    throw new \RuntimeException('Actor footer has unexpected empty receive bins.');
+                }
+                foreach ($footer['empty_receives_by_phase'] as $phase => $aggregate) {
+                    if (!\is_string($phase) || null === Phase::tryFrom($phase) || !\is_array($aggregate)) {
+                        throw new \RuntimeException('Actor footer has invalid empty receive phase.');
+                    }
+                    foreach (['count', 'sum_active_ns', 'max_active_ns', 'first_started_ns', 'last_ended_ns'] as $field) {
+                        if (!\is_int($aggregate[$field] ?? null) || $aggregate[$field] < 0) {
+                            throw new \RuntimeException('Invalid empty receive aggregate '.$field.'.');
+                        }
+                    }
+                    $histogram = $aggregate['histogram'] ?? [];
+                    if (!\is_array($histogram) || \count($histogram) !== \count(Recorder::EMPTY_DURATION_BINS_NS) + 1) {
+                        throw new \RuntimeException('Invalid empty receive histogram size.');
+                    }
+                    foreach ($histogram as $count) {
+                        if (!\is_int($count) || $count < 0) {
+                            throw new \RuntimeException('Invalid empty receive histogram count.');
+                        }
+                    }
+                    if (array_sum($histogram) !== $aggregate['count']) {
+                        throw new \RuntimeException('Empty receive histogram does not reconcile with count.');
+                    }
+                    if ($aggregate['last_ended_ns'] < $aggregate['first_started_ns']) {
+                        throw new \RuntimeException('Empty receive aggregate boundaries are reversed.');
+                    }
+                    if ($aggregate['sum_active_ns'] < $aggregate['max_active_ns']) {
+                        throw new \RuntimeException('Empty receive aggregate maximum exceeds its duration sum.');
+                    }
+                }
                 $footers[$role] = $footer;
             } catch (\Throwable $error) {
                 $issues[$role]['footer_error'] = $error::class.': '.$error->getMessage();

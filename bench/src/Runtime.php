@@ -11,19 +11,12 @@ final class Runtime
 {
     public static function recorder(): Recorder
     {
-        $expected = json_decode(self::environment('BENCH_RUNTIME_PROFILE'), true, flags: \JSON_THROW_ON_ERROR);
-        if (!\is_array($expected)) {
-            throw new \RuntimeException('Invalid expected runtime profile.');
-        }
-        RuntimeProfile::verifyCurrent($expected);
         $path = self::environment('BENCH_TELEMETRY');
         $stream = fopen($path, 'ab');
         if (false === $stream) {
             throw new \RuntimeException('Cannot open telemetry.');
         }
         try {
-            self::saveJson($path.'.runtime.json', RuntimeProfile::current());
-
             return new Recorder(static fn (string $bytes): bool => fwrite($stream, $bytes) === \strlen($bytes), Recorder::BUFFER_CAPACITY_BYTES, self::environment('BENCH_RUN'), self::environment('BENCH_ROLE'));
         } catch (\Throwable $error) {
             fclose($stream);

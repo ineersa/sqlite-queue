@@ -27,16 +27,16 @@ final class ApplicationWorkflowTest extends TestCase
         $bus = $this->createMock(MessageBusInterface::class);
         $bus->expects($this->once())->method('dispatch')->with($this->callback(function (object $result): bool {
             $this->assertInstanceOf(ResultMessage::class, $result);
-            $this->assertSame('root:result', $result->id);
+            $this->assertSame('warmup:0:result', $result->id);
             $this->assertSame(Phase::Warmup, $result->phase);
-            $this->assertSame(str_repeat('x', 256), $result->payload);
+            $this->assertSame(\Ineersa\SqliteQueue\Bench\Payload::generate('warmup:0'), $result->payload);
             $this->assertFalse($result->followUp);
             $this->assertNotInstanceOf(ProbeMessage::class, $result);
 
             return true;
         }))->willReturn(new Envelope(new \stdClass()));
         $handler = new Handler(new Recorder(static fn (string $bytes): bool => true, 8192, 'run', 'execution'), $bus, Clock::system());
-        $handler(new ApplicationMessage('root', Phase::Warmup, str_repeat('x', 256), true));
+        $handler(new ApplicationMessage('warmup:0', Phase::Warmup, \Ineersa\SqliteQueue\Bench\Payload::generate('warmup:0'), true));
     }
 
     public function testRootAndResultHaveDistinctAckAndWorkflowCounters(): void
@@ -103,10 +103,9 @@ final class ApplicationWorkflowTest extends TestCase
     public function testApplicationOptionsDeclareSyntheticWorkAndBothConsumers(): void
     {
         $command = new RunCommand();
-        $options = RunCommand::options(new ArrayInput(['--workload' => 'application', '--handler-ms' => '3', '--rate' => '10', '--capacity' => '2', '--smoke' => true], $command->getDefinition()));
-        $this->assertSame(3, $options->handlerMilliseconds);
-        $this->assertSame('one synchronous publisher, one execution consumer, one result/control consumer', $options->configuration()['topology']);
-        $this->assertStringContainsString('not production or keepalive reproduction', $options->configuration()['application_interpretation']);
+        $options = RunCommand::options(new ArrayInput(['--workload' => 'application', '--smoke' => true], $command->getDefinition()));
+        $this->assertSame(100, $options->configuration()['handler_milliseconds']);
+        $this->assertSame(5, $options->configuration()['rate']);
     }
 
     private function events(): array

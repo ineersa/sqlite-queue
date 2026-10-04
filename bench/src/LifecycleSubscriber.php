@@ -37,6 +37,13 @@ final class LifecycleSubscriber implements EventSubscriberInterface
             $packet = $this->control->receive();
             if (str_starts_with($packet, 'arm-idle:')) {
                 $this->idleRequest = $packet;
+            } elseif ('hold' === $packet) {
+                // Concurrent warmup uses an observable barrier so both stock workers handle work.
+                $this->control->send('hold');
+                if ('resume' !== $this->control->receive()) {
+                    throw new \RuntimeException('Consumer warmup resume missing.');
+                }
+                $this->control->send('resume');
             } elseif (str_starts_with($packet, 'snapshot:')) {
                 $this->control->sendPacket(['id' => $packet, 'pid' => getmypid(), 'used_bytes' => memory_get_usage(false), 'reserved_bytes' => memory_get_usage(true), 'peak_bytes' => memory_get_peak_usage(true), 'monotonic_ns' => hrtime(true)]);
             } else {

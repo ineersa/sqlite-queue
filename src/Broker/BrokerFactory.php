@@ -33,6 +33,7 @@ final class BrokerFactory
     private const int RELEASE_BUDGET_SECONDS = 5;
 
     /**
+     * @param SqliteSynchronousMode  $synchronous       NORMAL is the product default; FULL enables stronger commit durability
      * @param int                    $visibilityTimeout redelivery delay in milliseconds; defaults to Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS
      * @param (\Closure(): int)|null $clock             deterministic millisecond clock for tests; the wall clock otherwise
      * @param ?Cancellation          $cancellation      cooperative cancellation for the blocking startup only; serving cancellation stays on Broker::run()
@@ -43,7 +44,9 @@ final class BrokerFactory
         private readonly int $visibilityTimeout = Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS,
         private readonly ?\Closure $clock = null,
         private readonly ?Cancellation $cancellation = null,
+        private readonly SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal,
     ) {
+        SqliteQueueStorage::validateSynchronousMode($synchronous);
     }
 
     public function create(): Broker
@@ -68,7 +71,7 @@ final class BrokerFactory
             }
             $config = (new SqliteConfig($locks->database))
                 ->withJournalMode(SqliteJournalMode::Wal)
-                ->withSynchronousMode(SqliteSynchronousMode::Full)
+                ->withSynchronousMode($this->synchronous)
                 ->withTransactionMode(SqliteTransactionMode::Immediate)
                 ->withBusyTimeout(self::BUSY_TIMEOUT_MS);
             $connection = (new SqliteConnector($workerFactory))->connect($config, $this->cancellation);

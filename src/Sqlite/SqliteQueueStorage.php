@@ -40,9 +40,10 @@ final class SqliteQueueStorage
         $this->owned = new FiberLocal(static fn (): bool => false);
         try {
             $config = $connection->getConfig();
-            if (SqliteJournalMode::Wal !== $config->getJournalMode() || SqliteSynchronousMode::Full !== $config->getSynchronousMode()) {
-                throw new \InvalidArgumentException('Queue storage requires an explicitly configured WAL/FULL connection.');
+            if (SqliteJournalMode::Wal !== $config->getJournalMode()) {
+                throw new \InvalidArgumentException('Queue storage requires an explicitly configured WAL connection.');
             }
+            self::validateSynchronousMode($config->getSynchronousMode());
             $connection->setTransactionIsolation(SqliteTransactionMode::Immediate);
             $mode = $connection->query('PRAGMA journal_mode');
             $journal = $mode->fetchRow();
@@ -50,8 +51,16 @@ final class SqliteQueueStorage
             $sync = $connection->query('PRAGMA synchronous');
             $synchronous = $sync->fetchRow();
             $sync->close();
-            if ('wal' !== ($journal['journal_mode'] ?? null) || 2 !== ($synchronous['synchronous'] ?? null)) {
-                throw new \RuntimeException('Queue storage requires file-backed WAL/FULL durability.');
+            if ('wal' !== ($journal['journal_mode'] ?? null)) {
+                throw new \RuntimeException('Queue storage requires effective file-backed WAL mode.');
+            }
+            $expectedSynchronous = match ($config->getSynchronousMode()) {
+                SqliteSynchronousMode::Normal => 1, // SQLite PRAGMA synchronous NORMAL.
+                SqliteSynchronousMode::Full => 2, // SQLite PRAGMA synchronous FULL.
+                default => throw new \LogicException('Unsupported synchronous mode passed validation.'),
+            };
+            if ($expectedSynchronous !== ($synchronous['synchronous'] ?? null)) {
+                throw new \RuntimeException('Effective synchronous mode does not match the configured mode.');
             }
             $connection->executeScript(<<<'SQL'
                 CREATE TABLE IF NOT EXISTS queue_messages (
@@ -87,18 +96,46 @@ final class SqliteQueueStorage
     {
     }
 
-    /** Open durable queue storage for a database file. */
-    public static function open(string $path, ?Cancellation $cancellation = null): self
+    /** Open queue storage. NORMAL is the product default; cancellation remains the second positional argument. */
+    public static function open(string $path, ?Cancellation $cancellation = null, SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal): self
     {
         if ('' === $path || ':memory:' === $path) {
             throw new \InvalidArgumentException('Queue storage requires a database file path.');
         }
+        self::validateSynchronousMode($synchronous);
         $config = (new SqliteConfig($path))
             ->withJournalMode(SqliteJournalMode::Wal)
-            ->withSynchronousMode(SqliteSynchronousMode::Full)
+            ->withSynchronousMode($synchronous)
             ->withTransactionMode(SqliteTransactionMode::Immediate);
 
         return new self((new SqliteConnector())->connect($config, $cancellation));
+    }
+
+    /** Only NORMAL and FULL are supported queue durability policies. */
+    public static function validateSynchronousMode(SqliteSynchronousMode $synchronous): void
+    {
+        if (SqliteSynchronousMode::Normal !== $synchronous && SqliteSynchronousMode::Full !== $synchronous) {
+            throw new \InvalidArgumentException('Queue synchronous mode must be normal or full.');
+        }
+    }
+
+    /** Read the owning connection before serving, never an observer connection. */
+    public function synchronousMode(): SqliteSynchronousMode
+    {
+        $this->assertOpen();
+        $result = $this->connection->query('PRAGMA synchronous');
+        $row = $result->fetchRow();
+        $result->close();
+        $effective = match ($row['synchronous'] ?? null) {
+            1 => SqliteSynchronousMode::Normal,
+            2 => SqliteSynchronousMode::Full,
+            default => throw new \RuntimeException('Effective synchronous mode must be normal or full.'),
+        };
+        if ($effective !== $this->connection->getConfig()->getSynchronousMode()) {
+            throw new \RuntimeException('Effective synchronous mode does not match the configured mode.');
+        }
+
+        return $effective;
     }
 
     /**

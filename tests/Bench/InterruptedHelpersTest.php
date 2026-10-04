@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Tests\Bench;
 
 use Ineersa\SqliteQueue\Bench\Analysis;
-use Ineersa\SqliteQueue\Bench\Arrivals;
 use Ineersa\SqliteQueue\Bench\Clock;
 use Ineersa\SqliteQueue\Bench\Phase;
 use Ineersa\SqliteQueue\Bench\Resources;
@@ -14,16 +13,6 @@ use PHPUnit\Framework\TestCase;
 
 final class InterruptedHelpersTest extends TestCase
 {
-    public function testArrivalsRetainTheirOriginalSchedule(): void
-    {
-        $arrivals = new Arrivals(100, 1000000100, 4);
-        $this->assertSame(4, $arrivals->count());
-        $this->assertSame(100, $arrivals->at(0));
-        $this->assertSame(750000100, $arrivals->at(3));
-        $this->expectException(\InvalidArgumentException::class);
-        $arrivals->at(-1);
-    }
-
     public function testResourcesRejectReusedPidAndKeepMissingMemoryUnknown(): void
     {
         $start = 10;

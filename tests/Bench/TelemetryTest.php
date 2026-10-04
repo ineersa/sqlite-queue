@@ -63,7 +63,7 @@ final class TelemetryTest extends TestCase
 
             return true;
         }, 8192, 'run', 'consumer');
-        $envelope = new Envelope(new ProbeMessage('m', Phase::Measure, str_repeat('x', 256), false));
+        $envelope = new Envelope(new ProbeMessage('measure:0', Phase::Measure, \Ineersa\SqliteQueue\Bench\Payload::generate('measure:0'), false));
         $inner = $this->createStub(TransportInterface::class);
         $inner->method('get')->willReturn([$envelope]);
         $inner->method('ack')->willThrowException(new \RuntimeException('ACK reply lost'));
@@ -126,7 +126,7 @@ final class TelemetryTest extends TestCase
             return false;
         }, 1024, 'r', 'c');
         for ($i = 0; $i < 20; ++$i) {
-            $recorder->record(Operation::Receive, Outcome::Empty, Phase::Measure, (string) $i, '', 1, 2, '');
+            $recorder->record(Operation::Receive, Outcome::Error, Phase::Measure, (string) $i, '', 1, 2, 'failed');
             $this->assertLessThanOrEqual(1024, $recorder->counters()['buffered_bytes']);
         }
         $recorder->flush();

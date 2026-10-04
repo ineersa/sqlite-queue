@@ -104,3 +104,26 @@ The cleanup budget is not an exact process-exit deadline. Signal delivery and pr
 If an endpoint remains after an abrupt exit, do not delete it just because a connection attempt fails. Verify that no broker or other listener owns it before removal, or choose another endpoint. Startup refuses existing sockets, regular files, and symlinks.
 
 See the [protocol reference](broker-protocol.md) for framing, deadlines, errors, and ownership requirements.
+
+## WAL synchronous mode
+
+Both broker commands accept `--synchronous=normal|full`. Only these two modes are supported. The default is `normal`. For the bundle command, precedence is CLI > `sqlite_queue.synchronous` > `normal`. The standalone command does not load bundle configuration.
+
+```sh
+vendor/bin/sqlite-queue broker --database=/private/queue.db --endpoint=/private/queue.sock --synchronous=full
+```
+
+```yaml
+sqlite_queue:
+    synchronous: full
+```
+
+PHP callers use the driver enum:
+
+```php
+use Fabpot\Amp\Sqlite\SqliteSynchronousMode;
+
+$broker = (new BrokerFactory($database, $endpoint, synchronous: SqliteSynchronousMode::Full))->create();
+```
+
+NORMAL preserves commits across process crashes, but an OS crash or power failure can lose recent publications or ACKs. FULL provides stronger commit durability if storage honors synchronization. See [storage and durability](contracts.md#storage-and-durability).

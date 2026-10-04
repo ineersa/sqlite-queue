@@ -78,13 +78,17 @@ final class NativeBenchmarkTest extends TestCase
         $this->assertFileExists($directory.'/report.md');
         $this->assertStringContainsString('Product-total resource accounting is partial', file_get_contents($directory.'/report.md'));
         $this->assertFileExists($directory.'/manifest.json');
-        $this->assertFileExists($directory.'/source/bench/src/Kernel.php');
+        $manifest = json_decode(file_get_contents($directory.'/manifest.json'), true, flags: \JSON_THROW_ON_ERROR);
+        $this->assertSame(['revision', 'composer_lock_sha256', 'settings', 'results', 'owning_connection_durability'], array_keys($manifest));
+        $this->assertSame(hash_file('sha256', $root.'/composer.lock'), $manifest['composer_lock_sha256']);
+        $this->assertSame(['doctrine' => 'doctrine/result.json', 'broker' => 'broker/result.json'], $manifest['results']);
+        $this->assertDirectoryDoesNotExist($directory.'/source');
     }
 
     public function testApplicationUsesTwoNativeWorkersAndCorrelatedResultAcknowledgement(): void
     {
         $root = \dirname(__DIR__, 2);
-        $process = new Process([\PHP_BINARY, $root.'/bin/benchmark', 'run', '--smoke', '--workload=application', '--handler-ms=1', '--rate=10', '--capacity=4'], $root, timeout: 90);
+        $process = new Process([\PHP_BINARY, $root.'/bin/benchmark', 'run', '--smoke', '--workload=application'], $root, timeout: 90);
         $process->mustRun();
         $output = json_decode(trim($process->getOutput()), true, flags: \JSON_THROW_ON_ERROR);
         $summary = json_decode(file_get_contents($output['capture'].'/summary.json'), true, flags: \JSON_THROW_ON_ERROR);
@@ -93,7 +97,8 @@ final class NativeBenchmarkTest extends TestCase
             $this->assertSame('pass', $run['integrity_status']);
             $this->assertSame('pass', $run['warmup_integrity_status']);
             $this->assertSame('complete', $run['accounting_status']);
-            $this->assertSame('offered-load-met', $run['generator']['status']);
+            $this->assertSame(5, $run['configuration']['rate']);
+            $this->assertSame(100, $run['configuration']['handler_milliseconds']);
             $this->assertSame($run['expected'], $run['unique_completions']);
             $this->assertSame(2 * $run['unique_completions'], $run['total_message_ack_completions']);
             $this->assertSame($run['unique_completions'], $run['workflow_latency_ms']['count']);
@@ -124,10 +129,10 @@ final class NativeBenchmarkTest extends TestCase
         }
     }
 
-    public function testRetentionKeepsProcessIdentitiesAcrossTwentyAuditedEmptyCycles(): void
+    public function testRetentionSmokeKeepsProcessIdentitiesAcrossTwoAuditedEmptyCycles(): void
     {
         $root = \dirname(__DIR__, 2);
-        $process = new Process([\PHP_BINARY, $root.'/bin/benchmark', 'run', '--smoke', '--workload=retention', '--cycles=20', '--cycle-messages=2', '--settling=0.001'], $root, timeout: 180);
+        $process = new Process([\PHP_BINARY, $root.'/bin/benchmark', 'run', '--smoke', '--workload=retention'], $root, timeout: 180);
         $process->mustRun();
         $output = json_decode(trim($process->getOutput()), true, flags: \JSON_THROW_ON_ERROR);
         $summary = json_decode(file_get_contents($output['capture'].'/summary.json'), true, flags: \JSON_THROW_ON_ERROR);
@@ -135,9 +140,14 @@ final class NativeBenchmarkTest extends TestCase
             $this->assertSame('complete', $run['execution_status']);
             $this->assertSame('pass', $run['integrity_status']);
             $this->assertSame('complete', $run['accounting_status']);
-            $this->assertSame(40, $run['unique_completions']);
-            $this->assertSame(20, $run['retention']['cycle_execution']['completed_cycles']);
-            $this->assertSame(40, $run['retention']['cycle_execution']['historical_completions']);
+            $this->assertSame(2, $run['configuration']['cycles']);
+            $this->assertSame(2, $run['configuration']['cycle_messages']);
+            $this->assertSame(4, $run['unique_completions']);
+            $this->assertSame(2, $run['retention']['cycle_execution']['completed_cycles']);
+            $this->assertSame(4, $run['retention']['cycle_execution']['historical_completions']);
+            $this->assertStringContainsString('one streaming offline pass', $run['retention']['cycle_execution']['observer_analysis']);
+            $this->assertSame([], glob($output['capture'].'/'.$backend.'/cycle-*-analysis.sqlite'));
+            $this->assertFileExists($output['capture'].'/'.$backend.'/analysis.sqlite');
             $this->assertSame(0, $run['audit_remaining']);
             $cycles = 0;
             foreach (Recorder::read($output['capture'].'/'.$backend.'/cycles.jsonl') as $cycle) {
@@ -148,49 +158,26 @@ final class NativeBenchmarkTest extends TestCase
                 $this->assertSame(2 * $cycle['retention_cycle'], $cycle['historical_completions']);
                 ++$cycles;
             }
-            $this->assertSame(21, $cycles);
+            $this->assertSame(3, $cycles);
             $registry = $run['resources']['coverage_details']['registry'];
             foreach ($run['retention']['roles'] as $role => $series) {
                 $this->assertSame($registry[$role]['pid'], $series['pid']);
                 $this->assertSame($registry[$role]['start_ticks'], $series['start_ticks']);
-                $this->assertSame(21, $series['matched_points']);
+                $this->assertSame(3, $series['matched_points']);
                 $this->assertSame(0, $series['excluded_points']);
                 $this->assertSame(0, $series['identity_changes']);
-                $this->assertSame(40, $series['historical_completions']);
+                $this->assertSame(4, $series['historical_completions']);
                 if (\in_array($role, ['broker', 'persistence'], true)) {
                     $this->assertSame('unavailable', $series['metrics']['php_used_bytes']['coverage']);
                 }
             }
-            $this->assertSame(21, $run['retention']['roles']['consumer']['metrics']['php_used_bytes']['count']);
+            $this->assertSame(3, $run['retention']['roles']['consumer']['metrics']['php_used_bytes']['count']);
             $this->assertFalse($run['retention']['forced_gc']);
             $this->assertFalse($run['retention']['process_restarts']);
             if ('broker' === $backend) {
                 $this->assertArrayHasKey('broker', $run['retention']['roles']);
                 $this->assertArrayHasKey('persistence', $run['retention']['roles']);
             }
-        }
-    }
-
-    public function testTinyPilotRecordsFixedWindowAndFrozenSource(): void
-    {
-        $root = \dirname(__DIR__, 2);
-        $process = new Process([\PHP_BINARY, $root.'/bin/benchmark', 'run', '--pilot', '--duration=0.1', '--repetitions=1', '--workload=roundtrip'], $root, timeout: 90);
-        $process->mustRun();
-        $output = json_decode(trim($process->getOutput()), true, flags: \JSON_THROW_ON_ERROR);
-        $directory = $output['capture'];
-        $manifest = json_decode(file_get_contents($directory.'/manifest.json'), true, flags: \JSON_THROW_ON_ERROR);
-        $this->assertSame('pilot', $manifest['mode']);
-        $this->assertCount(2, $manifest['schedule']);
-        $this->assertSame(64, \strlen($manifest['source_sha256']));
-        $this->assertFileExists($directory.'/git-status.txt');
-        $summary = json_decode(file_get_contents($directory.'/summary.json'), true, flags: \JSON_THROW_ON_ERROR);
-        foreach ($summary['results'] as $id => $run) {
-            $this->assertSame('complete', $run['execution_status']);
-            $this->assertSame('pass', $run['integrity_status']);
-            $this->assertSame(0.1, $run['window_seconds']);
-            $this->assertSame($run['expected'], $run['unique_completions']);
-            $this->assertFileExists($directory.'/'.$id.'/expected-ids.txt');
-            $this->assertFileExists($directory.'/'.$id.'/config.json');
         }
     }
 }

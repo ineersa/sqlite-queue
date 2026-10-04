@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue;
 
+use Fabpot\Amp\Sqlite\SqliteSynchronousMode;
 use Ineersa\SqliteQueue\Command\BrokerCommand;
 use Ineersa\SqliteQueue\DependencyInjection\RegisterNativeConsumeWaitSubscriberPass;
 use Ineersa\SqliteQueue\Messenger\TransportFactory;
@@ -34,6 +35,7 @@ final class SqliteQueueBundle extends AbstractBundle
     public function configure(DefinitionConfigurator $definition): void
     {
         $definition->rootNode()->children()
+            ->enumNode('synchronous')->values(['normal', 'full'])->defaultValue('normal')->end()
             ->integerNode('redeliver_timeout')->min(1)->max(intdiv(\PHP_INT_MAX, 1000))->defaultValue(BrokerCommand::DEFAULT_REDELIVER_TIMEOUT_SECONDS)->end()
         ->end();
     }
@@ -49,6 +51,7 @@ final class SqliteQueueBundle extends AbstractBundle
 
         $services->set(BrokerCommand::class)
             ->arg('$redeliverTimeoutSeconds', $config['redeliver_timeout'])
+            ->arg('$synchronous', SqliteSynchronousMode::from($config['synchronous']))
             ->autoconfigure(false)
             ->tag('console.command', ['command' => 'sqlite-queue:broker']);
     }

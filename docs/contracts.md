@@ -24,7 +24,9 @@ SQLite is the only authoritative message store. One table holds all named queues
 
 Receive reserves one eligible message in a write transaction and returns it only after commit. Concurrent receives cannot reserve the same delivery. Send, ACK, and reject also return success only after commit. A rollback or storage error does not produce success.
 
-The writing connection uses WAL and synchronous FULL. Durability still depends on SQLite, the filesystem, and the host. A process-crash or reopen check does not simulate power loss.
+The writing connection uses WAL and synchronous NORMAL by default. NORMAL preserves committed changes across application or process crashes, but recent committed writes can be lost after an OS crash or power failure. A confirmed send may disappear without delivery, and a committed ACK may be lost so the message reappears. NORMAL does not guarantee at-least-once delivery across power loss.
+
+Choose synchronous FULL for stronger commit durability across OS crashes and power loss, assuming storage honors synchronization. Durability still depends on SQLite, the filesystem, and the host. A process-crash or reopen check does not simulate power loss.
 
 Transactions remain short. They do not include handlers, socket I/O, or waits for future messages. The driver does not support data-changing `RETURNING` statements, so claim uses select, conditional update, and payload read in one immediate transaction. See [schema and ordering](queue-engine.md#schema-and-ordering).
 

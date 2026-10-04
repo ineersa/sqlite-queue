@@ -844,6 +844,11 @@ final class BrokerTest extends TestCase
                 $this->assertSame(CancelledException::class, $settled, 'The shared budget must cancel the blocked shutdown.');
                 $this->assertFileDoesNotExist($this->endpoint, 'Shutdown must release the endpoint while the launcher is stopped.');
                 $this->assertFileExists($database->path(), 'Shutdown must preserve confirmed data.');
+                // SIGKILL is asynchronous. Observe process exit instead of assuming the kernel
+                // has scheduled the worker before the cancelled shutdown future settles.
+                while ([] !== ProcessTree::ownedBy((int) getmypid())['workers']) {
+                    \Amp\delay(0, cancellation: $safety);
+                }
                 $this->assertSame([], ProcessTree::ownedBy((int) getmypid())['workers'], 'The force-stopped worker must not survive the shutdown.');
                 $this->assertSame('T', $this->processState($launcher), 'The broker does not own the launcher, so this test must reap it.');
             } finally {

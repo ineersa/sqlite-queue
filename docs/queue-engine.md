@@ -31,9 +31,9 @@ try {
 
 The database directory must exist. Queue names are independent of the database path. Construct `QueueName` from untrusted strings; invalid names fail at construction. Names contain 1 to 255 ASCII letters, digits, dots, underscores, or hyphens and start with a letter or digit. Paths, empty names, and NUL bytes are rejected. Bodies and headers can contain arbitrary bytes, including empty strings.
 
-`SqliteQueueStorage::open(string $path, ?Cancellation $cancellation = null)` starts the connection with explicit WAL, synchronous FULL, and immediate transactions. Initialization verifies the effective WAL/FULL settings and creates the table and index if absent. In-memory databases are not supported. The database is dedicated queue storage. Do not modify its schema or open it independently while the broker owns it.
+`SqliteQueueStorage::open(string $path, ?Cancellation $cancellation = null, SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal)` starts the connection with explicit WAL and immediate transactions. Only NORMAL and FULL are supported. The NORMAL default is the product durability policy. Use `SqliteQueueStorage::open($path, synchronous: SqliteSynchronousMode::Full)` for FULL. Initialization verifies the effective WAL and selected synchronous settings and creates the table and index if absent. In-memory databases are not supported. The database is dedicated queue storage. Do not modify its schema or open it independently while the broker owns it.
 
-`new SqliteQueueStorage(SqliteConnection $connection)` transfers exclusive ownership of an existing driver connection. It requires explicitly configured WAL/FULL, verifies effective settings, and sets immediate transaction mode. Do not use the transferred connection concurrently or change its schema or settings. Initialization failure closes it. The constructor supports embedding with an existing driver connection.
+`new SqliteQueueStorage(SqliteConnection $connection)` transfers exclusive ownership of an existing driver connection. It requires explicitly configured WAL with NORMAL or FULL, verifies that the effective synchronous mode matches configuration, and sets immediate transaction mode. Do not use the transferred connection concurrently or change its schema or settings. Initialization failure closes it. The constructor supports embedding with an existing driver connection.
 
 `new Queue(SqliteQueueStorage $storage, int $visibilityTimeout = 60000, ?Closure $clock = null)` is message policy only. It does not open, configure, or close storage. Invalid visibility fails without closing the caller-owned storage dependency.
 
@@ -109,4 +109,4 @@ Send, successful claim, acknowledge, and reject return only after commit. SQL er
 
 SQLite can commit before a process or connection fails to deliver confirmation. An exception therefore does not prove that the operation had no effect. The client does not replay uncertain operations.
 
-WAL/FULL durability remains subject to SQLite, filesystem, and host guarantees. Close/reopen and process-crash checks do not establish power-loss survival.
+NORMAL can lose recent committed sends or ACKs after OS crashes or power loss. FULL provides stronger commit durability if storage honors synchronization. See [storage and durability](contracts.md#storage-and-durability). Close/reopen and process-crash checks do not establish power-loss survival.

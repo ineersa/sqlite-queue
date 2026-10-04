@@ -97,7 +97,7 @@ final class Broker
         try {
             $cancellation?->throwIfRequested();
             if (!$this->stopping) {
-                $ready?->__invoke(['event' => BrokerEventEnum::Ready->value, 'pid' => getmypid(), 'persistence_pid' => $this->worker->pid(), 'database' => $this->locks->database, 'endpoint' => $this->locks->endpoint]);
+                $ready?->__invoke(['synchronous_effective' => $this->storage->synchronousMode()->value, 'event' => BrokerEventEnum::Ready->value, 'pid' => getmypid(), 'persistence_pid' => $this->worker->pid(), 'database' => $this->locks->database, 'endpoint' => $this->locks->endpoint]);
             }
             while (!$this->stopping && null !== ($socket = $this->server->accept())) {
                 if (\count($this->clients) >= self::MAX_CONNECTIONS) {

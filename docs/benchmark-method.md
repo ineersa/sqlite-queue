@@ -6,7 +6,9 @@ Method `native-messenger-diagnostic` measures a package-owned Symfony applicatio
 
 Doctrine uses its stock Messenger transport with PHP 8.5 PDO SQLite immediate transactions. The broker uses the current package adapter and native bundle integration. There is no custom Doctrine empty-poll optimization or automatic replay of failed publish or ACK operations.
 
-Both backends use WAL/FULL, a 5000ms busy timeout, and a 3600-second redelivery interval. Payloads alternate between 256 bytes and 16 KiB. The serializer and payload-validation handler are shared. Broker workers use native single-receiver WAIT integration. Doctrine workers use the named 1ms polling reference.
+Both backends use WAL, immediate transactions, a 5000ms busy timeout, and a 3600-second redelivery interval. `--synchronous=normal|full` selects the same mode for both, defaulting to NORMAL. Before measurement, the actual Doctrine transport connections read back their pragmas, and broker readiness reports readback from its owning storage connection. Desired and effective modes are recorded in configuration, manifest, and per-run results. The read-only audit connection is not authoritative for synchronous mode. Do not pool NORMAL and FULL captures.
+
+NORMAL preserves commits across application or process crashes, but OS crashes or power loss can lose recent committed publications or ACKs. Confirmed sends may vanish and ACKed messages may reappear. NORMAL does not guarantee at-least-once across power loss. FULL retains stronger commit durability if storage honors synchronization. Payloads alternate between 256 bytes and 16 KiB. The serializer and payload-validation handler are shared. Broker workers use native single-receiver WAIT integration. Doctrine workers use the named 1ms polling reference.
 
 The publisher and observer share a process. Broker consumers and publishers have no diagnostic SQL connections. The observer audits storage through a separate read-only process after measurement and drain. Resource reports do not pretend that shared publisher/observer costs are isolated product costs.
 
@@ -21,6 +23,8 @@ The publisher and observer share a process. Broker consumers and publishers have
 | `delayed` | Single-queue DelayStamp delivery through native consumption and broker WAIT. |
 | `retention` | At least twenty publish/drain cycles with the same processes and clients, followed by audited-empty memory observations. |
 
+Omitting `--rate` selects 20 messages/s for `fixed-rate` and 5 workflows/s for `application`. Application handler work defaults to 100ms. An explicit rate is never changed. Demand above `1000 / handler-ms` is labelled handler-alone overload, not healthy application demand. This nominal limit excludes queue overhead.
+
 Fixed-rate capacity bounds outstanding work. An overloaded generator retains original scheduled timestamps and reports unstarted or late arrivals. Generator insufficiency is not transport loss or a healthy capacity result. This single synchronous publisher can become the bottleneck before the transport does.
 
 Application handlers dispatch correlated results through Messenger. Reports distinguish message ACKs from workflows whose root and result both complete cleanly. The workflow is synthetic. It does not reproduce real LLM latency, external side effects, keepalive incidents, or multi-receiver native selection.
@@ -31,7 +35,7 @@ Delayed reports distinguish requested-deadline error from unavailable stored-dea
 
 The lifecycle records boot, connected baseline, same-process warmup, measurement, bounded drain, settling, audit, and shutdown. Scenario-specific idle, pickup, and retention-cycle boundaries remain separate. Warmup exercises both payloads and the relevant routes without restarting workers.
 
-Formal runs require a clean revision and freeze configuration and the full alternating backend schedule before execution. Defaults are 60 seconds per backend and one pair, about two minutes plus setup for a time-based workload. Additional repetitions require an explicit option. Retention is cohort/cycle based rather than a duration-based capacity test. Pilots preserve source snapshots and are labelled separately. Smoke captures prove wiring and accounting only.
+Formal runs require a clean revision and freeze configuration and the full alternating backend schedule before execution. Defaults are 60 seconds per backend and one pair, about two minutes plus setup for a time-based workload. Additional repetitions require an explicit option. Retention is cohort/cycle based rather than a duration-based capacity test. Non-smoke defaults are twenty cycles of one hundred messages. Retention smoke explicitly uses two cycles of two messages, records both requested and effective settings, and does not establish retention behavior. Pilots preserve source snapshots and are labelled separately. Smoke captures prove wiring and accounting only.
 
 Failed repetitions remain in place. A later clean repetition does not replace them. Changes to offered rates or instrumentation create a separate experiment.
 

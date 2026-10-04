@@ -23,7 +23,7 @@ final class Analysis
             $db->exec('PRAGMA cache_size=-4096');
             $db->exec('PRAGMA temp_store=FILE');
             $db->exec('CREATE TABLE expected (id TEXT PRIMARY KEY)');
-            $db->exec('CREATE TABLE observations (id TEXT PRIMARY KEY, send_call INTEGER, send_return INTEGER, scheduled INTEGER, payload_bytes INTEGER, delivery INTEGER, receive_call INTEGER, handler_enter INTEGER, handler_exit INTEGER, ack_call INTEGER, ack_return INTEGER, requested_deadline INTEGER, requested_wall INTEGER, anchor_mono INTEGER, anchor_wall INTEGER, delay_ms INTEGER, deliveries INTEGER NOT NULL DEFAULT 0, acks INTEGER NOT NULL DEFAULT 0, sends INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0)');
+            $db->exec('CREATE TABLE observations (id TEXT PRIMARY KEY, send_call INTEGER, send_return INTEGER, payload_bytes INTEGER, delivery INTEGER, receive_call INTEGER, handler_enter INTEGER, handler_exit INTEGER, ack_call INTEGER, ack_return INTEGER, deliveries INTEGER NOT NULL DEFAULT 0, acks INTEGER NOT NULL DEFAULT 0, sends INTEGER NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0)');
             $insert = $db->prepare('INSERT INTO expected VALUES (?)');
             $db->exec('BEGIN');
             foreach ($ids as $id) {
@@ -62,7 +62,7 @@ final class Analysis
                     continue;
                 }
                 $columns = match ($operation) {
-                    'send' => ['send_call' => $event['started_ns'], 'send_return' => 'success' === $outcome ? $event['ended_ns'] : null, 'scheduled' => $event['scheduled_ns'] ?? null],
+                    'send' => ['send_call' => $event['started_ns'], 'send_return' => 'success' === $outcome ? $event['ended_ns'] : null],
                     'delivery' => ['delivery' => $event['ended_ns'], 'receive_call' => $event['started_ns']],
                     'handler' => 'enter' === $outcome ? ['handler_enter' => $event['started_ns']] : ('success' === $outcome ? ['handler_exit' => $event['ended_ns']] : []),
                     'ack' => ['ack_call' => $event['started_ns'], 'ack_return' => 'success' === $outcome ? $event['ended_ns'] : null],
@@ -72,11 +72,7 @@ final class Analysis
                     continue;
                 }
                 $columns['payload_bytes'] = $event['payload_bytes'] ?? null;
-                if (Operation::Send->value === $operation && \is_array($event['eligibility'] ?? null)) {
-                    foreach (['requested_monotonic_ns' => 'requested_deadline', 'requested_wall_ms' => 'requested_wall', 'anchor_monotonic_ns' => 'anchor_mono', 'anchor_wall_ms' => 'anchor_wall', 'delay_ms' => 'delay_ms'] as $field => $column) {
-                        $columns[$column] = $event['eligibility'][$field] ?? null;
-                    }
-                }
+
                 $stmt = $db->prepare('INSERT OR IGNORE INTO observations(id) VALUES (?)');
                 $stmt->bindValue(1, $id, \SQLITE3_TEXT);
                 $stmt->execute();
@@ -124,7 +120,7 @@ final class Analysis
                 $latencies = [];
                 $source = ' FROM observations WHERE id IN (SELECT id FROM expected)'.$filter;
                 $stratumExpected = '' === $filter ? $expected : (int) $db->querySingle('SELECT COUNT(*)'.$source);
-                foreach (['send_ms' => 'send_return-send_call', 'receive_ms' => 'delivery-receive_call', 'delivery_ms' => 'delivery-send_call', 'handler_ms' => 'handler_exit-handler_enter', 'ack_ms' => 'ack_return-ack_call', 'full_cycle_ms' => 'ack_return-send_call', 'schedule_lag_ms' => 'send_call-scheduled', 'confirmation_gap_ms' => 'delivery-send_return', 'requested_delivery_lateness_ms' => 'delivery-requested_deadline', 'requested_handler_lateness_ms' => 'handler_enter-requested_deadline'] as $name => $expression) {
+                foreach (['send_ms' => 'send_return-send_call', 'receive_ms' => 'delivery-receive_call', 'delivery_ms' => 'delivery-send_call', 'handler_ms' => 'handler_exit-handler_enter', 'ack_ms' => 'ack_return-ack_call', 'full_cycle_ms' => 'ack_return-send_call', 'confirmation_gap_ms' => 'delivery-send_return'] as $name => $expression) {
                     $count = (int) $db->querySingle('SELECT COUNT('.$expression.')'.$source);
                     $stats = ['count' => $count, 'expected_count' => $stratumExpected, 'missing_boundary_count' => $stratumExpected - $count, 'coverage' => 'available-boundaries-only', 'p50' => null, 'p95' => null, 'p99' => null, 'maximum' => null, 'mean' => null, 'tail' => $count >= self::MIN_TAIL_SAMPLES ? 'observed' : 'insufficient-samples'];
                     if ($count > 0) {

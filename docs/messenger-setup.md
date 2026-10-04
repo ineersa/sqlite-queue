@@ -41,7 +41,7 @@ The example uses native PHP serialization. Accept only trusted messages with thi
 
 4. Wait for the JSON `ready` event before starting consumers.
 
-With the bundle enabled, `php bin/console sqlite-queue:broker` accepts the same options and loads `sqlite_queue.redeliver_timeout`. The standalone command does not read bundle configuration. An explicit CLI value overrides the bundle value.
+With the bundle enabled, `php bin/console sqlite-queue:broker` accepts the same options and loads `sqlite_queue.redeliver_timeout` and `sqlite_queue.synchronous`. The standalone command does not read bundle configuration. An explicit CLI value overrides the bundle value. `--synchronous=normal|full` selects WAL commit durability, defaulting to NORMAL. See [durability guarantees](contracts.md#storage-and-durability).
 
 Use absolute paths and a socket path no longer than 100 bytes. See [broker startup and recovery](broker.md) for permissions and supervisor configuration.
 

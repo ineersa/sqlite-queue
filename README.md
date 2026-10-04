@@ -2,7 +2,7 @@
 
 A PHP queue broker backed by SQLite, with a socket client and a Symfony Messenger transport.
 
-Run the broker as a separate process. Applications send messages through the PHP client or Messenger. The broker stores messages durably, supports millisecond delays, and redelivers messages that are not acknowledged before their reservation expires.
+Run the broker as a separate process. Applications send messages through the PHP client or Messenger. The broker stores messages in SQLite, supports millisecond delays, and redelivers messages that are not acknowledged before their reservation expires.
 
 ## Requirements
 
@@ -28,7 +28,7 @@ Start the broker with `vendor/bin/sqlite-queue broker`, then connect with `Clien
 
 ## Delivery guarantees
 
-- A successful send or settlement is confirmed only after SQLite commits, using WAL and synchronous FULL.
+- A successful send or settlement is confirmed only after SQLite commits, using WAL and synchronous NORMAL by default. Choose FULL for stronger durability across OS crashes or power loss. See [durability guarantees](docs/contracts.md#storage-and-durability).
 - Delivery is at least once, not exactly once. Make external effects safe to repeat.
 - Reservations expire after 60 seconds by default. Configure `--redeliver-timeout` for your handlers. There is no automatic lease renewal.
 - A connection failure can hide a committed operation. The client does not reconnect or replay it automatically.

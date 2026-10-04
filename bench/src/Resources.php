@@ -33,6 +33,47 @@ final class Resources
         $this->registry[$role->value] = ['pid' => $pid, 'start_ticks' => $stat['start_ticks']];
     }
 
+    /** @param \Closure(int): bool $kill signals only an original, confirmed owned identity
+     * @return array{complete: bool, roles: array<string, string>}
+     */
+    public function cleanup(\Closure $kill, float $timeoutSeconds): array
+    {
+        $deadline = hrtime(true) + (int) ($timeoutSeconds * 1e9);
+        $roles = [];
+        $signalled = [];
+        while (true) {
+            $complete = true;
+            foreach ($this->registry as $role => $identity) {
+                if (Role::ObserverPublisher->value === $role) {
+                    continue;
+                }
+                $stat = $this->stat($identity['pid']);
+                if ([] === $stat && is_dir('/proc/'.$identity['pid'])) {
+                    $complete = false;
+                    $roles[$role] = CleanupStatus::IdentityUnavailable->value;
+                    continue;
+                }
+                if ([] === $stat || $stat['start_ticks'] !== $identity['start_ticks'] || 1 === ($stat['zombie'] ?? 0)) {
+                    $roles[$role] = match (true) {
+                        [] === $stat => CleanupStatus::Exited->value,
+                        $stat['start_ticks'] !== $identity['start_ticks'] => CleanupStatus::PidReused->value,
+                        default => CleanupStatus::Zombie->value,
+                    };
+                    continue;
+                }
+                $complete = false;
+                if (!isset($signalled[$role])) {
+                    $signalled[$role] = true;
+                    $roles[$role] = $kill($identity['pid']) ? CleanupStatus::KillSent->value : CleanupStatus::KillFailed->value;
+                }
+            }
+            if ($complete || hrtime(true) >= $deadline) {
+                return ['complete' => $complete, 'roles' => $roles];
+            }
+            usleep(1000);
+        }
+    }
+
     /** @param array<string, array<string, mixed>> $actors Cooperative PHP snapshots, empty when unavailable
      * @param array<string, mixed> $context optional fixed-size cycle metadata, absent outside retention
      */
@@ -181,7 +222,7 @@ final class Resources
         if (false === $fields) {
             return [];
         }
-        $result = [];
+        $result = ['zombie' => 'Z' === ($fields[0] ?? '') ? 1 : 0];
         foreach (['user_ticks' => 11, 'system_ticks' => 12, 'start_ticks' => 19, 'rss_pages' => 21] as $name => $index) {
             if (!isset($fields[$index]) || !ctype_digit($fields[$index])) {
                 return [];

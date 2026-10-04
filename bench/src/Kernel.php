@@ -51,6 +51,7 @@ final class Kernel extends BaseKernel
         parent::build($container);
         $container->register(Clock::class)->setFactory([Clock::class, 'system']);
         $container->register(Recorder::class)->setFactory([Runtime::class, 'recorder'])->setPublic(true);
+        $container->register(Command\PublisherCommand::class)->setArguments([new Reference('messenger.default_bus'), new Reference(Recorder::class), new Reference(Control::class), new Reference(ObservedTransport::class)])->addTag('console.command');
         $container->register(Control::class)->setFactory([Runtime::class, 'control']);
         $container->register(DoctrineFactory::class)->addTag('messenger.transport_factory');
         $container->register(Handler::class)->setArguments([new Reference(Recorder::class), new Reference('messenger.default_bus'), new Reference(Clock::class)])->addTag('messenger.message_handler');

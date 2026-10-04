@@ -30,20 +30,21 @@ final class BrokerVisibilityTest extends TestCase
 {
     public static function configuredLeases(): iterable
     {
-        yield 'bundle configuration' => [[], 15000, 15];
-        yield 'CLI override' => [['--redeliver-timeout' => '20'], 20000, 15];
-        yield 'default' => [[], 60000, null];
+        yield 'bundle configuration' => [[], 15000, 15, 'full'];
+        yield 'CLI synchronous override' => [['--synchronous' => 'normal'], 15000, 15, 'full'];
+        yield 'CLI override' => [['--redeliver-timeout' => '20', '--synchronous' => 'full'], 20000, 15, 'normal'];
+        yield 'default' => [[], 60000, null, 'normal'];
     }
 
     #[DataProvider('configuredLeases')]
-    public function testNativeBrokerLeaseSurvivesSixSecondHandler(array $options, int $lease, ?int $configuredSeconds): void
+    public function testNativeBrokerLeaseSurvivesSixSecondHandler(array $options, int $lease, ?int $configuredSeconds, string $configuredMode): void
     {
         $fixture = new IsolatedDatabase();
         $project = $fixture->directory().'/app';
         $filesystem = new Filesystem();
         $filesystem->mirror(__DIR__.'/Fixtures/NativeApp/config', $project.'/config');
         if (null !== $configuredSeconds) {
-            $filesystem->dumpFile($project.'/config/packages/sqlite_queue.yaml', "sqlite_queue:\n    redeliver_timeout: $configuredSeconds\n");
+            $filesystem->dumpFile($project.'/config/packages/sqlite_queue.yaml', "sqlite_queue:\n    redeliver_timeout: $configuredSeconds\n    synchronous: $configuredMode\n");
         }
         $clock = new MockClock('2026-10-03 00:00:00 UTC');
         $previousClock = Clock::get();
@@ -53,6 +54,7 @@ final class BrokerVisibilityTest extends TestCase
         $application = new Application($kernel);
         $application->setAutoExit(false);
         $application->setCatchExceptions(false);
+        $this->assertSame(null === $configuredSeconds ? 'normal' : $configuredMode, $application->find('sqlite-queue:broker')->getDefinition()->getOption('synchronous')->getDefault());
         $ready = new DeferredFuture();
         $output = new class($ready) extends BufferedOutput {
             public function __construct(private readonly DeferredFuture $ready)
@@ -152,5 +154,32 @@ final class BrokerVisibilityTest extends TestCase
         $tester = new CommandTester(new BrokerCommand());
         $this->assertSame(1, $tester->execute(['--redeliver-timeout' => $value]));
         $this->assertStringContainsString('InvalidArgumentException', $tester->getDisplay());
+    }
+
+    public static function invalidSynchronousModes(): iterable
+    {
+        foreach (['off', 'extra', 'automatic', 'invalid'] as $mode) {
+            yield [$mode];
+        }
+    }
+
+    #[DataProvider('invalidSynchronousModes')]
+    public function testBundleRejectsInvalidSynchronousMode(string $mode): void
+    {
+        $fixture = new IsolatedDatabase();
+        $project = $fixture->directory().'/app';
+        $filesystem = new Filesystem();
+        $filesystem->mirror(__DIR__.'/Fixtures/NativeApp/config', $project.'/config');
+        $filesystem->dumpFile($project.'/config/packages/sqlite_queue.yaml', "sqlite_queue:\n    synchronous: $mode\n");
+        $kernel = new NativeKernel($project);
+        try {
+            $this->expectException(\Symfony\Component\Config\Definition\Exception\InvalidConfigurationException::class);
+            $this->expectExceptionMessage('sqlite_queue.synchronous');
+            $kernel->boot();
+        } finally {
+            $kernel->shutdown();
+            $filesystem->remove($project);
+            $fixture->remove();
+        }
     }
 }

@@ -20,9 +20,7 @@ final readonly class Handler
         $outcome = Outcome::Error;
         $error = '';
         try {
-            if (!\in_array(\strlen($message->payload), [Config::SMALL_PAYLOAD_BYTES, Config::LARGE_PAYLOAD_BYTES], true)) {
-                throw new \RuntimeException('Unexpected payload stratum.');
-            }
+            Payload::verify($message->id, $message->payload);
             if ($message->workMilliseconds > 0) {
                 usleep($message->workMilliseconds * 1000);
             }
