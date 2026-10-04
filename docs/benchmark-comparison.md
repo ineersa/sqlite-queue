@@ -2,6 +2,57 @@
 
 The native benchmark measures configured Symfony buses and stock `messenger:consume`. The [method](benchmark-method.md) defines its workload, completion boundaries, and coverage limits. Observations from the earlier synthetic runner are not interchangeable repetitions of this experiment.
 
+## Where concurrent NORMAL time goes
+
+The following public-operation timings come from the unprofiled `1b1dac2` NORMAL concurrent capture. Each distribution has 3,000 delivered-message samples. Empty receives are separate aggregates. The receive span measures active fetching of the returned message, not handler execution or idle WAIT.
+
+| Operation | Doctrine mean, ms | Broker mean, ms | Doctrine p50, ms | Broker p50, ms | Doctrine p95, ms | Broker p95, ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Send | 0.354 | 1.345 | 0.050 | 1.025 | 0.136 | 2.054 |
+| Receive | 0.364 | 0.859 | 0.141 | 0.677 | 2.122 | 1.617 |
+| Handler | 0.007 | 0.008 | 0.006 | 0.007 | 0.010 | 0.012 |
+| ACK | 0.268 | 0.688 | 0.038 | 0.464 | 1.128 | 1.400 |
+
+The handler is not responsible for the difference. Average send, receive, and ACK durations are all higher for the broker. Three publishers and two consumers overlap these spans, so summing their means is not an elapsed-time decomposition. Backlog residence is also separate: median send-call-to-delivery was 426 ms for Doctrine and 1,690 ms for the broker.
+
+### CPU is concentrated in the broker and SQLite worker
+
+These CPU deltas bracket the same unprofiled measurement through its drain boundary. CPU core-seconds are accumulated processor time, not elapsed seconds.
+
+| Role | Doctrine CPU core-seconds | Broker CPU core-seconds |
+| --- | ---: | ---: |
+| Broker | Not present | 1.69 |
+| SQLite worker | Not present | 2.37 |
+| Both consumers together | 0.88 | 0.70 |
+| Coordinator and observer | 0.07 | 0.09 |
+| Publishers | Unavailable | Unavailable |
+
+Publishers exit before the final resource snapshot, so their CPU must not be treated as zero or used to construct complete product totals. The extra broker processes alone consumed 4.06 core-seconds while the measured cohort took 3.457 elapsed seconds. The SQLite worker is the largest observed CPU consumer; it is doing considerably more than a single native SQL call per message.
+
+### Diagnostic profile identifies driver work amplification
+
+Capture `native-20261004-182616-0f3bbe28` ran the same 3,000-message NORMAL cohort with `XDEBUG_MODE=profile`. Both backends completed cleanly. Profiling increased cohort durations to 7.463 seconds for Doctrine and 28.449 seconds for the broker. These durations are diagnostic only and do not replace the unprofiled results.
+
+The worker profile includes startup, six warmup messages, the measured cohort, and shutdown. It records:
+
+| Worker activity | Calls | Recorded duration, s |
+| --- | ---: | ---: |
+| Worker `execute` dispatches | 33,248 | Not additive across fibers |
+| Native `SQLite3Stmt::execute` | 54,309 | 1.246 |
+| Native `SQLite3::prepare` | 54,309 | 0.579 self time |
+| Native `SQLite3::querySingle` | 60,336 | 0.307 |
+| Native `SQLite3Result::fetchArray` | 631,650 | 0.328 |
+| Driver `analyzeStatement` | 18,052 | 0.700 self time |
+| Driver `isOrdinaryTableDefinition` | 3,006 | 0.803 self time |
+
+The locked driver is `fabpot/amphp-sqlite3` v1.0.0, source `1ee168273e29af037a5c4576349ff89e3a53b5fd`. Its execution path probes `total_changes()`, prepares statements, uses `EXPLAIN` to inspect non-read-only statements, and queries and parses table definitions to detect insert identities. These are driver operations, not benchmark diagnostic SQL. The broker's successful message path also uses three transactions and five application statements: INSERT, SELECT, UPDATE, SELECT, and DELETE. Transaction statements and driver inspection add further work and IPC.
+
+This is roughly eleven worker execute dispatches and eighteen native prepare/execute calls per completed message, including small setup and warmup contributions. It gives a concrete optimization target: reduce worker round trips and repeated statement/metadata processing without removing correctness checks. The driver explicitly rejects row-producing DML, so blindly replacing claims with `UPDATE ... RETURNING` is not a compatible fix.
+
+Xdebug's fiber suspend/resume times overlap. Summed worker self time was 166.7 seconds against a 33.6-second process profile; the broker's summed self time was 460.9 seconds. Neither is a valid CPU total or percentage breakdown. Native SQL timings are whole-process diagnostic observations, not a subtraction from the 3.457-second unprofiled cohort. Serialization alone is not established as the bottleneck, and exact unprofiled SQL-versus-IPC duration remains unmeasured.
+
+Raw compressed profiles, the streaming analysis script, and `profile-summary.json` remain in that capture directory outside Git. No profiling hooks were added to the benchmark or production implementation.
+
 ## Measurements on 4 October 2026
 
 Source revision: `1b1dac2`. Each command ran Doctrine first and the broker second, sequentially on the same host, with `XDEBUG_MODE=off`. Both owning connections confirmed the selected synchronous mode. These are single comparisons, not repeated estimates. Time-based windows were 60 seconds per backend. No failed comparison was retried.

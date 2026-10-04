@@ -7,6 +7,7 @@ namespace Ineersa\SqliteQueue\Tests\Broker;
 use Amp\DeferredCancellation;
 use Amp\TimeoutCancellation;
 use Ineersa\SqliteQueue\Protocol\Frame;
+use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Protocol\ProtocolException;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -45,6 +46,52 @@ final class FrameTest extends TestCase
     {
         $this->assertNull($this->exchange(''));
         $this->assertNull($this->exchange('', 4));
+    }
+
+    public static function initialPrefixLengths(): iterable
+    {
+        foreach (range(1, Limits::LENGTH_PREFIX_BYTES) as $length) {
+            yield [$length];
+        }
+    }
+
+    #[DataProvider('initialPrefixLengths')]
+    public function testReadAfterPrefixCompletesAllPrefixFragments(int $length): void
+    {
+        async(function () use ($length): void {
+            [$reader, $writer] = createSocketPair();
+            try {
+                $bytes = (new Frame(['v' => Frame::VERSION, 'id' => 1], 'payload', 'headers'))->encode();
+                $writer->write(substr($bytes, $length));
+                $frame = Frame::readAfterPrefix($reader, substr($bytes, 0, $length), new TimeoutCancellation(5));
+                $this->assertSame('payload', $frame->body);
+                $this->assertSame('headers', $frame->headers);
+                $this->assertSame(1, $frame->control['id']);
+            } finally {
+                $reader->close();
+                $writer->close();
+            }
+        })->await();
+    }
+
+    public static function invalidInitialPrefixes(): iterable
+    {
+        yield 'empty' => ['', 'Frame prefix must not be empty.'];
+        yield 'overlong' => [str_repeat("\0", Limits::LENGTH_PREFIX_BYTES + 1), 'Frame prefix exceeds the length-prefix size.'];
+    }
+
+    #[DataProvider('invalidInitialPrefixes')]
+    public function testReadAfterPrefixRejectsInvalidFragments(string $prefix, string $message): void
+    {
+        [$reader, $writer] = createSocketPair();
+        try {
+            $this->expectException(\InvalidArgumentException::class);
+            $this->expectExceptionMessage($message);
+            Frame::readAfterPrefix($reader, $prefix, new TimeoutCancellation(5));
+        } finally {
+            $reader->close();
+            $writer->close();
+        }
     }
 
     /** @return iterable<string, array{string}> */

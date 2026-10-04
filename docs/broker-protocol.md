@@ -8,7 +8,7 @@ Each frame is a four-byte unsigned big-endian length followed by a four-byte con
 
 Fixed v1 limits are 1,048,576 frame bytes, 8,192 control bytes, 1,040,000 combined body and header bytes, and 30,000 milliseconds for WAIT. Each buffered request or reply is limited to roughly 1 MiB. The broker accepts at most 64 connections, executes one request per connection at a time, and retains at most one pending response per connection. Amp handles partial reads and write backpressure. Oversized lengths are rejected before reading their content.
 
-Handshake reads have a five-second deadline. Subsequent non-WAIT frame reads have a thirty-second deadline, including idle time. Writes have a five-second deadline. A WAIT exchange remains open for the requested bound plus the client's transport allowance. The client still permits one outstanding call. Cancellation or timeout after starting an exchange invalidates the client. Large limits and indefinite idle connections are not negotiated in v1.
+Handshake reads have a five-second deadline. After the handshake, an established connection can remain idle until disconnect or broker shutdown. Its thirty-second frame deadline starts when the first prefix bytes arrive and covers the rest of that frame. Idle time between requests does not consume the deadline or invalidate receipt ownership. Writes have a five-second deadline. A WAIT exchange remains open for the requested bound plus the client's transport allowance. The client still permits one outstanding call. Cancellation or timeout after starting an exchange invalidates the client. Larger frame limits are not negotiated in v1.
 
 ## Exchanges
 

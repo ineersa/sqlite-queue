@@ -32,7 +32,7 @@ use function Amp\async;
 final class Broker
 {
     public const int MAX_CONNECTIONS = 64;
-    private const int IDLE_READ_TIMEOUT = 5;
+    private const int HANDSHAKE_TIMEOUT = 5;
     private const int OPERATION_TIMEOUT = 30;
     private const int WRITE_TIMEOUT = 5;
     private const int OWNER_ID_BYTES = 32;
@@ -295,7 +295,7 @@ final class Broker
         $expected = 0;
         try {
             while (!$this->stopping) {
-                $request = Frame::read($socket, new TimeoutCancellation(0 === $expected ? self::IDLE_READ_TIMEOUT : self::OPERATION_TIMEOUT));
+                $request = $this->readRequest($socket, $lifetime, $expected);
                 if (null === $request) {
                     return;
                 }
@@ -355,6 +355,22 @@ final class Broker
         } catch (\Throwable) {
             // A malformed or disconnected peer may be unable to receive its error.
         }
+    }
+
+    private function readRequest(Socket $socket, Cancellation $lifetime, int $expected): ?Frame
+    {
+        if (0 === $expected) {
+            return Frame::read($socket, new CompositeCancellation($lifetime, new TimeoutCancellation(self::HANDSHAKE_TIMEOUT)));
+        }
+
+        // An established session may be idle or executing a handler. Bound partial frames,
+        // not the time between requests: receipts must retain their original session owner.
+        $prefix = $socket->read($lifetime, Limits::LENGTH_PREFIX_BYTES);
+        if (null === $prefix) {
+            return null;
+        }
+
+        return Frame::readAfterPrefix($socket, $prefix, new CompositeCancellation($lifetime, new TimeoutCancellation(self::OPERATION_TIMEOUT)));
     }
 
     /** Validation runs before dispatch so every rejection reports its own error code. */

@@ -37,6 +37,8 @@ final class BrokerTest extends TestCase
 {
     /** Harness safety timeout, not a correctness threshold. */
     private const int SHUTDOWN_BOUND_SECONDS = 10;
+    private const int HANDSHAKE_READ_TIMEOUT_SECONDS = 5;
+    private const int FRAME_READ_TIMEOUT_SECONDS = 30;
     private ?IsolatedDatabase $database = null;
     private ?Broker $broker = null;
     /** @var Future<int>|null */
@@ -76,6 +78,61 @@ final class BrokerTest extends TestCase
         }
 
         parent::tearDown();
+    }
+
+    public function testIdleReceiptOwnerHasNoFrameDeadlineAndCanStillAcknowledge(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker(clock: fn (): int => $this->now);
+            $client = $this->connectClient();
+            $client->send('jobs', 'held during a handler');
+            $delivery = $client->receive('jobs');
+            $this->assertNotNull($delivery);
+            $this->turn();
+            $this->assertSame([], $this->readTimeoutTimers(self::FRAME_READ_TIMEOUT_SECONDS), 'An idle receipt owner must not have a frame deadline.');
+            $client->acknowledge($delivery->receipt);
+            $this->assertNull($client->receive('jobs'));
+            $client->send('jobs', 'same publisher session');
+        });
+    }
+
+    public static function incompleteRequests(): iterable
+    {
+        yield 'handshake has no first byte' => [false, 0, self::HANDSHAKE_READ_TIMEOUT_SECONDS];
+        yield 'first prefix byte starts deadline' => [true, 1, self::FRAME_READ_TIMEOUT_SECONDS];
+        yield 'full prefix without control starts deadline' => [true, Limits::LENGTH_PREFIX_BYTES, self::FRAME_READ_TIMEOUT_SECONDS];
+        yield 'payload remains bounded' => [true, -1, self::FRAME_READ_TIMEOUT_SECONDS];
+    }
+
+    #[DataProvider('incompleteRequests')]
+    public function testIncompleteRequestsRetainTheirReadDeadline(bool $established, int $bytes, int $seconds): void
+    {
+        $this->runAsync(function () use ($established, $bytes, $seconds): void {
+            $this->startBroker();
+            $peer = $this->rawPeer();
+            if ($established) {
+                Frame::write($peer, (new Frame(['v' => Frame::VERSION, 'id' => 0, 'op' => 'hello']))->encode(), new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS));
+                $this->assertNotNull(Frame::read($peer, new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS)));
+                $this->turn();
+                $this->assertSame([], $this->readTimeoutTimers(self::FRAME_READ_TIMEOUT_SECONDS));
+                $frame = (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'send', 'queue' => 'jobs'], 'payload'))->encode();
+                $peer->write(substr($frame, 0, $bytes));
+            }
+            $deadline = microtime(true) + self::SHUTDOWN_BOUND_SECONDS;
+            do {
+                $timers = $this->readTimeoutTimers($seconds);
+                if ([] !== $timers) {
+                    break;
+                }
+                $this->turn();
+            } while (microtime(true) < $deadline);
+            $this->assertCount(1, $timers);
+            $timer = array_key_first($timers);
+            EventLoop::disable($timer);
+            $this->fireNotifierTimer($timer);
+            $this->assertNull(Frame::read($peer, new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS)));
+            $this->connectClient()->send('jobs', 'unrelated client remains usable');
+        });
     }
 
     public function testConnectionLimitRejectsExtraClientAndKeepsAdmittedClientsWorking(): void
@@ -1098,7 +1155,33 @@ final class BrokerTest extends TestCase
         $this->fail('Waiter timeout timer was not armed.');
     }
 
+    /** @return array<string, TimerCallback> */
+    private function readTimeoutTimers(int $seconds): array
+    {
+        $result = [];
+        foreach ($this->loopCallbacks() as $id => $callback) {
+            if (!$callback instanceof TimerCallback || $callback->interval !== (float) $seconds || !EventLoop::isEnabled($id)) {
+                continue;
+            }
+            if ((new \ReflectionFunction($callback->closure))->getFileName() === (new \ReflectionClass(TimeoutCancellation::class))->getFileName()) {
+                $result[$id] = $callback;
+            }
+        }
+
+        return $result;
+    }
+
     private function fireNotifierTimer(string $timerId): void
+    {
+        $callback = $this->loopCallbacks()[$timerId] ?? null;
+        $this->assertInstanceOf(TimerCallback::class, $callback);
+        EventLoop::cancel($timerId);
+        ($callback->closure)($timerId);
+        $this->turn();
+    }
+
+    /** @return array<string, object> */
+    private function loopCallbacks(): array
     {
         $driver = EventLoop::getDriver();
         $callbacks = null;
@@ -1111,11 +1194,8 @@ final class BrokerTest extends TestCase
             $reflection = $reflection->getParentClass() ?: null;
         }
         $this->assertIsArray($callbacks);
-        $callback = $callbacks[$timerId] ?? null;
-        $this->assertInstanceOf(TimerCallback::class, $callback);
-        EventLoop::cancel($timerId);
-        ($callback->closure)($timerId);
-        $this->turn();
+
+        return $callbacks;
     }
 
     private function turn(): void
