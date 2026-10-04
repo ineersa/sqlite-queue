@@ -2,22 +2,32 @@
 
 The native benchmark measures configured Symfony buses and stock `messenger:consume`. The [method](benchmark-method.md) defines its workload, completion boundaries, and coverage limits. Observations from the earlier synthetic runner are not interchangeable repetitions of this experiment.
 
+## Idle fix and unprofiled rerun
+
+Revision `e3b371a` keeps established sessions idle until their next request. The five-second handshake bound remains; the thirty-second partial-frame bound starts at the first prefix bytes. Deterministic tests explicitly fire handshake and incomplete-frame deadlines and verify that an idle receipt owner can still ACK without reconnecting. Full QA passed with 460 tests and 3,554 assertions.
+
+The unprofiled NORMAL rerun retained the same three-publisher, two-consumer, 3,000-message cohort. Doctrine completed it in 1.062 seconds, or 2,825 messages/s. The broker took 3.839 seconds, or 781 messages/s. Both had clean integrity, complete accounting, and verified process cleanup. The throughput deficit remains. These single before-and-after comparisons do not isolate a performance effect of the idle fix.
+
+Both backends also passed the 60-second idle check and completed both isolated pickups. Doctrine recorded 56,731 empty receives and 5.01 consumer CPU core-seconds. The broker recorded 61 empty receives and 0.11 observed CPU core-seconds across consumer, broker, and SQLite worker. Send-call-to-delivery times for the two pickups ranged from 1.030 to 1.147 ms for Doctrine and 1.288 to 1.820 ms for the broker. Two arrivals cannot establish a tail-latency advantage. The earlier failed idle capture remains below and is not replaced.
+
+Rerun captures: concurrent `native-20261004-184418-bb24a5c7`, idle `native-20261004-184439-48ee784d`. Both use `XDEBUG_MODE=off` and verified owning NORMAL connections. No throughput optimization was implemented.
+
 ## Where concurrent NORMAL time goes
 
-The following public-operation timings come from the unprofiled `1b1dac2` NORMAL concurrent capture. Each distribution has 3,000 delivered-message samples. Empty receives are separate aggregates. The receive span measures active fetching of the returned message, not handler execution or idle WAIT.
+The following public-operation timings come from the unprofiled `e3b371a` NORMAL concurrent rerun. Each distribution has 3,000 delivered-message samples. Empty receives are separate aggregates. The receive span measures active fetching of the returned message, not handler execution or idle WAIT.
 
 | Operation | Doctrine mean, ms | Broker mean, ms | Doctrine p50, ms | Broker p50, ms | Doctrine p95, ms | Broker p95, ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Send | 0.354 | 1.345 | 0.050 | 1.025 | 0.136 | 2.054 |
-| Receive | 0.364 | 0.859 | 0.141 | 0.677 | 2.122 | 1.617 |
-| Handler | 0.007 | 0.008 | 0.006 | 0.007 | 0.010 | 0.012 |
-| ACK | 0.268 | 0.688 | 0.038 | 0.464 | 1.128 | 1.400 |
+| Send | 0.341 | 1.580 | 0.051 | 1.165 | 0.139 | 2.970 |
+| Receive | 0.426 | 1.014 | 0.145 | 0.699 | 2.974 | 2.196 |
+| Handler | 0.007 | 0.008 | 0.006 | 0.007 | 0.011 | 0.015 |
+| ACK | 0.199 | 0.781 | 0.039 | 0.477 | 0.122 | 1.708 |
 
-The handler is not responsible for the difference. Average send, receive, and ACK durations are all higher for the broker. Three publishers and two consumers overlap these spans, so summing their means is not an elapsed-time decomposition. Backlog residence is also separate: median send-call-to-delivery was 426 ms for Doctrine and 1,690 ms for the broker.
+The handler is not responsible for the difference. Average send, receive, and ACK durations are all higher for the broker. Three publishers and two consumers overlap these spans, so summing their means is not an elapsed-time decomposition. Backlog residence is also separate: the original capture's median send-call-to-delivery was 426 ms for Doctrine and 1,690 ms for the broker.
 
 ### CPU is concentrated in the broker and SQLite worker
 
-These CPU deltas bracket the same unprofiled measurement through its drain boundary. CPU core-seconds are accumulated processor time, not elapsed seconds.
+These CPU deltas bracket the original unprofiled `1b1dac2` measurement through its drain boundary. CPU core-seconds are accumulated processor time, not elapsed seconds.
 
 | Role | Doctrine CPU core-seconds | Broker CPU core-seconds |
 | --- | ---: | ---: |
@@ -31,7 +41,7 @@ Publishers exit before the final resource snapshot, so their CPU must not be tre
 
 ### Diagnostic profile identifies driver work amplification
 
-Capture `native-20261004-182616-0f3bbe28` ran the same 3,000-message NORMAL cohort with `XDEBUG_MODE=profile`. Both backends completed cleanly. Profiling increased cohort durations to 7.463 seconds for Doctrine and 28.449 seconds for the broker. These durations are diagnostic only and do not replace the unprofiled results.
+Capture `native-20261004-182616-0f3bbe28` at `07c2897` ran the same 3,000-message NORMAL cohort with `XDEBUG_MODE=profile`, before the idle fix. Both backends completed cleanly. Profiling increased cohort durations to 7.463 seconds for Doctrine and 28.449 seconds for the broker. These durations are diagnostic only and do not replace the unprofiled results.
 
 The worker profile includes startup, six warmup messages, the measured cohort, and shutdown. It records:
 
@@ -47,7 +57,7 @@ The worker profile includes startup, six warmup messages, the measured cohort, a
 
 The locked driver is `fabpot/amphp-sqlite3` v1.0.0, source `1ee168273e29af037a5c4576349ff89e3a53b5fd`. Its execution path probes `total_changes()`, prepares statements, uses `EXPLAIN` to inspect non-read-only statements, and queries and parses table definitions to detect insert identities. These are driver operations, not benchmark diagnostic SQL. The broker's successful message path also uses three transactions and five application statements: INSERT, SELECT, UPDATE, SELECT, and DELETE. Transaction statements and driver inspection add further work and IPC.
 
-This is roughly eleven worker execute dispatches and eighteen native prepare/execute calls per completed message, including small setup and warmup contributions. It gives a concrete optimization target: reduce worker round trips and repeated statement/metadata processing without removing correctness checks. The driver explicitly rejects row-producing DML, so blindly replacing claims with `UPDATE ... RETURNING` is not a compatible fix.
+This is roughly eleven worker execute dispatches, eighteen native prepares, and eighteen native executions per completed message, including small setup and warmup contributions. It gives a concrete optimization target: reduce worker round trips and repeated statement/metadata processing without removing correctness checks. The driver explicitly rejects row-producing DML, so blindly replacing claims with `UPDATE ... RETURNING` is not a compatible fix.
 
 Xdebug's fiber suspend/resume times overlap. Summed worker self time was 166.7 seconds against a 33.6-second process profile; the broker's summed self time was 460.9 seconds. Neither is a valid CPU total or percentage breakdown. Native SQL timings are whole-process diagnostic observations, not a subtraction from the 3.457-second unprofiled cohort. Serialization alone is not established as the bottleneck, and exact unprofiled SQL-versus-IPC duration remains unmeasured.
 
@@ -114,7 +124,7 @@ This short 2,000-message screen does not establish a leak or prove leak-free ope
 
 ### What to fix next
 
-Fix established-session idle handling first, without weakening partial-frame limits or replaying uncertain operations. Then use a small profile of the NORMAL concurrent workload to separate SQL, worker IPC, and broker scheduling costs. The current results support neither an overall broker speed win nor a memory-leak claim.
+The idle fix and diagnostic profile are recorded above. Next, reduce repeated driver statement/metadata work and worker round trips without weakening correctness checks, then rerun the same unprofiled cohort. The current results support neither an overall broker speed win nor a memory-leak claim.
 
 ### Capture identifiers
 
