@@ -9,6 +9,7 @@ use Ineersa\SqliteQueue\Broker\BrokerEventEnum;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
+use Ineersa\SqliteQueue\Sqlite\SqliteWorkerContextFactory;
 use Revolt\EventLoop;
 use Symfony\Component\Clock\Clock;
 use Symfony\Component\Clock\ClockInterface;
@@ -41,6 +42,7 @@ final class BrokerCommand extends BaseCommand
         private readonly int $redeliverTimeoutSeconds = self::DEFAULT_REDELIVER_TIMEOUT_SECONDS,
         private readonly ClockInterface $clock = new Clock(),
         private readonly SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal,
+        private readonly SqliteWorkerContextFactory $workers = new SqliteWorkerContextFactory(),
     ) {
         if ($redeliverTimeoutSeconds <= 0) {
             throw new \InvalidArgumentException('Redelivery timeout must be positive seconds.');
@@ -109,6 +111,7 @@ final class BrokerCommand extends BaseCommand
                 clock: fn (): int => $this->nowMilliseconds(),
                 cancellation: $shutdown->getCancellation(),
                 synchronous: $synchronous,
+                workers: $this->workers,
             ))->create();
             $code = $broker->run(function (array $event) use ($output): void {
                 $this->write($event, $output);

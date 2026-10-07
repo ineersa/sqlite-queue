@@ -13,8 +13,8 @@ use Ineersa\SqliteQueue\Broker\Broker;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
 use Ineersa\SqliteQueue\Broker\QueueNotifier;
 use Ineersa\SqliteQueue\Client;
-use Ineersa\SqliteQueue\Sqlite\SqliteWorkerContextFactory;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeProbeMessage;
+use Ineersa\SqliteQueue\Tests\Support\ControlledWorkerClock;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -31,6 +31,8 @@ use function Amp\ByteStream\buffer;
 #[RequiresOperatingSystem('Linux')]
 final class NativeConsoleProcessTest extends TestCase
 {
+    use ControlledWorkerClock;
+
     private const int SAFETY_SECONDS = 15;
     // Keep reservations live until explicit settlement, independent of subprocess scheduling.
     private const int BROKER_NOW_MILLISECONDS = 1_700_000_000_000;
@@ -262,38 +264,10 @@ final class NativeConsoleProcessTest extends TestCase
         $this->assertSame($expected, $exit, $diagnostics);
     }
 
-    private function workerFactory(string $databasePath, ?\Closure $clock = null): SqliteWorkerContextFactory
-    {
-        $now = null === $clock ? (int) floor(microtime(true) * 1000) : $clock();
-        $clockFile = $databasePath.'.clock';
-        file_put_contents($clockFile, (string) $now);
-
-        return new SqliteWorkerContextFactory([
-            \dirname(__DIR__).'/Sqlite/Fixtures/worker-controlled-clock.php',
-            (string) $now,
-            $clockFile,
-        ]);
-    }
-
-    private function syncedClock(?\Closure $clock, string $databasePath): ?\Closure
-    {
-        if (null === $clock) {
-            return null;
-        }
-        $clockFile = $databasePath.'.clock';
-
-        return static function () use ($clock, $clockFile): int {
-            $value = $clock();
-            file_put_contents($clockFile, (string) $value);
-
-            return $value;
-        };
-    }
-
     private function setNow(int $value): void
     {
         $this->now = $value;
-        file_put_contents($this->database().'.clock', (string) $value);
+        (new Filesystem())->dumpFile($this->database().'.clock', (string) $value);
     }
 
     private function startBroker(): void

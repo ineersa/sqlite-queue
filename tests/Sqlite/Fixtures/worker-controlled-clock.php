@@ -16,19 +16,26 @@ use Ineersa\SqliteQueue\Sqlite\SqliteWorkerRuntime;
  * advance child storage time without production IPC clock commands.
  */
 return static function (Channel $channel) use ($argv): void {
-    $now = isset($argv[1]) && is_numeric($argv[1]) ? (int) $argv[1] : 1_700_000_000_000;
-    $clockFile = isset($argv[2]) && is_string($argv[2]) && '' !== $argv[2] ? $argv[2] : null;
-    SqliteWorkerRuntime::run(
-        $channel,
-        static function () use (&$now, $clockFile): int {
-            if (null !== $clockFile && is_file($clockFile)) {
-                $raw = file_get_contents($clockFile);
-                if (false !== $raw && is_numeric(trim($raw))) {
-                    $now = (int) trim($raw);
-                }
+    $options = ['options' => ['min_range' => 0]];
+    $now = filter_var($argv[1] ?? null, \FILTER_VALIDATE_INT, $options);
+    if (false === $now) {
+        throw new InvalidArgumentException('Test worker requires initial wall-clock milliseconds.');
+    }
+    $clock = static fn (): int => $now;
+    if (isset($argv[2])) {
+        $clockFile = $argv[2];
+        $clock = static function () use ($clockFile, $options): int {
+            $raw = file_get_contents($clockFile);
+            if (false === $raw) {
+                throw new RuntimeException('Cannot read controlled worker clock.');
+            }
+            $now = filter_var(trim($raw), \FILTER_VALIDATE_INT, $options);
+            if (false === $now) {
+                throw new InvalidArgumentException('Controlled worker clock must contain nonnegative milliseconds.');
             }
 
             return $now;
-        },
-    );
+        };
+    }
+    SqliteWorkerRuntime::run($channel, $clock);
 };

@@ -30,7 +30,7 @@ use function Amp\async;
 
 final class Broker
 {
-    public const int MAX_CONNECTIONS = 64;
+    public const int MAX_CONNECTIONS = Limits::MAX_CONNECTIONS;
     private const int HANDSHAKE_TIMEOUT = 5;
     private const int OPERATION_TIMEOUT = 30;
     private const int WRITE_TIMEOUT = 5;

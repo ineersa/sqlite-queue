@@ -14,7 +14,7 @@ use Ineersa\SqliteQueue\Broker\QueueNotifierWaiter;
 use Ineersa\SqliteQueue\Broker\QueueNotifierWatch;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
-use Ineersa\SqliteQueue\Tests\Driver\DriverTestCase;
+use Ineersa\SqliteQueue\Tests\Support\ProcessTestCase;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use Revolt\EventLoop;
 use Revolt\EventLoop\Internal\TimerCallback;
@@ -27,7 +27,7 @@ use function Amp\async;
  * Delayed timer firing uses reflection against the live Revolt timer callback. That is test-only
  * and does not add production hooks.
  */
-final class QueueNotifierTest extends DriverTestCase
+final class QueueNotifierTest extends ProcessTestCase
 {
     /** @var list<SqliteQueueStorage> */
     private array $storages = [];

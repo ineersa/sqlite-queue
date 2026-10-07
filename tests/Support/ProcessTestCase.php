@@ -2,25 +2,17 @@
 
 declare(strict_types=1);
 
-namespace Ineersa\SqliteQueue\Tests\Driver;
+namespace Ineersa\SqliteQueue\Tests\Support;
 
-use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
-use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
 use PHPUnit\Framework\TestCase;
 
 use function Amp\async;
 
 /**
- * Base class for driver checks.
- *
- * Each test owns an isolated database directory, runs its async work on a fresh event
- * loop, and proves on teardown that no persistence worker process is left behind.
- *
- * The process proof reads /proc, so it exists only on Linux. On a platform without a
- * readable /proc the driver suite skips explicitly instead of reporting a pass that
- * never observed a process.
+ * Isolates database files and verifies owned worker cleanup on Linux.
+ * Tests requiring this process proof skip when /proc is unavailable.
  */
-abstract class DriverTestCase extends TestCase
+abstract class ProcessTestCase extends TestCase
 {
     protected ?IsolatedDatabase $database = null;
 
@@ -30,7 +22,7 @@ abstract class DriverTestCase extends TestCase
 
         if (!ProcessTree::available()) {
             $this->markTestSkipped(
-                'The driver suite proves process cleanup by reading /proc, which is unavailable here.',
+                'Process cleanup checks require readable /proc.',
             );
         }
 

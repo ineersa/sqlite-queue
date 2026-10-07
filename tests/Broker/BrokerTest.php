@@ -20,9 +20,9 @@ use Ineersa\SqliteQueue\Protocol\ErrorCode;
 use Ineersa\SqliteQueue\Protocol\Frame;
 use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Queue;
-use Ineersa\SqliteQueue\Sqlite\SqliteWorkerContextFactory;
 use Ineersa\SqliteQueue\Tests\Broker\Fixtures\GatingServerSocket;
 use Ineersa\SqliteQueue\Tests\Broker\Fixtures\WriteGate;
+use Ineersa\SqliteQueue\Tests\Support\ControlledWorkerClock;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -36,6 +36,8 @@ use function Amp\Socket\connect;
 
 final class BrokerTest extends TestCase
 {
+    use ControlledWorkerClock;
+
     /** Harness safety timeout, not a correctness threshold. */
     private const int SHUTDOWN_BOUND_SECONDS = 10;
     private const int HANDSHAKE_READ_TIMEOUT_SECONDS = 5;
@@ -1210,35 +1212,7 @@ final class BrokerTest extends TestCase
     {
         $this->now = $value;
         $database = $this->database ?? throw new \LogicException('Missing test database.');
-        file_put_contents($database->path().'.clock', (string) $value);
-    }
-
-    private function workerFactory(string $databasePath, ?\Closure $clock = null): SqliteWorkerContextFactory
-    {
-        $now = null === $clock ? (int) floor(microtime(true) * 1000) : $clock();
-        $clockFile = $databasePath.'.clock';
-        file_put_contents($clockFile, (string) $now);
-
-        return new SqliteWorkerContextFactory([
-            \dirname(__DIR__).'/Sqlite/Fixtures/worker-controlled-clock.php',
-            (string) $now,
-            $clockFile,
-        ]);
-    }
-
-    private function syncedClock(?\Closure $clock, string $databasePath): ?\Closure
-    {
-        if (null === $clock) {
-            return null;
-        }
-        $clockFile = $databasePath.'.clock';
-
-        return static function () use ($clock, $clockFile): int {
-            $value = $clock();
-            file_put_contents($clockFile, (string) $value);
-
-            return $value;
-        };
+        (new \Symfony\Component\Filesystem\Filesystem())->dumpFile($database->path().'.clock', (string) $value);
     }
 
     private function startBroker(int $visibilityTimeout = 5000, ?\Closure $clock = null): void

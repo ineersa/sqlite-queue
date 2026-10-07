@@ -49,7 +49,14 @@ final class BrokerVisibilityTest extends TestCase
         $clock = new MockClock('2026-10-03 00:00:00 UTC');
         $previousClock = Clock::get();
         Clock::set($clock);
-        $kernel = new NativeKernel($project);
+        $now = $clock->now()->getTimestamp() * 1000;
+        $clockFile = $fixture->directory().'/clock';
+        $filesystem->dumpFile($clockFile, (string) $now);
+        $kernel = new NativeKernel($project, workerScript: [
+            \dirname(__DIR__).'/Sqlite/Fixtures/worker-controlled-clock.php',
+            (string) $now,
+            $clockFile,
+        ]);
         $kernel->boot();
         $application = new Application($kernel);
         $application->setAutoExit(false);
@@ -83,14 +90,14 @@ final class BrokerVisibilityTest extends TestCase
                 $owner->send('jobs', 'handler-effect');
                 $delivery = $owner->receive('jobs');
                 $this->assertNotNull($delivery);
-                $leaseMs = $delivery->reservedUntil - $delivery->availableAt;
-                $this->assertGreaterThanOrEqual($lease, $leaseMs);
-                $this->assertLessThan($lease + 1_000, $leaseMs);
+                $this->assertSame($now, $delivery->availableAt);
+                $this->assertSame($now + $lease, $delivery->reservedUntil);
                 $handled = [];
                 $bus = new MessageBus([new HandleMessageMiddleware(new HandlersLocator([
-                    NativeProbeMessage::class => [function (NativeProbeMessage $message) use ($clock, $competitor, &$handled): void {
+                    NativeProbeMessage::class => [function (NativeProbeMessage $message) use ($clock, $clockFile, $filesystem, $competitor, &$handled): void {
                         // Simulate a handler taking longer than the original five-second lease.
                         $clock->modify('+6 seconds');
+                        $filesystem->dumpFile($clockFile, (string) ($clock->now()->getTimestamp() * 1000));
                         $this->assertNull($competitor->receive('jobs'));
                         $handled[] = $message;
                     }],

@@ -21,8 +21,6 @@ use Ineersa\SqliteQueue\ValueObject\QueueName;
  */
 final class SqliteWorkerRuntime
 {
-    private const int DIAGNOSTIC_LIMIT_BYTES = 1_024;
-
     /**
      * @param Channel<mixed, mixed> $channel
      * @param \Closure(): int       $clock   wall-clock milliseconds sampled inside Queue after transaction acquisition
@@ -32,7 +30,7 @@ final class SqliteWorkerRuntime
         try {
             [$queue, $storage] = self::bootstrap($channel, $clock);
         } catch (\Throwable $error) {
-            self::sendFailure($channel, 0, SqliteWorkerOperationEnum::Init, 'bootstrap', $error);
+            self::sendFailure($channel, 1, SqliteWorkerOperationEnum::Init, 'bootstrap', $error);
             throw $error;
         }
 
@@ -132,6 +130,8 @@ final class SqliteWorkerRuntime
             } catch (\Throwable $error) {
                 self::sendFailure($channel, $id, $operation, 'execute', $error);
                 throw $error;
+            } finally {
+                unset($request, $data, $result, $error);
             }
         }
     }
@@ -250,24 +250,19 @@ final class SqliteWorkerRuntime
     }
 
     /**
-     * @return array{category: string, code: string, message: string}
+     * @return array{code: string, message: string}
      */
     private static function domainError(\Throwable $error): array
     {
         if ($error instanceof InvalidReceiptException) {
             $code = ErrorCode::fromReceiptException($error)->value;
-        } elseif ($error instanceof \InvalidArgumentException
-            && str_starts_with($error->getMessage(), 'Queue names must contain')
-        ) {
-            $code = ErrorCode::InvalidQueueName->value;
         } else {
-            $code = 'invalid_argument';
+            $code = ErrorCode::InvalidRequest->value;
         }
 
         return [
-            'category' => SqliteWorkerErrorCategoryEnum::Domain->value,
             'code' => $code,
-            'message' => self::diagnostic($error->getMessage()),
+            'message' => SqliteWorkerDiagnostic::text($error->getMessage()),
         ];
     }
 
@@ -283,12 +278,11 @@ final class SqliteWorkerRuntime
     ): void {
         try {
             $payload = [
-                'category' => SqliteWorkerErrorCategoryEnum::Failure->value,
                 'phase' => $phase,
-                'message' => self::diagnostic($error->getMessage()),
+                'message' => SqliteWorkerDiagnostic::text($error->getMessage()),
             ];
             if ($error instanceof \PDOException && \is_string($error->errorInfo[0] ?? null)) {
-                $payload['sqlstate'] = self::diagnostic($error->errorInfo[0]);
+                $payload['sqlstate'] = SqliteWorkerDiagnostic::text($error->errorInfo[0]);
             }
             $channel->send([
                 'id' => $id,
@@ -392,17 +386,5 @@ final class SqliteWorkerRuntime
         }
 
         return $value;
-    }
-
-    private static function diagnostic(string $message): string
-    {
-        if (!mb_check_encoding($message, 'UTF-8')) {
-            return 'non-utf8 diagnostic';
-        }
-        if (\strlen($message) <= self::DIAGNOSTIC_LIMIT_BYTES) {
-            return $message;
-        }
-
-        return mb_strcut($message, 0, self::DIAGNOSTIC_LIMIT_BYTES, 'UTF-8');
     }
 }

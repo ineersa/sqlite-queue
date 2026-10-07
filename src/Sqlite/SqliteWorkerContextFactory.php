@@ -46,21 +46,19 @@ final class SqliteWorkerContextFactory
             throw new \InvalidArgumentException('Worker database path must be non-empty.');
         }
 
-        $handle = null;
-        try {
-            // Inherit the broker environment. A non-empty Amp environment array replaces it.
-            $context = (new ProcessContextFactory())->start($this->script, $budget);
-            $drainCancellation = new DeferredCancellation();
-            $drains = [];
-            foreach ([$context->getStdout(), $context->getStderr()] as $stream) {
-                $drains[] = async(static function () use ($stream, $drainCancellation): void {
-                    while (null !== $stream->read($drainCancellation->getCancellation())) {
-                    }
-                });
-            }
-            $handle = new SqliteWorkerHandle($context, $drains, $drainCancellation);
-            $this->created[] = $handle;
-
+        // Inherit the broker environment. A non-empty Amp environment array replaces it.
+        $context = (new ProcessContextFactory())->start($this->script, $budget);
+        $drainCancellation = new DeferredCancellation();
+        $drains = [];
+        foreach ([$context->getStdout(), $context->getStderr()] as $stream) {
+            $drains[] = async(static function () use ($stream, $drainCancellation): void {
+                while (null !== $stream->read($drainCancellation->getCancellation())) {
+                }
+            });
+        }
+        $handle = new SqliteWorkerHandle($context, $drains, $drainCancellation);
+        $this->created[] = $handle;
+        $exchange = async(static function () use ($context, $database, $visibilityTimeout, $synchronous): mixed {
             $context->send([
                 'id' => 1,
                 'op' => SqliteWorkerOperationEnum::Init->value,
@@ -70,30 +68,38 @@ final class SqliteWorkerContextFactory
                     'synchronous' => $synchronous->value,
                 ],
             ]);
-            $response = $context->receive($budget);
-            if (!\is_array($response)
-                || 1 !== ($response['id'] ?? null)
-                || SqliteWorkerOperationEnum::Init->value !== ($response['op'] ?? null)
-                || SqliteWorkerStatusEnum::Ok->value !== ($response['status'] ?? null)
-                || !\is_array($response['result'] ?? null)
-            ) {
-                throw new StorageFailureException('Worker initialization response is malformed.');
+
+            return $context->receive();
+        });
+        try {
+            $response = $exchange->await($budget);
+            if (!\is_array($response)) {
+                throw new StorageFailureException('Worker initialization response must be an array.');
+            }
+            if (1 !== ($response['id'] ?? null)) {
+                throw new StorageFailureException('Worker initialization response id must be 1.');
+            }
+            if (SqliteWorkerOperationEnum::Init->value !== ($response['op'] ?? null)) {
+                throw new StorageFailureException('Worker initialization response operation must be init.');
+            }
+            if (SqliteWorkerStatusEnum::Failure->value === ($response['status'] ?? null)) {
+                throw new StorageFailureException('Worker initialization failed: '.SqliteWorkerDiagnostic::failure($response['error'] ?? null));
+            }
+            if (SqliteWorkerStatusEnum::Ok->value !== ($response['status'] ?? null)) {
+                throw new StorageFailureException('Worker initialization response status must be ok or failure.');
+            }
+            if (!\is_array($response['result'] ?? null)) {
+                throw new StorageFailureException('Worker initialization configuration must be an array.');
             }
             /** @var array{journal_mode: string, synchronous: string, busy_timeout: int, wal_autocheckpoint: int, sqlite_version: string} $configuration */
             $configuration = $this->validatedConfiguration($response['result'], $synchronous);
 
             return new SqliteQueueWorker($handle, $synchronous, $configuration);
         } catch (\Throwable $error) {
-            if (null !== $handle) {
-                try {
-                    $handle->close(new TimeoutCancellation(self::FAILED_STARTUP_RELEASE_SECONDS));
-                } catch (\Throwable) {
-                }
-            } else {
-                try {
-                    $this->forceStopAll();
-                } catch (\Throwable) {
-                }
+            $exchange->ignore();
+            try {
+                $handle->close(new TimeoutCancellation(self::FAILED_STARTUP_RELEASE_SECONDS));
+            } catch (\Throwable) {
             }
             throw $error;
         }

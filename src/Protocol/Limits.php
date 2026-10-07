@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Protocol;
 
-/** Single source of truth for protocol v1 size bounds. */
+/** Shared resource bounds for protocol v1. */
 final class Limits
 {
+    /** Maximum simultaneous broker client sessions, including notification sockets. */
+    public const int MAX_CONNECTIONS = 64;
+
     /** Bytes of the outer big-endian length prefix. */
     public const int LENGTH_PREFIX_BYTES = 4;
 

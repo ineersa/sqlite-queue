@@ -89,7 +89,7 @@ final class MeasurementRepairTest extends TestCase
         $control = new Control($pair[0]);
         $bus = $this->createMock(MessageBusInterface::class);
         $bus->expects($this->once())->method('dispatch')->willThrowException(new \RuntimeException('controlled publish failure'));
-        $runner = new Runner(static function (string $line): void {}, new RunOptionsDTO(Scenario::Retention, true, 60, \Fabpot\Amp\Sqlite\SqliteSynchronousMode::Normal));
+        $runner = new Runner(static function (string $line): void {}, new RunOptionsDTO(Scenario::Retention, true, 60, \Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode::Normal));
         $bounds = ['phase' => Phase::Warmup, 'start' => 1, 'end' => 2];
         $snapshot = static function (Phase $phase, array $context): void {};
         $boundary = static fn (Phase $phase): int => match ($phase) {

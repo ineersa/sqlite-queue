@@ -18,12 +18,12 @@ use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
-use Ineersa\SqliteQueue\Tests\Driver\DriverTestCase;
+use Ineersa\SqliteQueue\Tests\Support\ProcessTestCase;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use Pdo\Sqlite;
 use PHPUnit\Framework\Attributes\DataProvider;
 
-final class QueueTest extends DriverTestCase
+final class QueueTest extends ProcessTestCase
 {
     private int $now = 1_700_000_000_000;
     /** @var list<SqliteQueueStorage> */
@@ -286,14 +286,23 @@ final class QueueTest extends DriverTestCase
 
     public function testCancelledContextDoesNotRevokeAnAlreadyStartedSettlement(): void
     {
-        $queue = $this->open();
+        $lifetime = $this->lifetime();
+        $settling = false;
+        $storage = $this->openStorage();
+        $this->storages[] = $storage;
+        $queue = new Queue($storage, clock: function () use (&$settling, $lifetime): int {
+            if ($settling) {
+                // This clock runs after transaction acquisition, before the fenced DELETE.
+                $lifetime->cancel();
+            }
+
+            return $this->now;
+        });
         $owner = $this->owner();
         $receipt = $this->prepareOperation($queue, $owner, 'acknowledge');
-        $lifetime = $this->lifetime();
-        // Admission cancellation is checked before storage begins. Once settle() is entered,
-        // a later cancellation must not roll the delete back.
+        $settling = true;
         $queue->acknowledge($receipt, $owner, $lifetime->getCancellation());
-        $lifetime->cancel();
+        $this->assertTrue($lifetime->getCancellation()->isRequested());
         $this->assertSame(0, $this->scalar('SELECT count(*) FROM queue_messages'));
     }
 

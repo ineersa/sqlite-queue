@@ -6,11 +6,11 @@ namespace Ineersa\SqliteQueue\Tests\Queue;
 
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
-use Ineersa\SqliteQueue\Tests\Driver\DriverTestCase;
+use Ineersa\SqliteQueue\Tests\Support\ProcessTestCase;
 use Pdo\Sqlite;
 use PHPUnit\Framework\Attributes\DataProvider;
 
-final class SynchronousModeTest extends DriverTestCase
+final class SynchronousModeTest extends ProcessTestCase
 {
     public static function allowedModes(): iterable
     {

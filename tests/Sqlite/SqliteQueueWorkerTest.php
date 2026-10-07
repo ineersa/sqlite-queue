@@ -5,9 +5,13 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Tests\Sqlite;
 
 use Amp\DeferredCancellation;
+use Amp\DeferredFuture;
+use Amp\Sync\LocalMutex;
 use Amp\TimeoutCancellation;
+use Ineersa\SqliteQueue\Broker\Broker;
 use Ineersa\SqliteQueue\Exception\ClientContextClosedException;
 use Ineersa\SqliteQueue\Exception\MalformedReceiptException;
+use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Sqlite\Exception\StorageCapacityException;
 use Ineersa\SqliteQueue\Sqlite\Exception\StorageFailureException;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueWorker;
@@ -17,6 +21,7 @@ use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use PHPUnit\Framework\TestCase;
+use Revolt\EventLoop;
 
 use function Amp\async;
 
@@ -95,6 +100,38 @@ final class SqliteQueueWorkerTest extends TestCase
         })->await(new TimeoutCancellation(20));
     }
 
+    public function testCancelledMutexWaiterRemainsAccountedUntilItLeavesTheLane(): void
+    {
+        async(function (): void {
+            $worker = $this->startWorker();
+            $mutex = (new \ReflectionProperty($worker, 'exchange'))->getValue($worker);
+            $this->assertInstanceOf(LocalMutex::class, $mutex);
+            $gate = $mutex->acquire();
+            $count = new \ReflectionProperty($worker, 'admittedOperations');
+            $lifetime = new DeferredCancellation();
+            $queue = new QueueName('jobs');
+            try {
+                $queued = async(static fn (): int => $worker->send($queue, 'must not dispatch', cancellation: $lifetime->getCancellation()));
+                while (0 === $count->getValue($worker)) {
+                    $barrier = new DeferredFuture();
+                    EventLoop::queue(static fn () => $barrier->complete());
+                    $barrier->getFuture()->await(new TimeoutCancellation(5));
+                }
+                $lifetime->cancel();
+                try {
+                    $queued->await(new TimeoutCancellation(5));
+                    $this->fail('Cancelled waiter must return without dispatching.');
+                } catch (ClientContextClosedException) {
+                }
+                $this->assertSame(1, $count->getValue($worker));
+            } finally {
+                $gate->release();
+            }
+            $this->assertNull($worker->receive($queue, 'owner-1'));
+            $this->assertSame(0, $count->getValue($worker));
+        })->await(new TimeoutCancellation(20));
+    }
+
     public function testMalformedWorkerReplyFailsLaneWithoutReplay(): void
     {
         async(function (): void {
@@ -139,9 +176,9 @@ final class SqliteQueueWorkerTest extends TestCase
     {
         async(function (): void {
             $worker = $this->startWorker();
-            $payload = str_repeat('p', 1_040_000);
+            $payload = str_repeat('p', Limits::MAX_PAYLOAD);
             $reserved = [];
-            for ($i = 0; $i < 64; ++$i) {
+            for ($i = 0; $i < Broker::MAX_CONNECTIONS; ++$i) {
                 $reserved[] = $this->forceReserve($worker, \strlen($payload));
             }
             try {

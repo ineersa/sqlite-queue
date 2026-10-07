@@ -21,7 +21,11 @@ use function Amp\async;
  */
 final class SqliteWorkerHandle
 {
-    /** @var Future<null>|null */
+    /**
+     * Absent until join is requested.
+     *
+     * @var Future<null>|null
+     */
     private ?Future $joined = null;
 
     /**
@@ -51,14 +55,15 @@ final class SqliteWorkerHandle
     /**
      * Join once and share that outcome.
      *
-     * Callers must not retry this method. Forced termination may throw ContextException
-     * because the worker cannot send its return-value message.
+     * Repeated calls never retry ProcessContext::join(). Null means no caller deadline.
+     * Forced termination may throw ContextException because there is no exit result.
      */
     public function join(?Cancellation $cancellation = null): void
     {
         $this->joined ??= async(function (): void {
             $this->context->join();
         });
+        $this->joined->ignore();
         $this->joined->await($cancellation ?? new NullCancellation());
     }
 

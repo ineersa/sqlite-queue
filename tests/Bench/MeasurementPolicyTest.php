@@ -68,7 +68,7 @@ final class MeasurementPolicyTest extends TestCase
     {
         $calls = [];
         $capture = '';
-        $runner = new Runner(static function (string $line) use (&$capture): void { $capture = json_decode($line, true, flags: \JSON_THROW_ON_ERROR)['capture']; }, new RunOptionsDTO(Scenario::Roundtrip, true, 1, \Fabpot\Amp\Sqlite\SqliteSynchronousMode::Normal), static function (string $root, string $directory, Backend $backend) use (&$calls): array {
+        $runner = new Runner(static function (string $line) use (&$capture): void { $capture = json_decode($line, true, flags: \JSON_THROW_ON_ERROR)['capture']; }, new RunOptionsDTO(Scenario::Roundtrip, true, 1, \Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode::Normal), static function (string $root, string $directory, Backend $backend) use (&$calls): array {
             $calls[] = $backend;
             file_put_contents($directory.'/endpoint-retained.sock', 'owned endpoint fixture');
             file_put_contents($directory.'/evidence.json', '{"survivor":true}');

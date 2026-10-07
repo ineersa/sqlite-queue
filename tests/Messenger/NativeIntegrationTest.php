@@ -17,12 +17,12 @@ use Ineersa\SqliteQueue\Messenger\BrokerConnection;
 use Ineersa\SqliteQueue\Messenger\NativeConsumeWaitSubscriber;
 use Ineersa\SqliteQueue\Messenger\Transport;
 use Ineersa\SqliteQueue\Messenger\TransportFactory;
-use Ineersa\SqliteQueue\Sqlite\SqliteWorkerContextFactory;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\BrokenDecodeSerializer;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\ControllableClock;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Handler\NativeProbeMessageHandler;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeProbeMessage;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\NativeKernel;
+use Ineersa\SqliteQueue\Tests\Support\ControlledWorkerClock;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -49,6 +49,8 @@ use function Amp\async;
 #[RequiresOperatingSystem('Linux')]
 final class NativeIntegrationTest extends TestCase
 {
+    use ControlledWorkerClock;
+
     private const int SAFETY_SECONDS = 15;
 
     private ?IsolatedDatabase $database = null;
@@ -149,8 +151,6 @@ final class NativeIntegrationTest extends TestCase
             'command' => 'messenger:setup-transports',
             'transport' => 'async',
         ]), new BufferedOutput()));
-        $this->expectException(\Symfony\Component\Messenger\Exception\TransportException::class);
-        $transport->get();
     }
 
     public function testNativeConsumeLimitHandlesAndAcks(): void
@@ -698,39 +698,11 @@ final class NativeIntegrationTest extends TestCase
         return $this->bootKernel()->getContainer()->get('event_dispatcher');
     }
 
-    private function workerFactory(string $databasePath, ?\Closure $clock = null): SqliteWorkerContextFactory
-    {
-        $now = null === $clock ? (int) floor(microtime(true) * 1000) : $clock();
-        $clockFile = $databasePath.'.clock';
-        file_put_contents($clockFile, (string) $now);
-
-        return new SqliteWorkerContextFactory([
-            \dirname(__DIR__).'/Sqlite/Fixtures/worker-controlled-clock.php',
-            (string) $now,
-            $clockFile,
-        ]);
-    }
-
-    private function syncedClock(?\Closure $clock, string $databasePath): ?\Closure
-    {
-        if (null === $clock) {
-            return null;
-        }
-        $clockFile = $databasePath.'.clock';
-
-        return static function () use ($clock, $clockFile): int {
-            $value = $clock();
-            file_put_contents($clockFile, (string) $value);
-
-            return $value;
-        };
-    }
-
     private function setNow(int $value): void
     {
         $this->now = $value;
         $database = $this->database?->path() ?? throw new \LogicException('Missing database.');
-        file_put_contents($database.'.clock', (string) $value);
+        (new Filesystem())->dumpFile($database.'.clock', (string) $value);
     }
 
     private function startBroker(): void

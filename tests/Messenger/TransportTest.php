@@ -18,7 +18,7 @@ use Ineersa\SqliteQueue\Messenger\Stamp\DeliveryReceiptStamp;
 use Ineersa\SqliteQueue\Messenger\Transport;
 use Ineersa\SqliteQueue\Protocol\Frame;
 use Ineersa\SqliteQueue\Protocol\Limits;
-use Ineersa\SqliteQueue\Sqlite\SqliteWorkerContextFactory;
+use Ineersa\SqliteQueue\Tests\Support\ControlledWorkerClock;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use PHPUnit\Framework\TestCase;
@@ -38,6 +38,8 @@ use function Amp\Socket\listen;
 
 final class TransportTest extends TestCase
 {
+    use ControlledWorkerClock;
+
     private const int PROBE_SAFETY_SECONDS = 5;
 
     private ?IsolatedDatabase $database = null;
@@ -620,39 +622,11 @@ final class TransportTest extends TestCase
         return $client;
     }
 
-    private function workerFactory(string $databasePath, ?\Closure $clock = null): SqliteWorkerContextFactory
-    {
-        $now = null === $clock ? (int) floor(microtime(true) * 1000) : $clock();
-        $clockFile = $databasePath.'.clock';
-        file_put_contents($clockFile, (string) $now);
-
-        return new SqliteWorkerContextFactory([
-            \dirname(__DIR__).'/Sqlite/Fixtures/worker-controlled-clock.php',
-            (string) $now,
-            $clockFile,
-        ]);
-    }
-
-    private function syncedClock(?\Closure $clock, string $databasePath): ?\Closure
-    {
-        if (null === $clock) {
-            return null;
-        }
-        $clockFile = $databasePath.'.clock';
-
-        return static function () use ($clock, $clockFile): int {
-            $value = $clock();
-            file_put_contents($clockFile, (string) $value);
-
-            return $value;
-        };
-    }
-
     private function setNow(int $value): void
     {
         $this->now = $value;
         $database = $this->database ?? throw new \LogicException('Missing test database.');
-        file_put_contents($database->path().'.clock', (string) $value);
+        (new \Symfony\Component\Filesystem\Filesystem())->dumpFile($database->path().'.clock', (string) $value);
     }
 
     private function startBroker(int $visibilityTimeout = 5_000): void

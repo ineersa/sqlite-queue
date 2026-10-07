@@ -7,8 +7,10 @@ namespace Ineersa\SqliteQueue\Sqlite;
 use Amp\Cancellation;
 use Amp\CancelledException;
 use Amp\DeferredFuture;
+use Amp\Future;
 use Amp\NullCancellation;
 use Amp\Sync\LocalMutex;
+use Amp\Sync\Lock;
 use Amp\TimeoutCancellation;
 use Amp\TimeoutException;
 use Ineersa\SqliteQueue\DTO\DeliveryDTO;
@@ -31,10 +33,9 @@ use function Amp\async;
 final class SqliteQueueWorker
 {
     private const int EXCHANGE_TIMEOUT_SECONDS = 10;
-    private const int MAX_PUBLIC_CONNECTIONS = 64;
-    private const int MAX_ADMITTED_OPERATIONS = 128;
-    private const int MAX_ADMITTED_PAYLOAD_BYTES = self::MAX_PUBLIC_CONNECTIONS * Limits::MAX_PAYLOAD;
-    private const int DIAGNOSTIC_LIMIT_BYTES = 1_024;
+    private const int MAX_ELIGIBILITY_PROBES = Limits::MAX_CONNECTIONS;
+    private const int MAX_ADMITTED_OPERATIONS = Limits::MAX_CONNECTIONS + self::MAX_ELIGIBILITY_PROBES;
+    private const int MAX_ADMITTED_PAYLOAD_BYTES = Limits::MAX_CONNECTIONS * Limits::MAX_PAYLOAD;
 
     private readonly LocalMutex $exchange;
     private int $nextRequestId = 2;
@@ -45,6 +46,12 @@ final class SqliteQueueWorker
     private bool $closed = false;
     /** @var DeferredFuture<null>|null */
     private ?DeferredFuture $capacityAvailable = null;
+    /**
+     * Absent until close is requested; repeated callers share one shutdown.
+     *
+     * @var Future<void>|null
+     */
+    private ?Future $shutdown = null;
 
     /**
      * @param array{journal_mode: string, synchronous: string, busy_timeout: int, wal_autocheckpoint: int, sqlite_version: string} $configuration
@@ -140,13 +147,13 @@ final class SqliteQueueWorker
         return $result;
     }
 
-    /** Wait until admission capacity is available or the token cancels. */
+    /** Wait until a zero-payload eligibility probe can be admitted or the token cancels. */
     public function awaitCapacity(Cancellation $cancellation): void
     {
         if ($this->closed || $this->failed) {
             throw new StorageFailureException('Queue storage is closed.');
         }
-        if ($this->hasCapacity()) {
+        if ($this->hasProbeCapacity()) {
             return;
         }
         $this->capacityAvailable ??= new DeferredFuture();
@@ -161,10 +168,16 @@ final class SqliteQueueWorker
 
     public function close(Cancellation $budget): void
     {
-        if ($this->closed) {
-            return;
-        }
         $this->beginClose();
+        $this->shutdown ??= async(function () use ($budget): void {
+            $this->shutdownWorker($budget);
+        });
+        $this->shutdown->ignore();
+        $this->shutdown->await($budget);
+    }
+
+    private function shutdownWorker(Cancellation $budget): void
+    {
         try {
             if (!$this->failed) {
                 try {
@@ -220,7 +233,11 @@ final class SqliteQueueWorker
     ): mixed {
         $this->assertOpen($allowWhileClosing);
         $this->assertActive($cancellation);
-        $this->reserveAdmission($payloadBytes);
+        // One shared close exchange waits for the lane even when normal admission is full.
+        $admitted = !$allowWhileClosing;
+        if ($admitted) {
+            $this->reserveAdmission($payloadBytes);
+        }
         $lock = null;
         $dispatched = false;
         try {
@@ -228,8 +245,14 @@ final class SqliteQueueWorker
             try {
                 $lock = $acquire->await($cancellation);
             } catch (CancelledException $error) {
-                // A cancelled waiter must still release any lock acquired after abandonment.
-                $acquire->map(static fn ($lock) => $lock->release())->ignore();
+                // Keep an abandoned mutex waiter accounted for until it actually leaves the lane.
+                $acquire->map(function (Lock $lock) use ($payloadBytes, $admitted): void {
+                    $lock->release();
+                    if ($admitted) {
+                        $this->releaseAdmission($payloadBytes);
+                    }
+                })->ignore();
+                $admitted = false;
                 if ($allowWhileClosing) {
                     throw $this->failLane('Shutdown budget expired while waiting for the storage lane.', $error);
                 }
@@ -237,9 +260,6 @@ final class SqliteQueueWorker
             }
             $this->assertOpen($allowWhileClosing);
             $this->assertActive($cancellation);
-            if ($this->failed) {
-                throw new StorageFailureException('Queue storage lane has failed.');
-            }
             $id = $this->nextRequestId++;
             $context = $this->handle->context();
             $deadline = $allowWhileClosing ? $cancellation : new TimeoutCancellation(self::EXCHANGE_TIMEOUT_SECONDS);
@@ -280,7 +300,9 @@ final class SqliteQueueWorker
             throw $error;
         } finally {
             $lock?->release();
-            $this->releaseAdmission($payloadBytes);
+            if ($admitted) {
+                $this->releaseAdmission($payloadBytes);
+            }
         }
     }
 
@@ -311,7 +333,7 @@ final class SqliteQueueWorker
             throw $this->domainException($response['error'] ?? null);
         }
         if (SqliteWorkerStatusEnum::Failure === $status) {
-            throw $this->failLane($this->failureMessage($response['error'] ?? null));
+            throw $this->failLane(SqliteWorkerDiagnostic::failure($response['error'] ?? null));
         }
         if (!\array_key_exists('result', $response)) {
             throw $this->failLane('Worker success response is missing its result.');
@@ -385,15 +407,14 @@ final class SqliteQueueWorker
         }
         --$this->admittedOperations;
         $this->admittedPayloadBytes -= $payloadBytes;
-        if ($this->hasCapacity()) {
+        if ($this->hasProbeCapacity()) {
             $this->signalCapacity(null);
         }
     }
 
-    private function hasCapacity(): bool
+    private function hasProbeCapacity(): bool
     {
-        return $this->admittedOperations < self::MAX_ADMITTED_OPERATIONS
-            && $this->admittedPayloadBytes < self::MAX_ADMITTED_PAYLOAD_BYTES;
+        return $this->admittedOperations < self::MAX_ADMITTED_OPERATIONS;
     }
 
     private function signalCapacity(?\Throwable $error): void
@@ -502,35 +523,13 @@ final class SqliteQueueWorker
         if (null !== $exception) {
             return $exception;
         }
-        if (ErrorCode::InvalidQueueName === $code) {
-            return new \InvalidArgumentException('Broker rejected the queue name.');
-        }
-        if ('invalid_argument' === $error['code']) {
-            $message = \is_string($error['message'] ?? null) ? $this->diagnostic($error['message']) : '';
+        if (ErrorCode::InvalidRequest === $code) {
+            $message = \is_string($error['message'] ?? null) ? SqliteWorkerDiagnostic::text($error['message']) : '';
 
             return new \InvalidArgumentException('' !== $message ? $message : 'Invalid queue argument.');
         }
 
         throw $this->failLane('Worker reported an unsupported domain failure.');
-    }
-
-    private function failureMessage(mixed $error): string
-    {
-        if (!\is_array($error)) {
-            return 'Worker reported a storage failure.';
-        }
-        $parts = [];
-        if (\is_string($error['phase'] ?? null) && '' !== $error['phase']) {
-            $parts[] = 'phase='.$this->diagnostic($error['phase']);
-        }
-        if (\is_string($error['sqlstate'] ?? null) && '' !== $error['sqlstate']) {
-            $parts[] = 'sqlstate='.$this->diagnostic($error['sqlstate']);
-        }
-        if (\is_string($error['message'] ?? null) && '' !== $error['message']) {
-            $parts[] = $this->diagnostic($error['message']);
-        }
-
-        return [] === $parts ? 'Worker reported a storage failure.' : implode('; ', $parts);
     }
 
     private function failLane(string $message, ?\Throwable $previous = null): StorageFailureException
@@ -543,18 +542,6 @@ final class SqliteQueueWorker
         }
         $this->signalCapacity(new StorageFailureException('Queue storage lane has failed.'));
 
-        return new StorageFailureException($this->diagnostic($message), previous: $previous);
-    }
-
-    private function diagnostic(string $message): string
-    {
-        if (!mb_check_encoding($message, 'UTF-8')) {
-            return 'non-utf8 diagnostic';
-        }
-        if (\strlen($message) <= self::DIAGNOSTIC_LIMIT_BYTES) {
-            return $message;
-        }
-
-        return mb_strcut($message, 0, self::DIAGNOSTIC_LIMIT_BYTES, 'UTF-8');
+        return new StorageFailureException(SqliteWorkerDiagnostic::text($message), previous: $previous);
     }
 }
