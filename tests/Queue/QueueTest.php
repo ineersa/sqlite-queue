@@ -14,6 +14,7 @@ use Ineersa\SqliteQueue\Exception\NoActiveReservationException;
 use Ineersa\SqliteQueue\Exception\ReceiptEpochMismatchException;
 use Ineersa\SqliteQueue\Exception\ReceiptOwnerMismatchException;
 use Ineersa\SqliteQueue\Exception\ReceiptTokenMismatchException;
+use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
@@ -452,6 +453,44 @@ final class QueueTest extends DriverTestCase
         $this->assertSame($observed + 50, $this->scalar('SELECT reserved_until FROM queue_messages'));
     }
 
+    public function testClaimRejectsOversizedStoredPayloadBeforeCommit(): void
+    {
+        $storage = $this->openStorage();
+        $this->storages[] = $storage;
+        $storage->insert('jobs', 'ok', '', fn (): int => $this->now);
+        $oversized = str_repeat('x', Limits::MAX_PAYLOAD + 1);
+        $this->bindExec('UPDATE queue_messages SET body = ?', $oversized);
+        try {
+            $storage->claim(
+                'jobs',
+                $this->owner(),
+                str_repeat('a', 64),
+                str_repeat('b', 64),
+                fn (): int => $this->now,
+                static fn (int $now): int => $now + 50,
+            );
+            $this->fail('Oversized stored payload must fail before commit.');
+        } catch (\RuntimeException $error) {
+            $this->assertSame('Stored message payload exceeds the supported size.', $error->getMessage());
+        }
+        $this->assertNull($this->scalar('SELECT reservation_token FROM queue_messages'));
+        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
+    }
+
+    public function testCloseClearsStatementAndConnectionOwnership(): void
+    {
+        $storage = $this->openStorage();
+        $this->storages[] = $storage;
+        $storage->insert('jobs', str_repeat('p', 1024), str_repeat('h', 128), fn (): int => $this->now);
+        $storage->close();
+        $connection = (new \ReflectionProperty($storage, 'connection'))->getValue($storage);
+        $statements = (new \ReflectionProperty($storage, 'statements'))->getValue($storage);
+        $this->assertNull($connection);
+        $this->assertNull($statements);
+        $this->expectException(\RuntimeException::class);
+        $storage->earliestEligibility('jobs');
+    }
+
     public function testSettlementCrossingExpiryUsesTransactionClock(): void
     {
         $queue = $this->open(50);
@@ -562,6 +601,22 @@ final class QueueTest extends DriverTestCase
         $database->enableExceptions(true);
         try {
             $database->exec($sql);
+        } finally {
+            $database->close();
+        }
+    }
+
+    private function bindExec(string $sql, string $blob): void
+    {
+        $database = new \SQLite3($this->database->path());
+        $database->enableExceptions(true);
+        try {
+            $statement = $database->prepare($sql);
+            if (false === $statement) {
+                throw new \RuntimeException('Failed to prepare test SQL.');
+            }
+            $statement->bindValue(1, $blob, \SQLITE3_BLOB);
+            $statement->execute();
         } finally {
             $database->close();
         }

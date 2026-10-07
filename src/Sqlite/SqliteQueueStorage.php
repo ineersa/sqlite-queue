@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Sqlite;
 
+use Ineersa\SqliteQueue\Protocol\Limits;
 use Pdo\Sqlite;
 
 /**
@@ -18,6 +19,13 @@ final class SqliteQueueStorage
     private const int BUSY_TIMEOUT_MILLISECONDS = 5_000;
     private const int WAL_AUTOCHECKPOINT_PAGES = 1_000;
     private const string SQLITE_MINIMUM_VERSION = '3.31.0';
+    private const string STATEMENT_INSERT = 'insert';
+    private const string STATEMENT_ELIGIBLE_ID = 'eligible_id';
+    private const string STATEMENT_RESERVE = 'reserve';
+    private const string STATEMENT_PAYLOAD = 'payload';
+    private const string STATEMENT_DELETE = 'delete';
+    private const string STATEMENT_DIAGNOSE = 'diagnose';
+    private const string STATEMENT_EARLIEST = 'earliest_eligibility';
     private const string SCHEMA_SQL = <<<'SQL'
         CREATE TABLE IF NOT EXISTS queue_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,18 +50,18 @@ final class SqliteQueueStorage
         SQL;
 
     private bool $closed = false;
-    /**
-     * Null after close or failed startup so PDO and statement resources are released.
-     * Closed storage must not keep a usable connection handle.
+    private ?Sqlite $connection = null;
+    /** @var array{
+     *     insert: \PDOStatement,
+     *     eligible_id: \PDOStatement,
+     *     reserve: \PDOStatement,
+     *     payload: \PDOStatement,
+     *     delete: \PDOStatement,
+     *     diagnose: \PDOStatement,
+     *     earliest_eligibility: \PDOStatement
+     * }|null
      */
-    private ?Sqlite $connection;
-    private readonly \PDOStatement $insertStatement;
-    private readonly \PDOStatement $eligibleIdStatement;
-    private readonly \PDOStatement $reserveStatement;
-    private readonly \PDOStatement $payloadStatement;
-    private readonly \PDOStatement $deleteStatement;
-    private readonly \PDOStatement $diagnoseStatement;
-    private readonly \PDOStatement $earliestEligibilityStatement;
+    private ?array $statements = null;
 
     /**
      * Takes exclusive ownership of the connection, including on initialization failure.
@@ -62,43 +70,49 @@ final class SqliteQueueStorage
         Sqlite $connection,
         private readonly SqliteSynchronousMode $synchronous,
     ) {
-        $this->connection = $connection;
+        $statements = null;
         try {
-            $this->configure($connection, $synchronous);
+            self::configure($connection, $synchronous);
             $connection->exec(self::SCHEMA_SQL);
-            $this->insertStatement = $connection->prepare(
-                'INSERT INTO queue_messages (queue, body, headers, available_at) VALUES (?, ?, ?, ?)',
-            );
-            $this->eligibleIdStatement = $connection->prepare(
-                'SELECT id FROM queue_messages WHERE queue = ? AND available_at <= ?
-                 AND (reserved_until IS NULL OR reserved_until <= ?) ORDER BY id LIMIT 1',
-            );
-            $this->reserveStatement = $connection->prepare(
-                'UPDATE queue_messages SET reserved_until = ?, reservation_token = ?, owner_id = ?, broker_epoch = ?
-                 WHERE id = ? AND queue = ? AND available_at <= ? AND (reserved_until IS NULL OR reserved_until <= ?)',
-            );
-            $this->payloadStatement = $connection->prepare(
-                'SELECT body, headers, available_at FROM queue_messages WHERE id = ?',
-            );
-            $this->deleteStatement = $connection->prepare(
-                'DELETE FROM queue_messages WHERE id = ? AND reservation_token = ? AND owner_id = ? AND broker_epoch = ? AND reserved_until > ?',
-            );
-            $this->diagnoseStatement = $connection->prepare(
-                'SELECT owner_id, typeof(owner_id) AS owner_id_type,
-                        broker_epoch, typeof(broker_epoch) AS broker_epoch_type,
-                        reservation_token, typeof(reservation_token) AS reservation_token_type,
-                        reserved_until, typeof(reserved_until) AS reserved_until_type
-                 FROM queue_messages WHERE id = ?',
-            );
-            $this->earliestEligibilityStatement = $connection->prepare(
-                'SELECT max(available_at, coalesce(reserved_until, available_at)) AS ready_at
-                 FROM queue_messages WHERE queue = ?
-                 ORDER BY ready_at LIMIT 1',
-            );
+            $statements = [
+                self::STATEMENT_INSERT => $connection->prepare(
+                    'INSERT INTO queue_messages (queue, body, headers, available_at) VALUES (?, ?, ?, ?)',
+                ),
+                self::STATEMENT_ELIGIBLE_ID => $connection->prepare(
+                    'SELECT id FROM queue_messages WHERE queue = ? AND available_at <= ?
+                     AND (reserved_until IS NULL OR reserved_until <= ?) ORDER BY id LIMIT 1',
+                ),
+                self::STATEMENT_RESERVE => $connection->prepare(
+                    'UPDATE queue_messages SET reserved_until = ?, reservation_token = ?, owner_id = ?, broker_epoch = ?
+                     WHERE id = ? AND queue = ? AND available_at <= ? AND (reserved_until IS NULL OR reserved_until <= ?)',
+                ),
+                self::STATEMENT_PAYLOAD => $connection->prepare(
+                    'SELECT body, headers, available_at FROM queue_messages WHERE id = ?',
+                ),
+                self::STATEMENT_DELETE => $connection->prepare(
+                    'DELETE FROM queue_messages WHERE id = ? AND reservation_token = ? AND owner_id = ? AND broker_epoch = ? AND reserved_until > ?',
+                ),
+                self::STATEMENT_DIAGNOSE => $connection->prepare(
+                    'SELECT owner_id, typeof(owner_id) AS owner_id_type,
+                            broker_epoch, typeof(broker_epoch) AS broker_epoch_type,
+                            reservation_token, typeof(reservation_token) AS reservation_token_type,
+                            reserved_until, typeof(reserved_until) AS reserved_until_type
+                     FROM queue_messages WHERE id = ?',
+                ),
+                self::STATEMENT_EARLIEST => $connection->prepare(
+                    'SELECT max(available_at, coalesce(reserved_until, available_at)) AS ready_at
+                     FROM queue_messages WHERE queue = ?
+                     ORDER BY ready_at LIMIT 1',
+                ),
+            ];
         } catch (\Throwable $error) {
-            $this->releaseConnection();
+            self::discardStatements($statements);
+            unset($connection, $statements);
             throw $error;
         }
+
+        $this->connection = $connection;
+        $this->statements = $statements;
     }
 
     private function __clone(): void
@@ -121,14 +135,19 @@ final class SqliteQueueStorage
             throw new \RuntimeException('Failed to open queue database.', previous: $error);
         }
 
-        return new self($connection, $synchronous);
+        try {
+            return new self($connection, $synchronous);
+        } catch (\Throwable $error) {
+            unset($connection);
+            throw $error;
+        }
     }
 
     /** Read the owning connection before serving, never an observer connection. */
     public function synchronousMode(): SqliteSynchronousMode
     {
         $connection = $this->requireConnection();
-        $effective = $this->readSynchronousMode($connection);
+        $effective = self::readSynchronousMode($connection);
         if ($effective !== $this->synchronous) {
             throw new \RuntimeException('Effective synchronous mode does not match the configured mode.');
         }
@@ -161,12 +180,6 @@ final class SqliteQueueStorage
         ];
     }
 
-    public static function validateSynchronousMode(SqliteSynchronousMode $synchronous): void
-    {
-        // Enum already bounds the accepted set; keep the call site explicit for CLI/bundle wiring.
-        unset($synchronous);
-    }
-
     /**
      * Insert one message after sampling availability inside the write transaction.
      *
@@ -174,20 +187,24 @@ final class SqliteQueueStorage
      */
     public function insert(string $queue, string $body, string $headers, \Closure $availableAt): int
     {
-        $this->requireConnection();
+        $connection = $this->requireConnection();
+        $statement = $this->statement(self::STATEMENT_INSERT);
 
-        return $this->transaction(function () use ($queue, $body, $headers, $availableAt): int {
+        return $this->transaction(static function () use ($connection, $statement, $queue, $body, $headers, $availableAt): int {
             $deadline = $availableAt();
             if ($deadline < 0) {
                 throw new \InvalidArgumentException('Availability deadline must be nonnegative.');
             }
-            $this->insertStatement->bindValue(1, $queue, \PDO::PARAM_STR);
-            $this->insertStatement->bindValue(2, $body, \PDO::PARAM_LOB);
-            $this->insertStatement->bindValue(3, $headers, \PDO::PARAM_LOB);
-            $this->insertStatement->bindValue(4, $deadline, \PDO::PARAM_INT);
-            $this->insertStatement->execute();
-            $this->insertStatement->closeCursor();
-            $rawId = $this->requireConnection()->lastInsertId();
+            try {
+                $statement->bindValue(1, $queue, \PDO::PARAM_STR);
+                $statement->bindValue(2, $body, \PDO::PARAM_LOB);
+                $statement->bindValue(3, $headers, \PDO::PARAM_LOB);
+                $statement->bindValue(4, $deadline, \PDO::PARAM_INT);
+                $statement->execute();
+            } finally {
+                self::releaseStatement($statement, clearBoundLobs: true);
+            }
+            $rawId = $connection->lastInsertId();
             if (!is_numeric($rawId)) {
                 throw new \RuntimeException('Insert did not return a message identity.');
             }
@@ -210,17 +227,22 @@ final class SqliteQueueStorage
      */
     public function claim(string $queue, string $ownerId, string $epoch, string $token, \Closure $clock, \Closure $reservationDeadline): ?array
     {
-        $this->requireConnection();
+        $eligible = $this->statement(self::STATEMENT_ELIGIBLE_ID);
+        $reserve = $this->statement(self::STATEMENT_RESERVE);
+        $payloadStatement = $this->statement(self::STATEMENT_PAYLOAD);
 
-        return $this->transaction(function () use ($queue, $ownerId, $epoch, $token, $clock, $reservationDeadline): ?array {
+        return $this->transaction(static function () use ($queue, $ownerId, $epoch, $token, $clock, $reservationDeadline, $eligible, $reserve, $payloadStatement): ?array {
             $now = $clock();
             $expires = $reservationDeadline($now);
-            $this->eligibleIdStatement->bindValue(1, $queue, \PDO::PARAM_STR);
-            $this->eligibleIdStatement->bindValue(2, $now, \PDO::PARAM_INT);
-            $this->eligibleIdStatement->bindValue(3, $now, \PDO::PARAM_INT);
-            $this->eligibleIdStatement->execute();
-            $row = $this->eligibleIdStatement->fetch(\PDO::FETCH_ASSOC);
-            $this->eligibleIdStatement->closeCursor();
+            try {
+                $eligible->bindValue(1, $queue, \PDO::PARAM_STR);
+                $eligible->bindValue(2, $now, \PDO::PARAM_INT);
+                $eligible->bindValue(3, $now, \PDO::PARAM_INT);
+                $eligible->execute();
+                $row = $eligible->fetch(\PDO::FETCH_ASSOC);
+            } finally {
+                self::releaseStatement($eligible);
+            }
             if (false === $row) {
                 return null;
             }
@@ -228,41 +250,52 @@ final class SqliteQueueStorage
                 throw new \RuntimeException('Stored message identity must be an integer.');
             }
             $id = (int) $row['id'];
-            $this->reserveStatement->bindValue(1, $expires, \PDO::PARAM_INT);
-            $this->reserveStatement->bindValue(2, $token, \PDO::PARAM_STR);
-            $this->reserveStatement->bindValue(3, $ownerId, \PDO::PARAM_STR);
-            $this->reserveStatement->bindValue(4, $epoch, \PDO::PARAM_STR);
-            $this->reserveStatement->bindValue(5, $id, \PDO::PARAM_INT);
-            $this->reserveStatement->bindValue(6, $queue, \PDO::PARAM_STR);
-            $this->reserveStatement->bindValue(7, $now, \PDO::PARAM_INT);
-            $this->reserveStatement->bindValue(8, $now, \PDO::PARAM_INT);
-            $this->reserveStatement->execute();
-            $changed = $this->reserveStatement->rowCount();
-            $this->reserveStatement->closeCursor();
+            try {
+                $reserve->bindValue(1, $expires, \PDO::PARAM_INT);
+                $reserve->bindValue(2, $token, \PDO::PARAM_STR);
+                $reserve->bindValue(3, $ownerId, \PDO::PARAM_STR);
+                $reserve->bindValue(4, $epoch, \PDO::PARAM_STR);
+                $reserve->bindValue(5, $id, \PDO::PARAM_INT);
+                $reserve->bindValue(6, $queue, \PDO::PARAM_STR);
+                $reserve->bindValue(7, $now, \PDO::PARAM_INT);
+                $reserve->bindValue(8, $now, \PDO::PARAM_INT);
+                $reserve->execute();
+                $changed = $reserve->rowCount();
+            } finally {
+                self::releaseStatement($reserve);
+            }
             if (0 === $changed) {
                 return null;
             }
             if (1 !== $changed) {
                 throw new \RuntimeException('Reservation UPDATE did not affect exactly one row.');
             }
-            $this->payloadStatement->bindValue(1, $id, \PDO::PARAM_INT);
-            $this->payloadStatement->execute();
-            $payload = $this->payloadStatement->fetch(\PDO::FETCH_ASSOC);
-            $this->payloadStatement->closeCursor();
+            try {
+                $payloadStatement->bindValue(1, $id, \PDO::PARAM_INT);
+                $payloadStatement->execute();
+                $payload = $payloadStatement->fetch(\PDO::FETCH_ASSOC);
+            } finally {
+                self::releaseStatement($payloadStatement);
+            }
             if (false === $payload) {
                 throw new \RuntimeException('Stored message is missing or has invalid payload types.');
             }
-            $body = $this->payloadBytes($payload['body'] ?? null, 'body');
-            $headers = $this->payloadBytes($payload['headers'] ?? null, 'headers');
+            $body = self::payloadBytes($payload['body'] ?? null, 'body');
+            $headers = self::payloadBytes($payload['headers'] ?? null, 'headers');
+            self::assertBoundedPayload($body, $headers);
             if (!is_numeric($payload['available_at'] ?? null)) {
                 throw new \RuntimeException('Stored availability deadline must be an integer.');
+            }
+            $availableAt = (int) $payload['available_at'];
+            if ($availableAt < 0) {
+                throw new \RuntimeException('Stored availability deadline must be nonnegative.');
             }
 
             return [
                 'id' => $id,
                 'body' => $body,
                 'headers' => $headers,
-                'available_at' => (int) $payload['available_at'],
+                'available_at' => $availableAt,
                 'reserved_until' => $expires,
             ];
         }, rollbackEmpty: true);
@@ -278,18 +311,21 @@ final class SqliteQueueStorage
      */
     public function settle(int $id, string $token, string $ownerId, string $epoch, \Closure $clock): SettlementResultEnum
     {
-        $this->requireConnection();
+        $delete = $this->statement(self::STATEMENT_DELETE);
 
-        return $this->transaction(function () use ($id, $token, $ownerId, $epoch, $clock): SettlementResultEnum {
+        return $this->transaction(function () use ($id, $token, $ownerId, $epoch, $clock, $delete): SettlementResultEnum {
             $now = $clock();
-            $this->deleteStatement->bindValue(1, $id, \PDO::PARAM_INT);
-            $this->deleteStatement->bindValue(2, $token, \PDO::PARAM_STR);
-            $this->deleteStatement->bindValue(3, $ownerId, \PDO::PARAM_STR);
-            $this->deleteStatement->bindValue(4, $epoch, \PDO::PARAM_STR);
-            $this->deleteStatement->bindValue(5, $now, \PDO::PARAM_INT);
-            $this->deleteStatement->execute();
-            $changed = $this->deleteStatement->rowCount();
-            $this->deleteStatement->closeCursor();
+            try {
+                $delete->bindValue(1, $id, \PDO::PARAM_INT);
+                $delete->bindValue(2, $token, \PDO::PARAM_STR);
+                $delete->bindValue(3, $ownerId, \PDO::PARAM_STR);
+                $delete->bindValue(4, $epoch, \PDO::PARAM_STR);
+                $delete->bindValue(5, $now, \PDO::PARAM_INT);
+                $delete->execute();
+                $changed = $delete->rowCount();
+            } finally {
+                self::releaseStatement($delete);
+            }
             if (0 === $changed) {
                 return $this->settlementFailure($id, $token, $ownerId, $epoch, $now);
             }
@@ -308,11 +344,14 @@ final class SqliteQueueStorage
      */
     public function earliestEligibility(string $queue): ?int
     {
-        $this->requireConnection();
-        $this->earliestEligibilityStatement->bindValue(1, $queue, \PDO::PARAM_STR);
-        $this->earliestEligibilityStatement->execute();
-        $row = $this->earliestEligibilityStatement->fetch(\PDO::FETCH_ASSOC);
-        $this->earliestEligibilityStatement->closeCursor();
+        $statement = $this->statement(self::STATEMENT_EARLIEST);
+        try {
+            $statement->bindValue(1, $queue, \PDO::PARAM_STR);
+            $statement->execute();
+            $row = $statement->fetch(\PDO::FETCH_ASSOC);
+        } finally {
+            self::releaseStatement($statement);
+        }
         if (false === $row) {
             return null;
         }
@@ -370,10 +409,14 @@ final class SqliteQueueStorage
 
     private function settlementFailure(int $id, string $token, string $ownerId, string $epoch, int $now): SettlementResultEnum
     {
-        $this->diagnoseStatement->bindValue(1, $id, \PDO::PARAM_INT);
-        $this->diagnoseStatement->execute();
-        $row = $this->diagnoseStatement->fetch(\PDO::FETCH_ASSOC);
-        $this->diagnoseStatement->closeCursor();
+        $diagnose = $this->statement(self::STATEMENT_DIAGNOSE);
+        try {
+            $diagnose->bindValue(1, $id, \PDO::PARAM_INT);
+            $diagnose->execute();
+            $row = $diagnose->fetch(\PDO::FETCH_ASSOC);
+        } finally {
+            self::releaseStatement($diagnose);
+        }
         if (false === $row || null === $row['reserved_until']) {
             return SettlementResultEnum::NoActiveReservation;
         }
@@ -405,7 +448,7 @@ final class SqliteQueueStorage
         throw new \RuntimeException('Settlement DELETE failed despite a matching active reservation.');
     }
 
-    private function configure(Sqlite $connection, SqliteSynchronousMode $synchronous): void
+    private static function configure(Sqlite $connection, SqliteSynchronousMode $synchronous): void
     {
         $connection->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
         $connection->setAttribute(\PDO::ATTR_DEFAULT_FETCH_MODE, \PDO::FETCH_ASSOC);
@@ -432,7 +475,7 @@ final class SqliteQueueStorage
         if ('wal' !== $journal) {
             throw new \RuntimeException('Queue storage requires effective file-backed WAL mode.');
         }
-        if ($this->readSynchronousMode($connection) !== $synchronous) {
+        if (self::readSynchronousMode($connection) !== $synchronous) {
             throw new \RuntimeException('Effective synchronous mode does not match the configured mode.');
         }
         $foreignKeys = $connection->query('PRAGMA foreign_keys')->fetchColumn();
@@ -441,7 +484,7 @@ final class SqliteQueueStorage
         }
     }
 
-    private function readSynchronousMode(Sqlite $connection): SqliteSynchronousMode
+    private static function readSynchronousMode(Sqlite $connection): SqliteSynchronousMode
     {
         $value = $connection->query('PRAGMA synchronous')->fetchColumn();
 
@@ -452,7 +495,7 @@ final class SqliteQueueStorage
         };
     }
 
-    private function payloadBytes(mixed $value, string $field): string
+    private static function payloadBytes(mixed $value, string $field): string
     {
         if (\is_string($value)) {
             return $value;
@@ -469,36 +512,82 @@ final class SqliteQueueStorage
         throw new \RuntimeException('Stored message is missing or has invalid payload types.');
     }
 
+    private static function assertBoundedPayload(string $body, string $headers): void
+    {
+        $bodyLength = \strlen($body);
+        $headersLength = \strlen($headers);
+        if ($bodyLength > Limits::MAX_PAYLOAD || $headersLength > Limits::MAX_PAYLOAD || $bodyLength + $headersLength > Limits::MAX_PAYLOAD) {
+            throw new \RuntimeException('Stored message payload exceeds the supported size.');
+        }
+    }
+
+    private function statement(string $name): \PDOStatement
+    {
+        $statements = $this->requireStatements();
+        if (!isset($statements[$name])) {
+            throw new \LogicException(\sprintf('Unknown queue storage statement "%s".', $name));
+        }
+
+        return $statements[$name];
+    }
+
     private function requireConnection(): Sqlite
     {
-        if ($this->closed || null === $this->connection) {
+        if ($this->closed || null === $this->connection || null === $this->statements) {
             throw new \RuntimeException('Queue storage is closed.');
         }
 
         return $this->connection;
     }
 
+    /**
+     * @return array{
+     *     insert: \PDOStatement,
+     *     eligible_id: \PDOStatement,
+     *     reserve: \PDOStatement,
+     *     payload: \PDOStatement,
+     *     delete: \PDOStatement,
+     *     diagnose: \PDOStatement,
+     *     earliest_eligibility: \PDOStatement
+     * }
+     */
+    private function requireStatements(): array
+    {
+        if ($this->closed || null === $this->connection || null === $this->statements) {
+            throw new \RuntimeException('Queue storage is closed.');
+        }
+
+        return $this->statements;
+    }
+
     private function failClosed(): void
     {
         $this->closed = true;
-        $this->releaseConnection();
+        self::discardStatements($this->statements);
+        $this->statements = null;
+        $this->connection = null;
     }
 
-    private function releaseConnection(): void
+    /**
+     * @param array<string, \PDOStatement>|null $statements
+     */
+    private static function discardStatements(?array $statements): void
     {
-        foreach ([
-            'insertStatement',
-            'eligibleIdStatement',
-            'reserveStatement',
-            'payloadStatement',
-            'deleteStatement',
-            'diagnoseStatement',
-            'earliestEligibilityStatement',
-        ] as $property) {
-            if (isset($this->{$property})) {
-                $this->{$property}->closeCursor();
-            }
+        if (null === $statements) {
+            return;
         }
-        $this->connection = null;
+        foreach ($statements as $name => $statement) {
+            self::releaseStatement($statement, clearBoundLobs: self::STATEMENT_INSERT === $name);
+        }
+    }
+
+    private static function releaseStatement(\PDOStatement $statement, bool $clearBoundLobs = false): void
+    {
+        $statement->closeCursor();
+        if ($clearBoundLobs) {
+            // Drop any retained LOB parameter values from the previous execution.
+            $statement->bindValue(2, '', \PDO::PARAM_LOB);
+            $statement->bindValue(3, '', \PDO::PARAM_LOB);
+        }
     }
 }
