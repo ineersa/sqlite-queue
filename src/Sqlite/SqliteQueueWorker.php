@@ -10,25 +10,23 @@ use Amp\DeferredFuture;
 use Amp\NullCancellation;
 use Amp\Sync\LocalMutex;
 use Amp\TimeoutCancellation;
+use Amp\TimeoutException;
 use Ineersa\SqliteQueue\DTO\DeliveryDTO;
 use Ineersa\SqliteQueue\Exception\ClientContextClosedException;
-use Ineersa\SqliteQueue\Exception\ExpiredReceiptException;
 use Ineersa\SqliteQueue\Exception\InvalidReceiptException;
-use Ineersa\SqliteQueue\Exception\MalformedReceiptException;
-use Ineersa\SqliteQueue\Exception\NoActiveReservationException;
-use Ineersa\SqliteQueue\Exception\ReceiptEpochMismatchException;
-use Ineersa\SqliteQueue\Exception\ReceiptOwnerMismatchException;
-use Ineersa\SqliteQueue\Exception\ReceiptTokenMismatchException;
+use Ineersa\SqliteQueue\Protocol\ErrorCode;
 use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Sqlite\Exception\StorageCapacityException;
 use Ineersa\SqliteQueue\Sqlite\Exception\StorageFailureException;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 
+use function Amp\async;
+
 /**
  * Parent proxy for one persistent PDO worker.
  *
- * Serializes whole queue operations across the Amp channel. Caller cancellation can
- * prevent dispatch; after channel send begins the terminal reply is always consumed.
+ * Caller cancellation can prevent dispatch. After channel send begins, the terminal
+ * reply is always consumed or the lane fails closed.
  */
 final class SqliteQueueWorker
 {
@@ -45,8 +43,8 @@ final class SqliteQueueWorker
     private bool $closing = false;
     private bool $failed = false;
     private bool $closed = false;
-    /** @var list<DeferredFuture<null>> */
-    private array $capacityWaiters = [];
+    /** @var DeferredFuture<null>|null */
+    private ?DeferredFuture $capacityAvailable = null;
 
     /**
      * @param array{journal_mode: string, synchronous: string, busy_timeout: int, wal_autocheckpoint: int, sqlite_version: string} $configuration
@@ -82,7 +80,7 @@ final class SqliteQueueWorker
         if ($delay < 0) {
             throw new \InvalidArgumentException('Delay must be nonnegative milliseconds.');
         }
-        $this->assertPayloadBounds($body, $headers);
+        $this->assertRequestPayloadBounds($body, $headers);
         $result = $this->exchange(
             SqliteWorkerOperationEnum::Send,
             [
@@ -94,9 +92,7 @@ final class SqliteQueueWorker
             \strlen($body) + \strlen($headers),
             $cancellation ?? new NullCancellation(),
         );
-        if (!\is_int($result) || $result <= 0) {
-            throw $this->failLane('Send response did not return a positive message identity.');
-        }
+        \assert(\is_int($result) && $result > 0);
 
         return $result;
     }
@@ -106,7 +102,7 @@ final class SqliteQueueWorker
         if ('' === $ownerId) {
             throw new \InvalidArgumentException('Owner identity must be a non-empty string.');
         }
-        $result = $this->exchange(
+        $delivery = $this->exchange(
             SqliteWorkerOperationEnum::Claim,
             [
                 'queue' => $queue->value,
@@ -114,15 +110,11 @@ final class SqliteQueueWorker
             ],
             0,
             $cancellation ?? new NullCancellation(),
+            expectedQueue: $queue->value,
         );
-        if (null === $result) {
-            return null;
-        }
-        if (!\is_array($result)) {
-            throw $this->failLane('Claim response must be an array or null.');
-        }
+        \assert(null === $delivery || $delivery instanceof DeliveryDTO);
 
-        return $this->deliveryFromResult($result, $queue->value);
+        return $delivery;
     }
 
     public function acknowledge(string $receipt, string $ownerId, ?Cancellation $cancellation = null): void
@@ -143,12 +135,7 @@ final class SqliteQueueWorker
             0,
             $cancellation ?? new NullCancellation(),
         );
-        if (null === $result) {
-            return null;
-        }
-        if (!\is_int($result) || $result < 0) {
-            throw $this->failLane('Earliest eligibility response must be a nonnegative integer or null.');
-        }
+        \assert(null === $result || (\is_int($result) && $result >= 0));
 
         return $result;
     }
@@ -156,25 +143,14 @@ final class SqliteQueueWorker
     /** Wait until admission capacity is available or the token cancels. */
     public function awaitCapacity(Cancellation $cancellation): void
     {
+        if ($this->closed || $this->failed) {
+            throw new StorageFailureException('Queue storage is closed.');
+        }
         if ($this->hasCapacity()) {
             return;
         }
-        $waiter = new DeferredFuture();
-        $this->capacityWaiters[] = $waiter;
-        $id = $cancellation->subscribe(static function () use ($waiter): void {
-            if (!$waiter->isComplete()) {
-                $waiter->error(new CancelledException());
-            }
-        });
-        try {
-            $waiter->getFuture()->await();
-        } finally {
-            $cancellation->unsubscribe($id);
-            $this->capacityWaiters = array_values(array_filter(
-                $this->capacityWaiters,
-                static fn (DeferredFuture $candidate): bool => $candidate !== $waiter,
-            ));
-        }
+        $this->capacityAvailable ??= new DeferredFuture();
+        $this->capacityAvailable->getFuture()->await($cancellation);
     }
 
     /** Mark the proxy closing so queued work cannot dispatch later. */
@@ -209,7 +185,7 @@ final class SqliteQueueWorker
         } finally {
             $this->closed = true;
             $this->failed = true;
-            $this->releaseCapacityWaiters(new StorageFailureException('Queue storage is closed.'));
+            $this->signalCapacity(new StorageFailureException('Queue storage is closed.'));
         }
     }
 
@@ -218,7 +194,7 @@ final class SqliteQueueWorker
         if ('' === $ownerId) {
             throw new \InvalidArgumentException('Owner identity must be a non-empty string.');
         }
-        $this->exchange(
+        $result = $this->exchange(
             SqliteWorkerOperationEnum::Settle,
             [
                 'receipt' => $receipt,
@@ -228,6 +204,7 @@ final class SqliteQueueWorker
             0,
             $cancellation ?? new NullCancellation(),
         );
+        \assert(true === $result);
     }
 
     /**
@@ -239,6 +216,7 @@ final class SqliteQueueWorker
         int $payloadBytes,
         Cancellation $cancellation,
         bool $allowWhileClosing = false,
+        ?string $expectedQueue = null,
     ): mixed {
         $this->assertOpen($allowWhileClosing);
         $this->assertActive($cancellation);
@@ -246,7 +224,17 @@ final class SqliteQueueWorker
         $lock = null;
         $dispatched = false;
         try {
-            $lock = $this->exchange->acquire();
+            $acquire = async($this->exchange->acquire(...));
+            try {
+                $lock = $acquire->await($cancellation);
+            } catch (CancelledException $error) {
+                // A cancelled waiter must still release any lock acquired after abandonment.
+                $acquire->map(static fn ($lock) => $lock->release())->ignore();
+                if ($allowWhileClosing) {
+                    throw $this->failLane('Shutdown budget expired while waiting for the storage lane.', $error);
+                }
+                throw new ClientContextClosedException('The client connection lifetime was cancelled.', previous: $error);
+            }
             $this->assertOpen($allowWhileClosing);
             $this->assertActive($cancellation);
             if ($this->failed) {
@@ -254,46 +242,36 @@ final class SqliteQueueWorker
             }
             $id = $this->nextRequestId++;
             $context = $this->handle->context();
-            $deadline = new TimeoutCancellation(self::EXCHANGE_TIMEOUT_SECONDS);
+            $deadline = $allowWhileClosing ? $cancellation : new TimeoutCancellation(self::EXCHANGE_TIMEOUT_SECONDS);
             // No yield between the final admission check and marking dispatch attempted.
             $dispatched = true;
-            try {
+            $exchange = async(static function () use ($context, $id, $operation, $data): mixed {
                 $context->send([
                     'id' => $id,
                     'op' => $operation->value,
                     'data' => $data,
                 ]);
-            } catch (\Throwable $error) {
-                throw $this->failLane('Worker channel send failed.', $error);
-            }
+
+                return $context->receive();
+            });
             try {
-                $response = $context->receive($deadline);
+                $response = $exchange->await($deadline);
+            } catch (CancelledException $error) {
+                try {
+                    $context->close();
+                } catch (\Throwable) {
+                }
+                $exchange->ignore();
+                $reason = $error->getPrevious() instanceof TimeoutException
+                    ? 'Worker exchange deadline expired.'
+                    : 'Worker exchange cancelled during shutdown.';
+                throw $this->failLane($reason, $error);
             } catch (\Throwable $error) {
-                throw $this->failLane('Worker channel receive failed.', $error);
+                throw $this->failLane('Worker exchange failed.', $error);
             }
-            if (!\is_array($response)) {
-                throw $this->failLane('Worker response must be an array.');
-            }
-            if (($response['id'] ?? null) !== $id) {
-                throw $this->failLane('Worker response id does not match the request.');
-            }
-            if (($response['op'] ?? null) !== $operation->value) {
-                throw $this->failLane('Worker response operation does not match the request.');
-            }
-            $status = SqliteWorkerStatusEnum::tryFrom((string) ($response['status'] ?? ''));
-            if (null === $status) {
-                throw $this->failLane('Worker response status is invalid.');
-            }
-            if (SqliteWorkerStatusEnum::Ok === $status) {
-                return $response['result'] ?? null;
-            }
-            if (SqliteWorkerStatusEnum::Domain === $status) {
-                throw $this->domainException($response['error'] ?? null);
-            }
-            throw $this->failLane($this->failureMessage($response['error'] ?? null));
-        } catch (ClientContextClosedException|StorageCapacityException|\InvalidArgumentException|InvalidReceiptException $error) {
-            throw $error;
-        } catch (StorageFailureException $error) {
+
+            return $this->validatedResult($operation, $id, $response, $expectedQueue);
+        } catch (ClientContextClosedException|StorageCapacityException|\InvalidArgumentException|InvalidReceiptException|StorageFailureException $error) {
             throw $error;
         } catch (\Throwable $error) {
             if ($dispatched) {
@@ -304,6 +282,86 @@ final class SqliteQueueWorker
             $lock?->release();
             $this->releaseAdmission($payloadBytes);
         }
+    }
+
+    private function validatedResult(
+        SqliteWorkerOperationEnum $operation,
+        int $id,
+        mixed $response,
+        ?string $expectedQueue,
+    ): mixed {
+        if (!\is_array($response)) {
+            throw $this->failLane('Worker response must be an array.');
+        }
+        if (($response['id'] ?? null) !== $id) {
+            throw $this->failLane('Worker response id does not match the request.');
+        }
+        if (($response['op'] ?? null) !== $operation->value) {
+            throw $this->failLane('Worker response operation does not match the request.');
+        }
+        $statusValue = $response['status'] ?? null;
+        if (!\is_string($statusValue)) {
+            throw $this->failLane('Worker response status must be a string.');
+        }
+        $status = SqliteWorkerStatusEnum::tryFrom($statusValue);
+        if (null === $status) {
+            throw $this->failLane('Worker response status is invalid.');
+        }
+        if (SqliteWorkerStatusEnum::Domain === $status) {
+            throw $this->domainException($response['error'] ?? null);
+        }
+        if (SqliteWorkerStatusEnum::Failure === $status) {
+            throw $this->failLane($this->failureMessage($response['error'] ?? null));
+        }
+        if (!\array_key_exists('result', $response)) {
+            throw $this->failLane('Worker success response is missing its result.');
+        }
+        $result = $response['result'];
+
+        return match ($operation) {
+            SqliteWorkerOperationEnum::Send => $this->requirePositiveInt($result, 'Send'),
+            SqliteWorkerOperationEnum::Claim => null === $result
+                ? null
+                : $this->deliveryFromResult($this->requireClaimArray($result), $expectedQueue ?? throw $this->failLane('Claim validation requires the requested queue.')),
+            SqliteWorkerOperationEnum::Settle, SqliteWorkerOperationEnum::Close => true === $result
+                ? true
+                : throw $this->failLane($operation->value.' response must be explicit success.'),
+            SqliteWorkerOperationEnum::EarliestEligibility => $this->requireEligibility($result),
+            SqliteWorkerOperationEnum::Init => throw $this->failLane('Init is not a steady-state exchange.'),
+        };
+    }
+
+    private function requirePositiveInt(mixed $result, string $label): int
+    {
+        if (!\is_int($result) || $result <= 0) {
+            throw $this->failLane($label.' response did not return a positive message identity.');
+        }
+
+        return $result;
+    }
+
+    /**
+     * @return array<array-key, mixed>
+     */
+    private function requireClaimArray(mixed $result): array
+    {
+        if (!\is_array($result)) {
+            throw $this->failLane('Claim response must be an array or null.');
+        }
+
+        return $result;
+    }
+
+    private function requireEligibility(mixed $result): mixed
+    {
+        if (null === $result) {
+            return null;
+        }
+        if (!\is_int($result) || $result < 0) {
+            throw $this->failLane('Earliest eligibility response must be a nonnegative integer or null.');
+        }
+
+        return $result;
     }
 
     private function reserveAdmission(int $payloadBytes): void
@@ -322,12 +380,13 @@ final class SqliteQueueWorker
 
     private function releaseAdmission(int $payloadBytes): void
     {
-        if ($this->admittedOperations > 0) {
-            --$this->admittedOperations;
+        if ($this->admittedOperations < 1 || $this->admittedPayloadBytes < $payloadBytes) {
+            throw $this->failLane('Admission counters are inconsistent.');
         }
-        $this->admittedPayloadBytes = max(0, $this->admittedPayloadBytes - $payloadBytes);
+        --$this->admittedOperations;
+        $this->admittedPayloadBytes -= $payloadBytes;
         if ($this->hasCapacity()) {
-            $this->releaseCapacityWaiters(null);
+            $this->signalCapacity(null);
         }
     }
 
@@ -337,19 +396,17 @@ final class SqliteQueueWorker
             && $this->admittedPayloadBytes < self::MAX_ADMITTED_PAYLOAD_BYTES;
     }
 
-    private function releaseCapacityWaiters(?\Throwable $error): void
+    private function signalCapacity(?\Throwable $error): void
     {
-        $waiters = $this->capacityWaiters;
-        $this->capacityWaiters = [];
-        foreach ($waiters as $waiter) {
-            if ($waiter->isComplete()) {
-                continue;
-            }
-            if (null === $error) {
-                $waiter->complete(null);
-            } else {
-                $waiter->error($error);
-            }
+        $waiter = $this->capacityAvailable;
+        $this->capacityAvailable = null;
+        if (null === $waiter || $waiter->isComplete()) {
+            return;
+        }
+        if (null === $error) {
+            $waiter->complete(null);
+        } else {
+            $waiter->error($error);
         }
     }
 
@@ -372,13 +429,21 @@ final class SqliteQueueWorker
         }
     }
 
-    private function assertPayloadBounds(string $body, string $headers): void
+    private function assertRequestPayloadBounds(string $body, string $headers): void
+    {
+        if (!$this->payloadWithinBounds($body, $headers)) {
+            throw new \InvalidArgumentException('Payload exceeds the supported frame budget.');
+        }
+    }
+
+    private function payloadWithinBounds(string $body, string $headers): bool
     {
         $bodyLength = \strlen($body);
         $headersLength = \strlen($headers);
-        if ($bodyLength > Limits::MAX_PAYLOAD || $headersLength > Limits::MAX_PAYLOAD || $bodyLength + $headersLength > Limits::MAX_PAYLOAD) {
-            throw new \InvalidArgumentException('Payload exceeds the supported frame budget.');
-        }
+
+        return $bodyLength <= Limits::MAX_PAYLOAD
+            && $headersLength <= Limits::MAX_PAYLOAD
+            && $bodyLength + $headersLength <= Limits::MAX_PAYLOAD;
     }
 
     /**
@@ -400,14 +465,20 @@ final class SqliteQueueWorker
         if (!\is_string($result['body']) || !\is_string($result['headers']) || !\is_string($result['receipt'])) {
             throw $this->failLane('Claim response payloads and receipt must be strings.');
         }
-        $this->assertPayloadBounds($result['body'], $result['headers']);
+        if (!$this->payloadWithinBounds($result['body'], $result['headers'])) {
+            throw $this->failLane('Claim response payload exceeds the supported frame budget.');
+        }
         if (!\is_int($result['available_at']) || $result['available_at'] < 0
             || !\is_int($result['reserved_until']) || $result['reserved_until'] < 0
         ) {
             throw $this->failLane('Claim response deadlines must be nonnegative integers.');
         }
-        if (1 !== preg_match('/\A([1-9][0-9]*):([a-f0-9]{64})\z/D', $result['receipt'])) {
+        if (1 !== preg_match('/\A([1-9][0-9]*):([a-f0-9]{64})\z/D', $result['receipt'], $parts)) {
             throw $this->failLane('Claim response receipt is malformed.');
+        }
+        $receiptId = filter_var($parts[1], \FILTER_VALIDATE_INT);
+        if (false === $receiptId || $receiptId !== $result['id']) {
+            throw $this->failLane('Claim response receipt identity does not match the delivery identity.');
         }
 
         return new DeliveryDTO(
@@ -423,31 +494,43 @@ final class SqliteQueueWorker
 
     private function domainException(mixed $error): \Throwable
     {
-        if (!\is_array($error) || !\is_string($error['class'] ?? null)) {
+        if (!\is_array($error) || !\is_string($error['code'] ?? null)) {
             throw $this->failLane('Worker domain failure is malformed.');
         }
-        $class = $error['class'];
-        $message = \is_string($error['message'] ?? null) ? $this->diagnostic($error['message']) : '';
+        $code = ErrorCode::tryFrom($error['code']);
+        $exception = $code?->receiptException();
+        if (null !== $exception) {
+            return $exception;
+        }
+        if (ErrorCode::InvalidQueueName === $code) {
+            return new \InvalidArgumentException('Broker rejected the queue name.');
+        }
+        if ('invalid_argument' === $error['code']) {
+            $message = \is_string($error['message'] ?? null) ? $this->diagnostic($error['message']) : '';
 
-        return match ($class) {
-            MalformedReceiptException::class => new MalformedReceiptException(),
-            NoActiveReservationException::class => new NoActiveReservationException(),
-            ReceiptOwnerMismatchException::class => new ReceiptOwnerMismatchException(),
-            ReceiptEpochMismatchException::class => new ReceiptEpochMismatchException(),
-            ReceiptTokenMismatchException::class => new ReceiptTokenMismatchException(),
-            ExpiredReceiptException::class => new ExpiredReceiptException(),
-            \InvalidArgumentException::class => new \InvalidArgumentException('' !== $message ? $message : 'Invalid queue argument.'),
-            default => throw $this->failLane('Worker reported an unsupported domain failure.'),
-        };
+            return new \InvalidArgumentException('' !== $message ? $message : 'Invalid queue argument.');
+        }
+
+        throw $this->failLane('Worker reported an unsupported domain failure.');
     }
 
     private function failureMessage(mixed $error): string
     {
-        if (!\is_array($error) || !\is_string($error['message'] ?? null) || '' === $error['message']) {
+        if (!\is_array($error)) {
             return 'Worker reported a storage failure.';
         }
+        $parts = [];
+        if (\is_string($error['phase'] ?? null) && '' !== $error['phase']) {
+            $parts[] = 'phase='.$this->diagnostic($error['phase']);
+        }
+        if (\is_string($error['sqlstate'] ?? null) && '' !== $error['sqlstate']) {
+            $parts[] = 'sqlstate='.$this->diagnostic($error['sqlstate']);
+        }
+        if (\is_string($error['message'] ?? null) && '' !== $error['message']) {
+            $parts[] = $this->diagnostic($error['message']);
+        }
 
-        return $this->diagnostic($error['message']);
+        return [] === $parts ? 'Worker reported a storage failure.' : implode('; ', $parts);
     }
 
     private function failLane(string $message, ?\Throwable $previous = null): StorageFailureException
@@ -458,7 +541,7 @@ final class SqliteQueueWorker
             $this->handle->forceStop();
         } catch (\Throwable) {
         }
-        $this->releaseCapacityWaiters(new StorageFailureException('Queue storage lane has failed.'));
+        $this->signalCapacity(new StorageFailureException('Queue storage lane has failed.'));
 
         return new StorageFailureException($this->diagnostic($message), previous: $previous);
     }
@@ -472,6 +555,6 @@ final class SqliteQueueWorker
             return $message;
         }
 
-        return substr($message, 0, self::DIAGNOSTIC_LIMIT_BYTES);
+        return mb_strcut($message, 0, self::DIAGNOSTIC_LIMIT_BYTES, 'UTF-8');
     }
 }

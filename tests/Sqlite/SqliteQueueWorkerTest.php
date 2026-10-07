@@ -111,7 +111,7 @@ final class SqliteQueueWorkerTest extends TestCase
                     'delay' => 0,
                 ],
             ]);
-            // Desynchronize the lane with a reply the proxy did not request.
+            // Non-monotonic child request IDs fail the lane closed.
             try {
                 $worker->send(new QueueName('jobs'), 'after-desync');
                 $this->fail('Desynchronized lane must fail closed.');

@@ -16,13 +16,12 @@ use function Amp\async;
 /**
  * Lifecycle owner for one package PDO worker process.
  *
- * Owns pipe drains and joins the process context at most once. Forced termination uses
- * ProcessContext::close() and tolerates the expected missing-result failure. AMPHP owns
- * underlying process-exit tracking.
+ * Joins the process context at most once. Forced termination uses ProcessContext::close()
+ * and tolerates a missing exit result. AMPHP owns process-exit tracking.
  */
 final class SqliteWorkerHandle
 {
-    /** @var Future<mixed>|null */
+    /** @var Future<null>|null */
     private ?Future $joined = null;
 
     /**
@@ -50,25 +49,17 @@ final class SqliteWorkerHandle
     }
 
     /**
-     * Join the process context once and share that outcome.
+     * Join once and share that outcome.
      *
-     * After SIGKILL the join may throw before the underlying process wait because the
-     * worker cannot send its return-value message. Callers must tolerate that path and
-     * must never retry this method.
+     * Callers must not retry this method. Forced termination may throw ContextException
+     * because the worker cannot send its return-value message.
      */
-    public function join(?Cancellation $cancellation = null): mixed
+    public function join(?Cancellation $cancellation = null): void
     {
-        $this->joined ??= async(function (): mixed {
-            try {
-                return $this->context->join();
-            } catch (ContextException $error) {
-                // Forced termination commonly loses the exit-result message. AMPHP still
-                // tracks process exit; treat the missing result as an expected terminal state.
-                return $error;
-            }
+        $this->joined ??= async(function (): void {
+            $this->context->join();
         });
-
-        return $this->joined->await($cancellation ?? new NullCancellation());
+        $this->joined->await($cancellation ?? new NullCancellation());
     }
 
     /** Kill the owned child without joining it. */
@@ -78,19 +69,45 @@ final class SqliteWorkerHandle
     }
 
     /**
-     * Force-stop the child, then observe pipes until EOF or the shared budget expires.
+     * Force-stop, tolerate a missing exit result, then release pipe readers.
      *
-     * Cancellation is required: this runs inside a shutdown budget. A timeout created here
-     * would extend that budget behind the caller's back.
+     * Cancellation is required: this runs inside a shared shutdown budget.
      */
     public function close(Cancellation $budget): void
     {
         $this->forceStop();
         try {
-            // Absorb the expected missing-result exception once without retrying join().
             $this->join($budget);
-        } catch (\Throwable) {
+        } catch (ContextException) {
+        } finally {
+            $this->releaseDrains($budget);
         }
+    }
+
+    /**
+     * Join a gracefully exited child once, then release pipe readers.
+     *
+     * Unexpected join failures propagate. Forced termination still uses close().
+     */
+    public function finish(Cancellation $budget): void
+    {
+        try {
+            $this->join($budget);
+        } finally {
+            $this->releaseDrains($budget);
+        }
+    }
+
+    /**
+     * @return ProcessContext<mixed, mixed, mixed>
+     */
+    public function context(): ProcessContext
+    {
+        return $this->context;
+    }
+
+    private function releaseDrains(Cancellation $budget): void
+    {
         try {
             foreach ($this->drains as $drain) {
                 $drain->await($budget);
@@ -102,38 +119,5 @@ final class SqliteWorkerHandle
             }
             $this->drains = [];
         }
-    }
-
-    /**
-     * Join a gracefully exited child once, then release owned pipe readers.
-     *
-     * Use this after a successful close exchange. Forced termination still uses close().
-     */
-    public function finish(Cancellation $budget): void
-    {
-        try {
-            $this->join($budget);
-        } finally {
-            try {
-                foreach ($this->drains as $drain) {
-                    $drain->await($budget);
-                }
-            } finally {
-                $this->drainCancellation->cancel();
-                foreach ($this->drains as $drain) {
-                    $drain->ignore();
-                }
-                $this->drains = [];
-            }
-        }
-    }
-
-    /** Expose the live process channel for the parent proxy. */
-    /**
-     * @return ProcessContext<mixed, mixed, mixed>
-     */
-    public function context(): ProcessContext
-    {
-        return $this->context;
     }
 }

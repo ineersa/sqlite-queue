@@ -7,6 +7,7 @@ namespace Ineersa\SqliteQueue\Sqlite;
 use Amp\Sync\Channel;
 use Ineersa\SqliteQueue\DTO\DeliveryDTO;
 use Ineersa\SqliteQueue\Exception\InvalidReceiptException;
+use Ineersa\SqliteQueue\Protocol\ErrorCode;
 use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
@@ -14,8 +15,9 @@ use Ineersa\SqliteQueue\ValueObject\QueueName;
 /**
  * Child-side queue runtime over one Amp channel.
  *
- * Receives one init request, constructs Queue over PDO storage, then serves one
- * operation at a time until close or a fatal failure.
+ * Bootstrap acquires PDO storage and Queue, then serves one operation at a time.
+ * Malformed internal protocol fails closed. Genuine queue argument and receipt
+ * errors remain non-fatal domain replies.
  */
 final class SqliteWorkerRuntime
 {
@@ -27,23 +29,43 @@ final class SqliteWorkerRuntime
      */
     public static function run(Channel $channel, \Closure $clock): void
     {
-        $storage = null;
-        $request = null;
         try {
-            $init = $channel->receive();
-            self::assertArray($init, 'Initialization request must be an array.');
-            self::assertOperation($init, SqliteWorkerOperationEnum::Init);
-            if (1 !== ($init['id'] ?? null)) {
-                throw new \InvalidArgumentException('Initialization request id must be 1.');
-            }
-            $data = self::arrayField($init, 'data');
-            $database = self::stringField($data, 'database');
-            $visibility = self::positiveIntField($data, 'visibility_timeout');
-            $synchronous = SqliteSynchronousMode::tryFrom(self::stringField($data, 'synchronous'));
-            if (null === $synchronous) {
-                throw new \InvalidArgumentException('Initialization synchronous mode must be normal or full.');
-            }
-            $storage = SqliteQueueStorage::open($database, $synchronous);
+            [$queue, $storage] = self::bootstrap($channel, $clock);
+        } catch (\Throwable $error) {
+            self::sendFailure($channel, 0, SqliteWorkerOperationEnum::Init, 'bootstrap', $error);
+            throw $error;
+        }
+
+        try {
+            self::serve($channel, $queue, $storage);
+        } finally {
+            $storage->close();
+        }
+    }
+
+    /**
+     * @param Channel<mixed, mixed> $channel
+     * @param \Closure(): int       $clock
+     *
+     * @return array{Queue, SqliteQueueStorage}
+     */
+    private static function bootstrap(Channel $channel, \Closure $clock): array
+    {
+        $init = $channel->receive();
+        self::assertArray($init, 'Initialization request must be an array.');
+        self::assertOperation($init, SqliteWorkerOperationEnum::Init);
+        if (1 !== ($init['id'] ?? null)) {
+            throw new \RuntimeException('Initialization request id must be 1.');
+        }
+        $data = self::arrayField($init, 'data');
+        $database = self::stringField($data, 'database');
+        $visibility = self::positiveIntField($data, 'visibility_timeout');
+        $synchronous = SqliteSynchronousMode::tryFrom(self::stringField($data, 'synchronous'));
+        if (null === $synchronous) {
+            throw new \RuntimeException('Initialization synchronous mode must be normal or full.');
+        }
+        $storage = SqliteQueueStorage::open($database, $synchronous);
+        try {
             $queue = new Queue($storage, $visibility, $clock);
             $channel->send([
                 'id' => 1,
@@ -51,41 +73,42 @@ final class SqliteWorkerRuntime
                 'status' => SqliteWorkerStatusEnum::Ok->value,
                 'result' => $storage->configuration(),
             ]);
-            self::serve($channel, $queue, $storage, $request);
         } catch (\Throwable $error) {
-            try {
-                $channel->send([
-                    'id' => \is_array($request) && isset($request['id']) && \is_int($request['id']) ? $request['id'] : 0,
-                    'op' => \is_array($request) && isset($request['op']) && \is_string($request['op']) ? $request['op'] : SqliteWorkerOperationEnum::Init->value,
-                    'status' => SqliteWorkerStatusEnum::Failure->value,
-                    'error' => [
-                        'class' => $error::class,
-                        'message' => self::diagnostic($error->getMessage()),
-                    ],
-                ]);
-            } catch (\Throwable) {
-            }
+            $storage->close();
             throw $error;
-        } finally {
-            $storage?->close();
         }
+
+        return [$queue, $storage];
     }
 
     /**
-     * @param Channel<mixed, mixed>        $channel
-     * @param array<array-key, mixed>|null $request
+     * @param Channel<mixed, mixed> $channel
      */
-    private static function serve(Channel $channel, Queue $queue, SqliteQueueStorage $storage, ?array &$request): void
+    private static function serve(Channel $channel, Queue $queue, SqliteQueueStorage $storage): void
     {
+        $expectedId = 2;
         while (true) {
             $request = $channel->receive();
-            self::assertArray($request, 'Worker request must be an array.');
-            $id = self::positiveIntField($request, 'id');
-            $operation = SqliteWorkerOperationEnum::tryFrom(self::stringField($request, 'op'));
-            if (null === $operation || SqliteWorkerOperationEnum::Init === $operation) {
-                throw new \InvalidArgumentException('Worker request operation is unsupported.');
+            try {
+                self::assertArray($request, 'Worker request must be an array.');
+                $id = self::positiveIntField($request, 'id');
+                if ($id !== $expectedId) {
+                    throw new \RuntimeException('Worker request id must increase monotonically.');
+                }
+                $operation = SqliteWorkerOperationEnum::tryFrom(self::stringField($request, 'op'));
+                if (null === $operation || SqliteWorkerOperationEnum::Init === $operation) {
+                    throw new \RuntimeException('Worker request operation is unsupported.');
+                }
+                $data = self::arrayField($request, 'data');
+            } catch (\Throwable $error) {
+                $id = \is_array($request) && isset($request['id']) && \is_int($request['id']) ? $request['id'] : 0;
+                $op = \is_array($request) && isset($request['op']) && \is_string($request['op'])
+                    ? SqliteWorkerOperationEnum::tryFrom($request['op'])
+                    : null;
+                self::sendFailure($channel, $id, $op ?? SqliteWorkerOperationEnum::Send, 'decode', $error);
+                throw $error;
             }
-            $data = self::arrayField($request, 'data');
+
             try {
                 $result = self::dispatch($queue, $storage, $operation, $data);
                 $channel->send([
@@ -94,6 +117,7 @@ final class SqliteWorkerRuntime
                     'status' => SqliteWorkerStatusEnum::Ok->value,
                     'result' => $result,
                 ]);
+                ++$expectedId;
                 if (SqliteWorkerOperationEnum::Close === $operation) {
                     return;
                 }
@@ -102,11 +126,12 @@ final class SqliteWorkerRuntime
                     'id' => $id,
                     'op' => $operation->value,
                     'status' => SqliteWorkerStatusEnum::Domain->value,
-                    'error' => [
-                        'class' => $error::class,
-                        'message' => self::diagnostic($error->getMessage()),
-                    ],
+                    'error' => self::domainError($error),
                 ]);
+                ++$expectedId;
+            } catch (\Throwable $error) {
+                self::sendFailure($channel, $id, $operation, 'execute', $error);
+                throw $error;
             }
         }
     }
@@ -170,8 +195,7 @@ final class SqliteWorkerRuntime
         if ('' === $ownerId) {
             throw new \InvalidArgumentException('Owner identity must be a non-empty string.');
         }
-        $acknowledge = self::boolField($data, 'acknowledge');
-        if ($acknowledge) {
+        if (self::boolField($data, 'acknowledge')) {
             $queue->acknowledge($receipt, $ownerId);
         } else {
             $queue->reject($receipt, $ownerId);
@@ -194,7 +218,7 @@ final class SqliteWorkerRuntime
     private static function close(SqliteQueueStorage $storage, array $data): true
     {
         if ([] !== $data) {
-            throw new \InvalidArgumentException('Close request must not carry queue data.');
+            throw new \RuntimeException('Close request must not carry queue data.');
         }
         $storage->close();
 
@@ -225,6 +249,57 @@ final class SqliteWorkerRuntime
         ];
     }
 
+    /**
+     * @return array{category: string, code: string, message: string}
+     */
+    private static function domainError(\Throwable $error): array
+    {
+        if ($error instanceof InvalidReceiptException) {
+            $code = ErrorCode::fromReceiptException($error)->value;
+        } elseif ($error instanceof \InvalidArgumentException
+            && str_starts_with($error->getMessage(), 'Queue names must contain')
+        ) {
+            $code = ErrorCode::InvalidQueueName->value;
+        } else {
+            $code = 'invalid_argument';
+        }
+
+        return [
+            'category' => SqliteWorkerErrorCategoryEnum::Domain->value,
+            'code' => $code,
+            'message' => self::diagnostic($error->getMessage()),
+        ];
+    }
+
+    /**
+     * @param Channel<mixed, mixed> $channel
+     */
+    private static function sendFailure(
+        Channel $channel,
+        int $id,
+        SqliteWorkerOperationEnum $operation,
+        string $phase,
+        \Throwable $error,
+    ): void {
+        try {
+            $payload = [
+                'category' => SqliteWorkerErrorCategoryEnum::Failure->value,
+                'phase' => $phase,
+                'message' => self::diagnostic($error->getMessage()),
+            ];
+            if ($error instanceof \PDOException && \is_string($error->errorInfo[0] ?? null)) {
+                $payload['sqlstate'] = self::diagnostic($error->errorInfo[0]);
+            }
+            $channel->send([
+                'id' => $id,
+                'op' => $operation->value,
+                'status' => SqliteWorkerStatusEnum::Failure->value,
+                'error' => $payload,
+            ]);
+        } catch (\Throwable) {
+        }
+    }
+
     private static function assertPayloadBounds(string $body, string $headers): void
     {
         $bodyLength = \strlen($body);
@@ -241,14 +316,14 @@ final class SqliteWorkerRuntime
     {
         $operation = SqliteWorkerOperationEnum::tryFrom(self::stringField($request, 'op'));
         if ($expected !== $operation) {
-            throw new \InvalidArgumentException(\sprintf('Expected %s operation.', $expected->value));
+            throw new \RuntimeException(\sprintf('Expected %s operation.', $expected->value));
         }
     }
 
     private static function assertArray(mixed $value, string $message): void
     {
         if (!\is_array($value)) {
-            throw new \InvalidArgumentException($message);
+            throw new \RuntimeException($message);
         }
     }
 
@@ -261,7 +336,7 @@ final class SqliteWorkerRuntime
     {
         $value = $data[$field] ?? null;
         if (!\is_array($value)) {
-            throw new \InvalidArgumentException(\sprintf('Field %s must be an array.', $field));
+            throw new \RuntimeException(\sprintf('Field %s must be an array.', $field));
         }
 
         return $value;
@@ -274,7 +349,7 @@ final class SqliteWorkerRuntime
     {
         $value = $data[$field] ?? null;
         if (!\is_string($value)) {
-            throw new \InvalidArgumentException(\sprintf('Field %s must be a string.', $field));
+            throw new \RuntimeException(\sprintf('Field %s must be a string.', $field));
         }
 
         return $value;
@@ -287,7 +362,7 @@ final class SqliteWorkerRuntime
     {
         $value = $data[$field] ?? null;
         if (!\is_int($value) || $value <= 0) {
-            throw new \InvalidArgumentException(\sprintf('Field %s must be a positive integer.', $field));
+            throw new \RuntimeException(\sprintf('Field %s must be a positive integer.', $field));
         }
 
         return $value;
@@ -300,7 +375,7 @@ final class SqliteWorkerRuntime
     {
         $value = $data[$field] ?? null;
         if (!\is_int($value) || $value < 0) {
-            throw new \InvalidArgumentException(\sprintf('Field %s must be a nonnegative integer.', $field));
+            throw new \RuntimeException(\sprintf('Field %s must be a nonnegative integer.', $field));
         }
 
         return $value;
@@ -313,7 +388,7 @@ final class SqliteWorkerRuntime
     {
         $value = $data[$field] ?? null;
         if (!\is_bool($value)) {
-            throw new \InvalidArgumentException(\sprintf('Field %s must be a boolean.', $field));
+            throw new \RuntimeException(\sprintf('Field %s must be a boolean.', $field));
         }
 
         return $value;
@@ -328,6 +403,6 @@ final class SqliteWorkerRuntime
             return $message;
         }
 
-        return substr($message, 0, self::DIAGNOSTIC_LIMIT_BYTES);
+        return mb_strcut($message, 0, self::DIAGNOSTIC_LIMIT_BYTES, 'UTF-8');
     }
 }
