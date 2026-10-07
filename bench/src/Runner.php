@@ -128,7 +128,7 @@ final class Runner
         $broker = new ChildProcess([\PHP_BINARY, $root.'/bin/sqlite-queue', 'broker', '--database='.$database, '--endpoint='.$short.'/broker.sock', '--redeliver-timeout='.Config::REDELIVER_TIMEOUT_S, '--synchronous='.$this->options->synchronous->value, '--no-ansi'], env: Process::environment(), timeout: $this->options->processTimeoutSeconds());
         $consumerArguments = [\PHP_BINARY, __DIR__.'/console.php', 'messenger:consume', 'async', '--no-ansi', '--no-interaction'];
         if (Backend::Doctrine === $backend) {
-            $consumerArguments[] = '--sleep=0.001';
+            $consumerArguments[] = '--sleep=0.05';
         }
         $consumer = new ChildProcess($consumerArguments, timeout: $this->options->processTimeoutSeconds());
         $kernel = new Kernel($directory);
@@ -704,7 +704,7 @@ final class Runner
         $environment['BENCH_TELEMETRY'] = $directory.'/results.operations.jsonl';
         $arguments = [\PHP_BINARY, __DIR__.'/console.php', 'messenger:consume', 'results', '--no-ansi', '--no-interaction'];
         if (Backend::Doctrine === $backend) {
-            $arguments[] = '--sleep=0.001';
+            $arguments[] = '--sleep=0.05';
         }
         $process = new ChildProcess($arguments, env: Process::environment($environment), timeout: $this->options->processTimeoutSeconds());
         try {
@@ -854,7 +854,7 @@ final class Runner
                 throw new \RuntimeException('Broker owning connection readback mismatch.');
             }
 
-            return ['desired' => $desired, 'effective' => $desired, 'authority' => 'broker storage owning connection before readiness', 'pid' => $ready['persistence_pid']];
+            return ['desired' => $desired, 'effective' => $desired, 'authority' => 'broker worker configuration readback before readiness', 'pid' => $ready['persistence_pid']];
         }
         $expected = ['publisher.operations.jsonl.async.durability.json', 'consumer.operations.jsonl.async.durability.json'];
         if (Scenario::Application === $this->options->scenario) {

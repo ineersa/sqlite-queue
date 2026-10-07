@@ -4,13 +4,12 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Bench\DTO;
 
-use Fabpot\Amp\Sqlite\SqliteSynchronousMode;
 use Ineersa\SqliteQueue\Bench\Backend;
 use Ineersa\SqliteQueue\Bench\ConcurrentCohort;
 use Ineersa\SqliteQueue\Bench\Config;
 use Ineersa\SqliteQueue\Bench\Runner;
 use Ineersa\SqliteQueue\Bench\Scenario;
-use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
+use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 
 final readonly class RunOptionsDTO
 {
@@ -24,7 +23,6 @@ final readonly class RunOptionsDTO
 
     public function __construct(public Scenario $scenario, public bool $smoke, public float $durationSeconds, public SqliteSynchronousMode $synchronous)
     {
-        SqliteQueueStorage::validateSynchronousMode($synchronous);
         if (!is_finite($durationSeconds)) {
             throw new \InvalidArgumentException('Duration must be finite seconds.');
         }

@@ -5,11 +5,10 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Command;
 
 use Amp\DeferredCancellation;
-use Fabpot\Amp\Sqlite\SqliteSynchronousMode;
 use Ineersa\SqliteQueue\Broker\BrokerEventEnum;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
 use Ineersa\SqliteQueue\Queue;
-use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
+use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 use Revolt\EventLoop;
 use Symfony\Component\Clock\Clock;
 use Symfony\Component\Clock\ClockInterface;
@@ -49,7 +48,6 @@ final class BrokerCommand extends BaseCommand
         if ($redeliverTimeoutSeconds > intdiv(\PHP_INT_MAX, 1000)) {
             throw new \InvalidArgumentException('Redelivery timeout exceeds the supported milliseconds range.');
         }
-        SqliteQueueStorage::validateSynchronousMode($synchronous);
         parent::__construct();
     }
 
@@ -76,7 +74,6 @@ final class BrokerCommand extends BaseCommand
             if (null === $synchronous) {
                 throw new \InvalidArgumentException('--synchronous must be normal or full.');
             }
-            SqliteQueueStorage::validateSynchronousMode($synchronous);
             $database = $input->getOption('database');
             $endpoint = $input->getOption('endpoint');
             $redeliverTimeoutSeconds = filter_var($input->getOption('redeliver-timeout'), \FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);

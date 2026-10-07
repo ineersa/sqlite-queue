@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Bench;
 
-use Fabpot\Amp\Sqlite\SqliteSynchronousMode;
+use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
 use Symfony\Component\Messenger\Transport\TransportFactoryInterface;
 use Symfony\Component\Messenger\Transport\TransportInterface;

@@ -4,21 +4,20 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Tests\Broker;
 
+use Amp\Cancellation;
 use Amp\CancelledException;
 use Amp\DeferredCancellation;
 use Amp\DeferredFuture;
 use Amp\TimeoutCancellation;
-use Fabpot\Amp\Sqlite\SqliteConfig;
-use Fabpot\Amp\Sqlite\SqliteConnection;
-use Fabpot\Amp\Sqlite\SqliteConnector;
-use Fabpot\Amp\Sqlite\SqliteJournalMode;
-use Fabpot\Amp\Sqlite\SqliteSynchronousMode;
-use Fabpot\Amp\Sqlite\SqliteTransaction;
 use Ineersa\SqliteQueue\Broker\QueueNotifier;
 use Ineersa\SqliteQueue\Broker\QueueNotifierWaiter;
 use Ineersa\SqliteQueue\Broker\QueueNotifierWatch;
+use Ineersa\SqliteQueue\DTO\DeliveryDTO;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
+use Ineersa\SqliteQueue\Sqlite\SqliteQueueWorker;
+use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
+use Ineersa\SqliteQueue\Sqlite\SqliteWorkerHandle;
 use Ineersa\SqliteQueue\Tests\Driver\DriverTestCase;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use Revolt\EventLoop;
@@ -93,8 +92,14 @@ final class QueueNotifierTest extends DriverTestCase
             $entered = new DeferredFuture();
             $release = new DeferredFuture();
             $armed = false;
-            $queue = $this->open(connection: $this->pauseAt($entered, $release, $armed));
-            $notifier = $this->notifier($queue);
+            $queue = $this->open();
+            $notifier = $this->notifier($queue, static function () use ($entered, $release, &$armed): void {
+                if ($armed) {
+                    $armed = false;
+                    $entered->complete();
+                    $release->getFuture()->await(new TimeoutCancellation(5));
+                }
+            });
             $name = new QueueName('jobs');
             $armed = true;
             $waiting = async(static fn (): bool => $notifier->wait($name, 5_000, new TimeoutCancellation(5)));
@@ -250,8 +255,14 @@ final class QueueNotifierTest extends DriverTestCase
             $entered = new DeferredFuture();
             $release = new DeferredFuture();
             $armed = false;
-            $queue = $this->open(connection: $this->pauseAt($entered, $release, $armed));
-            $notifier = $this->notifier($queue);
+            $queue = $this->open();
+            $notifier = $this->notifier($queue, static function () use ($entered, $release, &$armed): void {
+                if ($armed) {
+                    $armed = false;
+                    $entered->complete();
+                    $release->getFuture()->await(new TimeoutCancellation(5));
+                }
+            });
             $name = new QueueName('jobs');
             $queue->send($name, 'future', delay: 1_000);
             $lifetime = new DeferredCancellation();
@@ -291,26 +302,16 @@ final class QueueNotifierTest extends DriverTestCase
             $entered = [new DeferredFuture(), new DeferredFuture()];
             $release = [new DeferredFuture(), new DeferredFuture()];
             $reads = 0;
-            $real = (new SqliteConnector())->connect(
-                (new SqliteConfig($this->database->path()))
-                    ->withJournalMode(SqliteJournalMode::Wal)
-                    ->withSynchronousMode(SqliteSynchronousMode::Full),
-            );
-            $connection = $this->forward(SqliteConnection::class, $real, [
-                'execute' => static function (string $sql, array $parameters = []) use ($real, $entered, $release, &$reads) {
-                    if (str_contains($sql, 'ready_at') && $reads < 2) {
-                        $index = $reads++;
-                        $entered[$index]->complete();
-                        $release[$index]->getFuture()->await(new TimeoutCancellation(5));
-                    }
-
-                    return $real->execute($sql, $parameters);
-                },
-            ]);
-            $queue = $this->open(connection: $connection);
+            $queue = $this->open();
             $name = new QueueName('jobs');
             $queue->send($name, 'ready');
-            $notifier = $this->notifier($queue);
+            $notifier = $this->notifier($queue, static function () use ($entered, $release, &$reads): void {
+                if ($reads < 2) {
+                    $index = $reads++;
+                    $entered[$index]->complete();
+                    $release[$index]->getFuture()->await(new TimeoutCancellation(5));
+                }
+            });
             $cancel = new DeferredCancellation();
             $old = async(static fn (): bool => $notifier->wait($name, 5_000, $cancel->getCancellation()));
             try {
@@ -415,7 +416,7 @@ final class QueueNotifierTest extends DriverTestCase
         $notifier = $this->notifier($this->open());
         $cause = new \RuntimeException('Cancelled during subscription.');
         $unsubscribed = false;
-        $cancellation = $this->createStub(\Amp\Cancellation::class);
+        $cancellation = $this->createStub(Cancellation::class);
         $cancellation->method('subscribe')->willReturnCallback(static function (\Closure $callback) use ($cause): string {
             $callback(new CancelledException($cause));
 
@@ -456,22 +457,56 @@ final class QueueNotifierTest extends DriverTestCase
         });
     }
 
-    private function open(int $visibility = 5000, ?SqliteConnection $connection = null): Queue
+    private function open(int $visibility = 5000): Queue
     {
-        $storage = null === $connection
-            ? SqliteQueueStorage::open($this->database->path())
-            : new SqliteQueueStorage($connection);
+        $storage = SqliteQueueStorage::open($this->database->path());
         $this->storages[] = $storage;
 
         return new Queue($storage, $visibility, fn (): int => $this->now);
     }
 
-    private function notifier(Queue $queue): QueueNotifier
+    private function worker(Queue $queue, ?\Closure $onEligibility = null): SqliteQueueWorker
+    {
+        $worker = $this->createStub(SqliteQueueWorker::class);
+        $worker->method('earliestEligibility')->willReturnCallback(
+            static function (QueueName $name, ?Cancellation $cancellation = null) use ($queue, $onEligibility): ?int {
+                if (null !== $onEligibility) {
+                    $onEligibility();
+                }
+
+                return $queue->earliestEligibility($name, $cancellation);
+            },
+        );
+        $worker->method('awaitCapacity')->willReturnCallback(static function (Cancellation $cancellation): void {
+            $cancellation->throwIfRequested();
+        });
+        $worker->method('send')->willReturnCallback(
+            static fn (QueueName $name, string $body, string $headers = '', int $delay = 0, ?Cancellation $cancellation = null): int => $queue->send($name, $body, $headers, $delay, $cancellation),
+        );
+        $worker->method('receive')->willReturnCallback(
+            static fn (QueueName $name, string $ownerId, ?Cancellation $cancellation = null): ?DeliveryDTO => $queue->receive($name, $ownerId, $cancellation),
+        );
+        $worker->method('synchronousMode')->willReturn(SqliteSynchronousMode::Normal);
+        $worker->method('configuration')->willReturn([
+            'journal_mode' => 'wal',
+            'synchronous' => 'normal',
+            'busy_timeout' => 5000,
+            'wal_autocheckpoint' => 1000,
+            'sqlite_version' => '3.31.0',
+        ]);
+        $worker->method('handle')->willReturn($this->createStub(SqliteWorkerHandle::class));
+        $worker->method('beginClose')->willReturnCallback(static function (): void {});
+        $worker->method('close')->willReturnCallback(static function (): void {});
+
+        return $worker;
+    }
+
+    private function notifier(Queue $queue, ?\Closure $onEligibility = null): QueueNotifier
     {
         $this->notifier?->close();
         $this->failures = [];
         $this->notifier = new QueueNotifier(
-            $queue,
+            $this->worker($queue, $onEligibility),
             fn (): int => $this->now,
             function (\Throwable $error): void {
                 $this->failures[] = $error;
@@ -605,44 +640,5 @@ final class QueueNotifierTest extends DriverTestCase
         } finally {
             EventLoop::cancel($id);
         }
-    }
-
-    private function pauseAt(DeferredFuture $entered, DeferredFuture $release, bool &$armed): SqliteConnection
-    {
-        $real = (new SqliteConnector())->connect(
-            (new SqliteConfig($this->database->path()))
-                ->withJournalMode(SqliteJournalMode::Wal)
-                ->withSynchronousMode(SqliteSynchronousMode::Full),
-        );
-        $pause = static function () use ($entered, $release, &$armed): void {
-            if ($armed) {
-                $armed = false;
-                $entered->complete();
-                $release->getFuture()->await(new TimeoutCancellation(5));
-            }
-        };
-
-        return $this->forward(SqliteConnection::class, $real, [
-            'execute' => static function (string $sql, array $parameters = []) use ($real, $pause) {
-                if (str_contains($sql, 'ready_at')) {
-                    $pause();
-                }
-
-                return $real->execute($sql, $parameters);
-            },
-            'beginTransaction' => fn () => $this->forward(SqliteTransaction::class, $real->beginTransaction(), []),
-        ]);
-    }
-
-    /** Test-only forwarding decorators keep all persistence in the real driver. */
-    private function forward(string $interface, object $real, array $overrides): object
-    {
-        $double = $this->createStub($interface);
-        foreach ((new \ReflectionClass($interface))->getMethods() as $method) {
-            $name = $method->getName();
-            $double->method($name)->willReturnCallback($overrides[$name] ?? $real->$name(...));
-        }
-
-        return $double;
     }
 }

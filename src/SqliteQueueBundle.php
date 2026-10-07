@@ -4,10 +4,10 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue;
 
-use Fabpot\Amp\Sqlite\SqliteSynchronousMode;
 use Ineersa\SqliteQueue\Command\BrokerCommand;
 use Ineersa\SqliteQueue\DependencyInjection\RegisterNativeConsumeWaitSubscriberPass;
 use Ineersa\SqliteQueue\Messenger\TransportFactory;
+use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 use Symfony\Component\Config\Definition\Configurator\DefinitionConfigurator;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Loader\Configurator\ContainerConfigurator;

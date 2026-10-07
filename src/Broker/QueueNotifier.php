@@ -7,8 +7,10 @@ namespace Ineersa\SqliteQueue\Broker;
 use Amp\Cancellation;
 use Amp\CancelledException;
 use Amp\DeferredFuture;
+use Amp\NullCancellation;
 use Ineersa\SqliteQueue\Exception\ClientContextClosedException;
-use Ineersa\SqliteQueue\Queue;
+use Ineersa\SqliteQueue\Sqlite\Exception\StorageCapacityException;
+use Ineersa\SqliteQueue\Sqlite\SqliteQueueWorker;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use Revolt\EventLoop;
 
@@ -48,7 +50,7 @@ final class QueueNotifier
      * @param \Closure(\Throwable): void $onFailure fail-closed callback for async query or timer faults
      */
     public function __construct(
-        private readonly Queue $queue,
+        private readonly SqliteQueueWorker $worker,
         private readonly \Closure $clock,
         private readonly \Closure $onFailure,
     ) {
@@ -183,13 +185,29 @@ final class QueueNotifier
         }
         $watch->dirty = false;
         try {
-            $readyAt = $this->queue->earliestEligibility($watch->queue);
+            $readyAt = $this->queryEligibility($watch);
         } catch (\Throwable $error) {
             $this->failQueue($key, $error);
 
             return;
         }
         $this->applyReadiness($key, $watch, $readyAt);
+    }
+
+    private function queryEligibility(QueueNotifierWatch $watch): ?int
+    {
+        while (true) {
+            if ($this->closed || ($this->watches[self::watchKey($watch->queue)] ?? null) !== $watch) {
+                return null;
+            }
+            try {
+                return $this->worker->earliestEligibility($watch->queue);
+            } catch (StorageCapacityException) {
+                // Keep the live watch dirty and retry once capacity frees. Do not poll on a timer.
+                $watch->dirty = true;
+                $this->worker->awaitCapacity(new NullCancellation());
+            }
+        }
     }
 
     /** A null deadline means the query found no messages in this queue. */

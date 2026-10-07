@@ -6,8 +6,7 @@ namespace Ineersa\SqliteQueue\Bench;
 
 use Doctrine\DBAL\Connection as DbalConnection;
 use Doctrine\DBAL\DriverManager;
-use Fabpot\Amp\Sqlite\SqliteSynchronousMode;
-use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
+use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 use Symfony\Component\Messenger\Bridge\Doctrine\Transport\Connection as DoctrineTransportConnection;
 use Symfony\Component\Messenger\Bridge\Doctrine\Transport\DoctrineTransport;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
@@ -23,7 +22,6 @@ final class Baseline
 {
     public static function connect(string $databasePath, SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal): DbalConnection
     {
-        SqliteQueueStorage::validateSynchronousMode($synchronous);
         $connection = DriverManager::getConnection([
             'driver' => 'pdo_sqlite',
             'path' => $databasePath,
@@ -80,8 +78,6 @@ final class Baseline
 
     public static function synchronousValue(SqliteSynchronousMode $mode): int
     {
-        SqliteQueueStorage::validateSynchronousMode($mode);
-
         return SqliteSynchronousMode::Normal === $mode ? 1 : 2; // SQLite PRAGMA protocol values.
     }
 

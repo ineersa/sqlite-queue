@@ -86,7 +86,7 @@ final readonly class ConcurrentRun
                 if (!$publisher) {
                     $arguments[] = 'async';
                     if (Backend::Doctrine === $backend) {
-                        $arguments[] = '--sleep=0.001';
+                        $arguments[] = '--sleep=0.05';
                     }
                 }
                 $arguments[] = '--no-ansi';

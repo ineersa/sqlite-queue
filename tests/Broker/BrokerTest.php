@@ -885,15 +885,16 @@ final class BrokerTest extends TestCase
                 $timer = $this->shutdownTimerId($broker);
                 $this->assertNotNull($timer);
                 EventLoop::cancel($timer);
-                $storage = (new \ReflectionProperty($broker, 'storage'))->getValue($broker);
-                $connection = (new \ReflectionProperty($storage, 'connection'))->getValue($storage);
                 $safety = new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS);
-                while (!$connection->isClosed()) {
+                $proxy = (new \ReflectionProperty($broker, 'worker'))->getValue($broker);
+                $this->assertInstanceOf(\Ineersa\SqliteQueue\Sqlite\SqliteQueueWorker::class, $proxy);
+                // Close is in flight against a stopped launcher; wait one turn then escalate.
+                while (!$brokerFuture->isComplete() && !(new \ReflectionProperty($proxy, 'closing'))->getValue($proxy)) {
                     \Amp\delay(0, cancellation: $safety);
                 }
                 $this->assertFalse($brokerFuture->isComplete(), 'Driver close must still await the stopped launcher.');
                 $deadline = (new \ReflectionProperty($broker, 'deadline'))->getValue($broker);
-                $handle = (new \ReflectionProperty($broker, 'worker'))->getValue($broker);
+                $handle = $proxy->handle();
                 (new \ReflectionMethod($broker, 'releaseBudgetAfter'))->invoke($broker, $deadline, $handle->forceStop(...));
                 $outcome = $brokerFuture->catch(static fn (\Throwable $error): string => $error::class);
                 $settled = $outcome->await($safety);
@@ -1011,10 +1012,11 @@ final class BrokerTest extends TestCase
             $peer = $this->rawPeer();
             $peer->write((new Frame(['v' => 1, 'id' => 0, 'op' => 'hello']))->encode());
             $this->assertNotNull(Frame::read($peer, new TimeoutCancellation(10)));
-            $storage = (new \ReflectionProperty(Broker::class, 'storage'))->getValue($broker);
-            $this->assertInstanceOf(\Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage::class, $storage);
+            $worker = (new \ReflectionProperty(Broker::class, 'worker'))->getValue($broker);
+            $this->assertInstanceOf(\Ineersa\SqliteQueue\Sqlite\SqliteQueueWorker::class, $worker);
             // Fail the next storage operation without racing the independent worker-death monitor.
-            (new \ReflectionProperty($storage, 'closed'))->setValue($storage, true);
+            (new \ReflectionProperty($worker, 'failed'))->setValue($worker, true);
+            (new \ReflectionProperty($worker, 'closing'))->setValue($worker, true);
 
             $peer->write((new Frame(['v' => 1, 'id' => 1, 'op' => 'send', 'queue' => 'jobs', 'delay' => 0], 'must fail'))->encode());
             $this->assertNull(Frame::read($peer, new TimeoutCancellation(10)), 'Fatal storage failure must close without writing an error frame.');

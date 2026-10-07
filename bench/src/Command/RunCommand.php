@@ -4,10 +4,10 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Bench\Command;
 
-use Fabpot\Amp\Sqlite\SqliteSynchronousMode;
 use Ineersa\SqliteQueue\Bench\DTO\RunOptionsDTO;
 use Ineersa\SqliteQueue\Bench\Runner;
 use Ineersa\SqliteQueue\Bench\Scenario;
+use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Input\InputOption;
