@@ -29,12 +29,14 @@ final class BrokerFactory
     /** Budget for observing the SQLite worker while a failed startup releases resources, in seconds. */
     private const float RELEASE_BUDGET_SECONDS = 5.0;
 
+    private readonly SqliteWorkerContextFactory $workers;
+
     /**
      * @param SqliteSynchronousMode       $synchronous       NORMAL is the product default; FULL enables stronger commit durability
      * @param int                         $visibilityTimeout redelivery delay in milliseconds; defaults to Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS
      * @param (\Closure(): int)|null      $clock             parent wall-clock milliseconds for notifier timers; never a worker clock
      * @param ?Cancellation               $cancellation      cooperative cancellation for the blocking startup only; serving cancellation stays on Broker::run()
-     * @param ?SqliteWorkerContextFactory $workers           optional factory for tests; production constructs the package default
+     * @param ?SqliteWorkerContextFactory $workers           production uses the package default; tests may inject a controlled-clock bootstrap
      */
     public function __construct(
         private readonly string $database,
@@ -43,11 +45,12 @@ final class BrokerFactory
         private readonly ?\Closure $clock = null,
         private readonly ?Cancellation $cancellation = null,
         private readonly SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal,
-        private readonly ?SqliteWorkerContextFactory $workers = null,
+        ?SqliteWorkerContextFactory $workers = null,
     ) {
         if ($visibilityTimeout <= 0) {
             throw new \InvalidArgumentException('Visibility timeout must be positive milliseconds.');
         }
+        $this->workers = $workers ?? new SqliteWorkerContextFactory();
     }
 
     public function create(): Broker
@@ -64,7 +67,6 @@ final class BrokerFactory
         /** @var list<callable(): void> */
         $release = [];
         $filesystem = new Filesystem();
-        $workers = $this->workers ?? new SqliteWorkerContextFactory();
         try {
             $locks = new BrokerLifetimeLocks($this->database, $this->endpoint);
             $release[] = $locks->close(...);
@@ -78,7 +80,7 @@ final class BrokerFactory
             $budget = null === $this->cancellation
                 ? $startup
                 : new CompositeCancellation($this->cancellation, $startup);
-            $worker = $workers->create(
+            $worker = $this->workers->create(
                 $locks->database,
                 $this->visibilityTimeout,
                 $this->synchronous,
@@ -111,7 +113,7 @@ final class BrokerFactory
             return new Broker($server, $worker, $locks, $socketIdentity, $clock);
         } catch (\Throwable $error) {
             try {
-                $workers->forceStopAll();
+                $this->workers->forceStopAll();
             } catch (\Throwable) {
                 // Best-effort: the original failure is what the caller receives.
             }

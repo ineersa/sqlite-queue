@@ -10,7 +10,6 @@ use Amp\DeferredFuture;
 use Amp\NullCancellation;
 use Ineersa\SqliteQueue\Exception\ClientContextClosedException;
 use Ineersa\SqliteQueue\Sqlite\Exception\StorageCapacityException;
-use Ineersa\SqliteQueue\Sqlite\SqliteQueueWorker;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use Revolt\EventLoop;
 
@@ -46,11 +45,14 @@ final class QueueNotifier
     private bool $closed = false;
 
     /**
-     * @param \Closure(): int            $clock     Unix wall-clock milliseconds
-     * @param \Closure(\Throwable): void $onFailure fail-closed callback for async query or timer faults
+     * @param \Closure(QueueName, ?Cancellation): (?int) $earliestEligibility persisted readiness lookup
+     * @param \Closure(Cancellation): void               $awaitCapacity       waits until admission capacity is available
+     * @param \Closure(): int                            $clock               Unix wall-clock milliseconds
+     * @param \Closure(\Throwable): void                 $onFailure           fail-closed callback for async query or timer faults
      */
     public function __construct(
-        private readonly SqliteQueueWorker $worker,
+        private readonly \Closure $earliestEligibility,
+        private readonly \Closure $awaitCapacity,
         private readonly \Closure $clock,
         private readonly \Closure $onFailure,
     ) {
@@ -201,11 +203,11 @@ final class QueueNotifier
                 return null;
             }
             try {
-                return $this->worker->earliestEligibility($watch->queue);
+                return ($this->earliestEligibility)($watch->queue, null);
             } catch (StorageCapacityException) {
                 // Keep the live watch dirty and retry once capacity frees. Do not poll on a timer.
                 $watch->dirty = true;
-                $this->worker->awaitCapacity(new NullCancellation());
+                ($this->awaitCapacity)(new NullCancellation());
             }
         }
     }

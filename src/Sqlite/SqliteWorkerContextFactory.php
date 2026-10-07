@@ -39,7 +39,6 @@ final class SqliteWorkerContextFactory
         SqliteSynchronousMode $synchronous,
         Cancellation $budget,
     ): SqliteQueueWorker {
-        SqliteQueueStorage::validateSynchronousMode($synchronous);
         if ($visibilityTimeout <= 0) {
             throw new \InvalidArgumentException('Visibility timeout must be positive milliseconds.');
         }

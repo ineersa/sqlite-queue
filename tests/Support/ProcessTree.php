@@ -12,11 +12,13 @@ namespace Ineersa\SqliteQueue\Tests\Support;
  */
 final class ProcessTree
 {
-    /** Path fragment that identifies the persistence worker script in a command line. */
-    public const WORKER_SCRIPT = 'amphp-sqlite3/src/Internal/worker.php';
+    /** Path fragments that identify package worker scripts in a command line. */
+    public const string WORKER_SCRIPT = 'src/Sqlite/worker.php';
+    public const string WORKER_CLOCK_SCRIPT = 'tests/Sqlite/Fixtures/worker-controlled-clock.php';
+    public const string WORKER_PROBE_SCRIPT = 'tests/Broker/Fixtures/persistence-probe.php';
 
     /** Process title that the persistence worker sets for itself. */
-    public const WORKER_TITLE = 'amp-process';
+    public const string WORKER_TITLE = 'amp-process';
 
     public static function available(): bool
     {
@@ -88,7 +90,7 @@ final class ProcessTree
         $pids = [];
 
         foreach ($snapshot as $pid => $process) {
-            if (str_contains($process['cmd'], self::WORKER_SCRIPT)) {
+            if (self::isWorkerCommand($process['cmd'])) {
                 $pids[] = $pid;
             }
         }
@@ -137,5 +139,13 @@ final class ProcessTree
             'launchers' => $launchers,
             'workers' => self::persistenceWorkers($ancestor, $snapshot),
         ];
+    }
+
+    private static function isWorkerCommand(string $command): bool
+    {
+        return str_contains($command, self::WORKER_SCRIPT)
+            || str_contains($command, self::WORKER_CLOCK_SCRIPT)
+            || str_contains($command, self::WORKER_PROBE_SCRIPT)
+            || str_contains($command, 'persistence-env-probe.php');
     }
 }

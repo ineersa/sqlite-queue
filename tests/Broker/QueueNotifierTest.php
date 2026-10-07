@@ -12,12 +12,8 @@ use Amp\TimeoutCancellation;
 use Ineersa\SqliteQueue\Broker\QueueNotifier;
 use Ineersa\SqliteQueue\Broker\QueueNotifierWaiter;
 use Ineersa\SqliteQueue\Broker\QueueNotifierWatch;
-use Ineersa\SqliteQueue\DTO\DeliveryDTO;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
-use Ineersa\SqliteQueue\Sqlite\SqliteQueueWorker;
-use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
-use Ineersa\SqliteQueue\Sqlite\SqliteWorkerHandle;
 use Ineersa\SqliteQueue\Tests\Driver\DriverTestCase;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use Revolt\EventLoop;
@@ -465,10 +461,11 @@ final class QueueNotifierTest extends DriverTestCase
         return new Queue($storage, $visibility, fn (): int => $this->now);
     }
 
-    private function worker(Queue $queue, ?\Closure $onEligibility = null): SqliteQueueWorker
+    private function notifier(Queue $queue, ?\Closure $onEligibility = null): QueueNotifier
     {
-        $worker = $this->createStub(SqliteQueueWorker::class);
-        $worker->method('earliestEligibility')->willReturnCallback(
+        $this->notifier?->close();
+        $this->failures = [];
+        $this->notifier = new QueueNotifier(
             static function (QueueName $name, ?Cancellation $cancellation = null) use ($queue, $onEligibility): ?int {
                 if (null !== $onEligibility) {
                     $onEligibility();
@@ -476,37 +473,9 @@ final class QueueNotifierTest extends DriverTestCase
 
                 return $queue->earliestEligibility($name, $cancellation);
             },
-        );
-        $worker->method('awaitCapacity')->willReturnCallback(static function (Cancellation $cancellation): void {
-            $cancellation->throwIfRequested();
-        });
-        $worker->method('send')->willReturnCallback(
-            static fn (QueueName $name, string $body, string $headers = '', int $delay = 0, ?Cancellation $cancellation = null): int => $queue->send($name, $body, $headers, $delay, $cancellation),
-        );
-        $worker->method('receive')->willReturnCallback(
-            static fn (QueueName $name, string $ownerId, ?Cancellation $cancellation = null): ?DeliveryDTO => $queue->receive($name, $ownerId, $cancellation),
-        );
-        $worker->method('synchronousMode')->willReturn(SqliteSynchronousMode::Normal);
-        $worker->method('configuration')->willReturn([
-            'journal_mode' => 'wal',
-            'synchronous' => 'normal',
-            'busy_timeout' => 5000,
-            'wal_autocheckpoint' => 1000,
-            'sqlite_version' => '3.31.0',
-        ]);
-        $worker->method('handle')->willReturn($this->createStub(SqliteWorkerHandle::class));
-        $worker->method('beginClose')->willReturnCallback(static function (): void {});
-        $worker->method('close')->willReturnCallback(static function (): void {});
-
-        return $worker;
-    }
-
-    private function notifier(Queue $queue, ?\Closure $onEligibility = null): QueueNotifier
-    {
-        $this->notifier?->close();
-        $this->failures = [];
-        $this->notifier = new QueueNotifier(
-            $this->worker($queue, $onEligibility),
+            static function (Cancellation $cancellation): void {
+                $cancellation->throwIfRequested();
+            },
             fn (): int => $this->now,
             function (\Throwable $error): void {
                 $this->failures[] = $error;

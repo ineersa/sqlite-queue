@@ -13,6 +13,7 @@ use Ineersa\SqliteQueue\Broker\Broker;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
 use Ineersa\SqliteQueue\Broker\QueueNotifier;
 use Ineersa\SqliteQueue\Client;
+use Ineersa\SqliteQueue\Sqlite\SqliteWorkerContextFactory;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeProbeMessage;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
@@ -222,7 +223,7 @@ final class NativeConsoleProcessTest extends TestCase
         $client = Client::connect($this->endpoint());
         try {
             $this->assertNull($client->receive('jobs'));
-            $this->now = $expiry;
+            $this->setNow($expiry);
             $delivery = $client->receive('jobs');
             $this->assertNotNull($delivery);
             $envelope = (new PhpSerializer())->decode(['body' => $delivery->body, 'headers' => json_decode($delivery->headers, true, 32, \JSON_THROW_ON_ERROR)]);
@@ -261,12 +262,48 @@ final class NativeConsoleProcessTest extends TestCase
         $this->assertSame($expected, $exit, $diagnostics);
     }
 
+    private function workerFactory(string $databasePath, ?\Closure $clock = null): SqliteWorkerContextFactory
+    {
+        $now = null === $clock ? (int) floor(microtime(true) * 1000) : $clock();
+        $clockFile = $databasePath.'.clock';
+        file_put_contents($clockFile, (string) $now);
+
+        return new SqliteWorkerContextFactory([
+            \dirname(__DIR__).'/Sqlite/Fixtures/worker-controlled-clock.php',
+            (string) $now,
+            $clockFile,
+        ]);
+    }
+
+    private function syncedClock(?\Closure $clock, string $databasePath): ?\Closure
+    {
+        if (null === $clock) {
+            return null;
+        }
+        $clockFile = $databasePath.'.clock';
+
+        return static function () use ($clock, $clockFile): int {
+            $value = $clock();
+            file_put_contents($clockFile, (string) $value);
+
+            return $value;
+        };
+    }
+
+    private function setNow(int $value): void
+    {
+        $this->now = $value;
+        file_put_contents($this->database().'.clock', (string) $value);
+    }
+
     private function startBroker(): void
     {
+        $database = $this->database();
         $broker = (new BrokerFactory(
-            $this->database(),
+            $database,
             $this->endpoint(),
-            clock: fn (): int => $this->now,
+            clock: $this->syncedClock(fn (): int => $this->now, $database),
+            workers: $this->workerFactory($database, fn (): int => $this->now),
         ))->create();
         $this->broker = $broker;
         $ready = new DeferredFuture();

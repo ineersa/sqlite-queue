@@ -17,6 +17,7 @@ use Ineersa\SqliteQueue\Messenger\BrokerConnection;
 use Ineersa\SqliteQueue\Messenger\NativeConsumeWaitSubscriber;
 use Ineersa\SqliteQueue\Messenger\Transport;
 use Ineersa\SqliteQueue\Messenger\TransportFactory;
+use Ineersa\SqliteQueue\Sqlite\SqliteWorkerContextFactory;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\BrokenDecodeSerializer;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\ControllableClock;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Handler\NativeProbeMessageHandler;
@@ -331,7 +332,7 @@ final class NativeIntegrationTest extends TestCase
             $this->publisher()->send(new Envelope(new NativeProbeMessage('later'), [new DelayStamp(50)]));
             $timerId = $this->awaitNotifierDeadline($this->now + 50);
             $this->assertFalse(EventLoop::isEnabled($timerId));
-            $this->now += 50;
+            $this->setNow($this->now + 50);
             $this->fireNotifierTimer($timerId);
 
             $this->assertSame(0, $consume->await(new TimeoutCancellation(self::SAFETY_SECONDS)));
@@ -483,7 +484,7 @@ final class NativeIntegrationTest extends TestCase
             $this->awaitNotifierWaiters(1);
             $timerId = $this->awaitNotifierDeadline($this->now + 50);
             $this->assertFalse(EventLoop::isEnabled($timerId));
-            $this->now += 50;
+            $this->setNow($this->now + 50);
             $this->fireNotifierTimer($timerId);
 
             $this->assertSame(0, $consume->await(new TimeoutCancellation(self::SAFETY_SECONDS)));
@@ -551,7 +552,7 @@ final class NativeIntegrationTest extends TestCase
             ]));
             $this->awaitNotifierWaiters(1);
             $timer = $this->awaitNotifierDeadline($this->now + 50);
-            $this->now += 50;
+            $this->setNow($this->now + 50);
             $this->fireNotifierTimer($timer);
             $this->assertSame(0, $consume->await(new TimeoutCancellation(self::SAFETY_SECONDS)));
             $this->assertSame(2, NativeProbeMessageHandler::$attempts);
@@ -602,7 +603,7 @@ final class NativeIntegrationTest extends TestCase
             $this->startBroker();
             $this->assertSame([], iterator_to_array($this->transport()->get()));
             $this->assertGreaterThan($this->now, $availableAt);
-            $this->now = $availableAt;
+            $this->setNow($availableAt);
 
             $exit = $this->runConsume([
                 'command' => 'messenger:consume',
@@ -697,6 +698,41 @@ final class NativeIntegrationTest extends TestCase
         return $this->bootKernel()->getContainer()->get('event_dispatcher');
     }
 
+    private function workerFactory(string $databasePath, ?\Closure $clock = null): SqliteWorkerContextFactory
+    {
+        $now = null === $clock ? (int) floor(microtime(true) * 1000) : $clock();
+        $clockFile = $databasePath.'.clock';
+        file_put_contents($clockFile, (string) $now);
+
+        return new SqliteWorkerContextFactory([
+            \dirname(__DIR__).'/Sqlite/Fixtures/worker-controlled-clock.php',
+            (string) $now,
+            $clockFile,
+        ]);
+    }
+
+    private function syncedClock(?\Closure $clock, string $databasePath): ?\Closure
+    {
+        if (null === $clock) {
+            return null;
+        }
+        $clockFile = $databasePath.'.clock';
+
+        return static function () use ($clock, $clockFile): int {
+            $value = $clock();
+            file_put_contents($clockFile, (string) $value);
+
+            return $value;
+        };
+    }
+
+    private function setNow(int $value): void
+    {
+        $this->now = $value;
+        $database = $this->database?->path() ?? throw new \LogicException('Missing database.');
+        file_put_contents($database.'.clock', (string) $value);
+    }
+
     private function startBroker(): void
     {
         $database = $this->database?->path() ?? throw new \LogicException('Missing database.');
@@ -705,7 +741,8 @@ final class NativeIntegrationTest extends TestCase
             $database,
             $this->endpoint,
             5_000,
-            fn (): int => $this->now,
+            $this->syncedClock(fn (): int => $this->now, $database),
+            workers: $this->workerFactory($database, fn (): int => $this->now),
         ))->create();
         $this->brokerFuture = async(fn (): int => $this->broker->run(static function (array $event) use ($ready): void {
             if (!$ready->isComplete()) {

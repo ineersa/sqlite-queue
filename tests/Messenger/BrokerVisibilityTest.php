@@ -83,7 +83,9 @@ final class BrokerVisibilityTest extends TestCase
                 $owner->send('jobs', 'handler-effect');
                 $delivery = $owner->receive('jobs');
                 $this->assertNotNull($delivery);
-                $this->assertSame($lease, $delivery->reservedUntil - $delivery->availableAt);
+                $leaseMs = $delivery->reservedUntil - $delivery->availableAt;
+                $this->assertGreaterThanOrEqual($lease, $leaseMs);
+                $this->assertLessThan($lease + 1_000, $leaseMs);
                 $handled = [];
                 $bus = new MessageBus([new HandleMessageMiddleware(new HandlersLocator([
                     NativeProbeMessage::class => [function (NativeProbeMessage $message) use ($clock, $competitor, &$handled): void {

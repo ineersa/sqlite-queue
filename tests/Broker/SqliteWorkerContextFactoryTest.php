@@ -8,6 +8,7 @@ use Amp\ByteStream\PendingReadError;
 use Amp\CancelledException;
 use Amp\DeferredCancellation;
 use Amp\TimeoutCancellation;
+use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 use Ineersa\SqliteQueue\Sqlite\SqliteWorkerContextFactory;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
@@ -20,11 +21,12 @@ use function Amp\async;
 final class SqliteWorkerContextFactoryTest extends TestCase
 {
     /** Path fragment that identifies this test's probe child in the process tree. */
-    private const PROBE_SCRIPT = 'persistence-probe.php';
+    private const string PROBE_SCRIPT = 'persistence-probe.php';
 
     private ?SqliteWorkerContextFactory $factory = null;
     private ?int $probePid = null;
     private ?int $launcherPid = null;
+    private ?IsolatedDatabase $database = null;
 
     protected function tearDown(): void
     {
@@ -45,31 +47,34 @@ final class SqliteWorkerContextFactoryTest extends TestCase
             $this->factory = null;
             $this->probePid = null;
             $this->launcherPid = null;
+            $this->database?->remove();
+            $this->database = null;
             parent::tearDown();
         }
     }
 
     public function testForceStopAllKillsSpawnedChildrenWithoutJoining(): void
     {
-        if (!method_exists(SqliteWorkerContextFactory::class, 'start')) {
-            $this->markTestSkipped('IPC factory create() replaces ContextFactory::start(); rewrite this probe after worker merge.');
-        }
         if (!ProcessTree::available()) {
             $this->markTestSkipped('The /proc filesystem is unavailable.');
         }
         async(function (): void {
-            $factory = new SqliteWorkerContextFactory();
+            $factory = new SqliteWorkerContextFactory([__DIR__.'/Fixtures/persistence-probe.php']);
             $this->factory = $factory;
-            $context = $factory->start([__DIR__.'/Fixtures/persistence-probe.php'], new TimeoutCancellation(10));
-            // Readiness comes from the child itself, not from a sleep: a child that dies
-            // naturally can never send this.
-            $this->assertSame('ready', $context->receive(new TimeoutCancellation(10)));
+            $database = $this->database();
+            // create() is the production startup path. The probe ignores init and reports ready.
+            $worker = $factory->create(
+                $database->path(),
+                5_000,
+                SqliteSynchronousMode::Normal,
+                new TimeoutCancellation(10),
+            );
             $this->assertCount(1, $factory->created());
-            $pid = $factory->worker()->pid();
+            $pid = $worker->handle()->pid();
             $this->probePid = $pid;
             $this->assertArrayHasKey($pid, ProcessTree::snapshot(), 'The spawned child must be observable before the kill.');
 
-            // The driver alone joins its contexts; the factory only guarantees no survivor.
+            // The factory only guarantees no survivor; AMPHP owns process reaping.
             $factory->forceStopAll();
             $deadline = microtime(true) + 5;
             do {
@@ -84,19 +89,22 @@ final class SqliteWorkerContextFactoryTest extends TestCase
 
     public function testShutdownBudgetCancelsPipeReadsAndReleasesTheirWatchers(): void
     {
-        if (!method_exists(SqliteWorkerContextFactory::class, 'start')) {
-            $this->markTestSkipped('IPC factory create() replaces ContextFactory::start(); rewrite this probe after worker merge.');
-        }
         if (!ProcessTree::available()) {
             $this->markTestSkipped('The /proc filesystem is unavailable.');
         }
         async(function (): void {
-            $factory = new SqliteWorkerContextFactory();
+            $factory = new SqliteWorkerContextFactory([__DIR__.'/Fixtures/persistence-probe.php']);
             $this->factory = $factory;
-            $context = $factory->start([__DIR__.'/Fixtures/persistence-probe.php'], new TimeoutCancellation(10));
-            $this->assertSame('ready', $context->receive(new TimeoutCancellation(10)));
-            $worker = $factory->worker();
-            $this->probePid = $worker->pid();
+            $database = $this->database();
+            $worker = $factory->create(
+                $database->path(),
+                5_000,
+                SqliteSynchronousMode::Normal,
+                new TimeoutCancellation(10),
+            );
+            $handle = $worker->handle();
+            $this->probePid = $handle->pid();
+            $context = $handle->context();
 
             // The drain reads are queued tasks, so run the loop once to put both pipes under a
             // watcher that keeps the loop alive.
@@ -104,7 +112,7 @@ final class SqliteWorkerContextFactoryTest extends TestCase
             $watched = $this->enabledReadableWatchers();
             $this->assertCount(2, $watched, 'Both pipe reads must hold an enabled, referenced watcher before shutdown.');
 
-            $launcher = $this->launcherFor($worker->pid());
+            $launcher = $this->launcherFor($handle->pid());
             if (null === $launcher) {
                 $this->fail('The probe child must run behind the shell launcher Amp creates for it.');
             }
@@ -119,7 +127,7 @@ final class SqliteWorkerContextFactoryTest extends TestCase
                 // A stopped launcher holds the pipe write ends, so the pipes never reach EOF and
                 // only the shared budget can end the wait.
                 $budget = new DeferredCancellation();
-                $closing = async(static fn () => $worker->close($budget->getCancellation()));
+                $closing = async(static fn () => $handle->close($budget->getCancellation()));
                 $this->turnEventLoop();
                 $this->assertFalse($closing->isComplete(), 'Open pipe writers must keep close pending.');
                 $budget->cancel();
@@ -184,12 +192,20 @@ final class SqliteWorkerContextFactoryTest extends TestCase
             putenv('PHP_INI_SCAN_DIR='.(\is_string($existingScan) && '' !== $existingScan ? $existingScan.':' : ':').$scan->directory());
 
             async(function () use ($marker, $directive, $markerValue, $configValue, $temporary): void {
-                $factory = new SqliteWorkerContextFactory();
+                $factory = new SqliteWorkerContextFactory([
+                    __DIR__.'/Fixtures/persistence-env-probe.php',
+                    $marker,
+                    $directive,
+                ]);
                 $this->factory = $factory;
-                $context = $factory->start(
-                    [__DIR__.'/Fixtures/persistence-env-probe.php', $marker, $directive],
+                $database = $this->database();
+                $worker = $factory->create(
+                    $database->path(),
+                    5_000,
+                    SqliteSynchronousMode::Normal,
                     new TimeoutCancellation(10),
                 );
+                $context = $worker->handle()->context();
                 $report = $context->receive(new TimeoutCancellation(10));
                 $this->assertIsArray($report);
                 $this->assertSame(\PHP_BINARY, $report['php_binary'] ?? null, 'The child must run the broker interpreter.');
@@ -199,8 +215,7 @@ final class SqliteWorkerContextFactoryTest extends TestCase
                 $this->assertSame($configValue, $report['config'] ?? null, 'The child must read the broker PHP configuration.');
                 $this->assertTrue($report['sqlite3'] ?? null, 'The child must keep loading sqlite3 from the scan directory.');
 
-                // The driver joins the contexts of its own connections. This probe has no other
-                // join owner, so joining here proves a clean exit instead of a kill.
+                // This probe has no queue operations; joining here proves a clean exit instead of a kill.
                 $this->assertNull($context->join(new TimeoutCancellation(10)));
             })->await(new TimeoutCancellation(20));
         } finally {
@@ -218,23 +233,29 @@ final class SqliteWorkerContextFactoryTest extends TestCase
     /** Runs one turn of the event loop so queued tasks and stream watchers reach a steady state. */
     private function turnEventLoop(): void
     {
-        async(static function (): void {
-        })->await(new TimeoutCancellation(2));
+        $suspension = EventLoop::getSuspension();
+        $id = EventLoop::defer(static function () use ($suspension): void {
+            $suspension->resume();
+        });
+        try {
+            $suspension->suspend();
+        } finally {
+            EventLoop::cancel($id);
+        }
     }
 
-    /** @return list<string> Readable watchers that currently keep the loop alive. */
+    /** @return list<string> */
     private function enabledReadableWatchers(): array
     {
         $driver = EventLoop::getDriver();
-        $identifiers = [];
+        $watched = [];
         foreach ($driver->getIdentifiers() as $id) {
-            if (CallbackType::Readable !== $driver->getType($id) || !$driver->isEnabled($id) || !$driver->isReferenced($id)) {
-                continue;
+            if (CallbackType::Readable === $driver->getType($id) && $driver->isEnabled($id) && $driver->isReferenced($id)) {
+                $watched[] = $id;
             }
-            $identifiers[] = $id;
         }
 
-        return $identifiers;
+        return $watched;
     }
 
     /** The shell Amp starts around the probe child, which holds the pipes this test keeps open. */
@@ -291,5 +312,10 @@ final class SqliteWorkerContextFactoryTest extends TestCase
             @posix_kill($this->launcherPid, \SIGKILL);
         }
         $this->launcherPid = null;
+    }
+
+    private function database(): IsolatedDatabase
+    {
+        return $this->database ??= new IsolatedDatabase();
     }
 }

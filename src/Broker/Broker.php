@@ -61,10 +61,15 @@ final class Broker
         private readonly \Closure $clock,
     ) {
         $this->deadline = new DeferredCancellation();
-        $this->notifier = new QueueNotifier($this->worker, $this->clock, function (\Throwable $error): void {
-            $this->failed = true;
-            $this->stop();
-        });
+        $this->notifier = new QueueNotifier(
+            $this->worker->earliestEligibility(...),
+            $this->worker->awaitCapacity(...),
+            $this->clock,
+            function (\Throwable $error): void {
+                $this->failed = true;
+                $this->stop();
+            },
+        );
     }
 
     /**
