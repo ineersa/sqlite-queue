@@ -14,12 +14,15 @@ Smoke verifies wiring, payloads, accounting, and cleanup. It is not performance 
 
 ## Measure a workload
 
-The available workloads are `roundtrip`, `concurrent`, `application`, `idle`, and `retention`. Controls are `--workload`, `--smoke`, `--duration`, and `--synchronous`.
+The available workloads are `roundtrip`, `concurrent`, `application`, `idle`, and `retention`. Controls are `--workload`, `--smoke`, `--duration`, `--synchronous`, and `--polling-ms`.
+
+`--polling-ms` sets Doctrine's idle poll interval in integer milliseconds, from 1 to 1000. The default is 50 ms. Use 1000 for Symfony's one-second polling comparison. Broker consumers use notification WAIT in both cases. Each capture records the selected interval.
 
 ```sh
 	XDEBUG_MODE=off vendor/bin/castor bench --workload=roundtrip --duration=60 --synchronous=normal
 	XDEBUG_MODE=off vendor/bin/castor bench --workload=roundtrip --duration=60 --synchronous=full
 	XDEBUG_MODE=off vendor/bin/castor bench --workload=concurrent --synchronous=normal
+	XDEBUG_MODE=off vendor/bin/castor bench --workload=concurrent --synchronous=normal --polling-ms=1000
 	XDEBUG_MODE=off vendor/bin/castor bench --workload=application --duration=60
 	XDEBUG_MODE=off vendor/bin/castor bench --workload=idle --duration=60
 	XDEBUG_MODE=off vendor/bin/castor bench --workload=retention

@@ -36,8 +36,12 @@ final class RunCommand extends Command
         if (null === $synchronous) {
             throw new \InvalidArgumentException('Synchronous mode must be normal or full.');
         }
+        $polling = filter_var($input->getOption('polling-ms'), \FILTER_VALIDATE_INT);
+        if (false === $polling) {
+            throw new \InvalidArgumentException('Doctrine polling interval must be integer milliseconds.');
+        }
 
-        return new RunOptionsDTO($scenario, true === $input->getOption('smoke'), (float) $duration, $synchronous);
+        return new RunOptionsDTO($scenario, true === $input->getOption('smoke'), (float) $duration, $synchronous, $polling);
     }
 
     protected function configure(): void
@@ -46,6 +50,7 @@ final class RunCommand extends Command
             ->addOption('workload', null, InputOption::VALUE_REQUIRED, 'roundtrip, concurrent, application, idle or retention.', 'roundtrip')
             ->addOption('smoke', null, InputOption::VALUE_NONE, 'Tiny control-path checks, not performance evidence.')
             ->addOption('duration', null, InputOption::VALUE_REQUIRED, 'Measured window in seconds.', (string) RunOptionsDTO::DEFAULT_DURATION_SECONDS)
+            ->addOption('polling-ms', null, InputOption::VALUE_REQUIRED, 'Doctrine idle poll interval, 1..1000 milliseconds. Broker uses WAIT.', (string) RunOptionsDTO::DEFAULT_DOCTRINE_POLLING_MILLISECONDS)
             ->addOption('synchronous', null, InputOption::VALUE_REQUIRED, 'WAL synchronous mode for both backends: normal or full.', 'normal');
     }
 

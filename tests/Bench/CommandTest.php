@@ -25,7 +25,7 @@ final class CommandTest extends TestCase
         $this->assertStringContainsString('--smoke', $tester->getDisplay());
         $this->assertStringContainsString('--workload', $tester->getDisplay());
         $this->assertStringContainsString('roundtrip', $tester->getDisplay());
-        $this->assertSame(['workload', 'smoke', 'duration', 'synchronous'], array_keys((new RunCommand())->getDefinition()->getOptions()));
+        $this->assertSame(['workload', 'smoke', 'duration', 'polling-ms', 'synchronous'], array_keys((new RunCommand())->getDefinition()->getOptions()));
     }
 
     public function testRemovedWorkloadsAreRejectedBeforeAcquisition(): void
@@ -47,6 +47,7 @@ final class CommandTest extends TestCase
         $options = RunCommand::options(new \Symfony\Component\Console\Input\ArrayInput([], $command->getDefinition()));
         $this->assertSame(60.0, $options->durationSeconds);
         $this->assertSame('normal', $options->synchronous->value);
+        $this->assertSame(50, $options->doctrinePollingMilliseconds);
         $this->assertCount(2, $options->schedule());
         $this->assertSame(['doctrine', 'broker'], array_column($options->schedule(), 'backend'));
     }

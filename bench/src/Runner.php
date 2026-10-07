@@ -128,7 +128,7 @@ final class Runner
         $broker = new ChildProcess([\PHP_BINARY, $root.'/bin/sqlite-queue', 'broker', '--database='.$database, '--endpoint='.$short.'/broker.sock', '--redeliver-timeout='.Config::REDELIVER_TIMEOUT_S, '--synchronous='.$this->options->synchronous->value, '--no-ansi'], env: Process::environment(), timeout: $this->options->processTimeoutSeconds());
         $consumerArguments = [\PHP_BINARY, __DIR__.'/console.php', 'messenger:consume', 'async', '--no-ansi', '--no-interaction'];
         if (Backend::Doctrine === $backend) {
-            $consumerArguments[] = '--sleep=0.05';
+            $consumerArguments[] = '--sleep='.($this->options->doctrinePollingMilliseconds / 1000);
         }
         $consumer = new ChildProcess($consumerArguments, timeout: $this->options->processTimeoutSeconds());
         $kernel = new Kernel($directory);
@@ -704,7 +704,7 @@ final class Runner
         $environment['BENCH_TELEMETRY'] = $directory.'/results.operations.jsonl';
         $arguments = [\PHP_BINARY, __DIR__.'/console.php', 'messenger:consume', 'results', '--no-ansi', '--no-interaction'];
         if (Backend::Doctrine === $backend) {
-            $arguments[] = '--sleep=0.05';
+            $arguments[] = '--sleep='.($this->options->doctrinePollingMilliseconds / 1000);
         }
         $process = new ChildProcess($arguments, env: Process::environment($environment), timeout: $this->options->processTimeoutSeconds());
         try {

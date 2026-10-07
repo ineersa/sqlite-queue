@@ -24,6 +24,32 @@ final class ModeAndDefaultsTest extends TestCase
         }
     }
 
+    public function testPollingIntervalsAreRecordedExplicitly(): void
+    {
+        $command = new RunCommand();
+        foreach ([50, 1000] as $milliseconds) {
+            $options = RunCommand::options(new ArrayInput(['--polling-ms' => (string) $milliseconds], $command->getDefinition()));
+            $this->assertSame($milliseconds, $options->doctrinePollingMilliseconds);
+            $this->assertSame($milliseconds, $options->configuration()['doctrine_polling_milliseconds']);
+        }
+    }
+
+    public static function invalidPollingIntervals(): iterable
+    {
+        yield 'fractional milliseconds' => ['0.05', 'integer milliseconds'];
+        yield 'zero' => ['0', 'positive milliseconds'];
+        yield 'above comparison limit' => ['1001', 'not exceed 1000'];
+    }
+
+    #[DataProvider('invalidPollingIntervals')]
+    public function testInvalidPollingIntervalFailsBeforeExecution(string $milliseconds, string $message): void
+    {
+        $command = new RunCommand();
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage($message);
+        RunCommand::options(new ArrayInput(['--polling-ms' => $milliseconds], $command->getDefinition()));
+    }
+
     public static function modes(): iterable
     {
         yield ['normal', 1];

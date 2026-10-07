@@ -73,8 +73,9 @@ function bench(
     #[AsOption(description: 'Roundtrip, concurrent, application, idle or retention.')] string $workload = 'roundtrip',
     #[AsOption(description: 'Measured window in seconds.')] float $duration = 60,
     #[AsOption(description: 'WAL synchronous mode for both backends: normal or full.')] string $synchronous = 'normal',
+    #[AsOption(description: 'Doctrine idle poll interval in milliseconds; broker uses WAIT.')] string $pollingMs = '50',
 ): int {
-    $command = [\PHP_BINARY, 'bin/benchmark', 'run', '--no-ansi', '--no-interaction', '--workload='.$workload, '--duration='.$duration, '--synchronous='.$synchronous];
+    $command = [\PHP_BINARY, 'bin/benchmark', 'run', '--no-ansi', '--no-interaction', '--workload='.$workload, '--duration='.$duration, '--synchronous='.$synchronous, '--polling-ms='.$pollingMs];
     if ($smoke) {
         $command[] = '--smoke';
     }

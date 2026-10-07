@@ -14,6 +14,8 @@ use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 final readonly class RunOptionsDTO
 {
     public const DEFAULT_DURATION_SECONDS = 60.0;
+    public const DEFAULT_DOCTRINE_POLLING_MILLISECONDS = 50;
+    public const MAX_DOCTRINE_POLLING_MILLISECONDS = 1_000;
     public const DRAIN_TIMEOUT_SECONDS = 15;
     public const WARMUP_TIMEOUT_SECONDS = 20;
     public const APPLICATION_RATE = 5;
@@ -21,8 +23,20 @@ final readonly class RunOptionsDTO
     public const HANDLER_MILLISECONDS = 100;
     public const SETTLING_SECONDS = 0.1;
 
-    public function __construct(public Scenario $scenario, public bool $smoke, public float $durationSeconds, public SqliteSynchronousMode $synchronous)
-    {
+    /** Doctrine defaults to Hatfield's 50 ms poll; broker consumers keep notification WAIT. */
+    public function __construct(
+        public Scenario $scenario,
+        public bool $smoke,
+        public float $durationSeconds,
+        public SqliteSynchronousMode $synchronous,
+        public int $doctrinePollingMilliseconds = self::DEFAULT_DOCTRINE_POLLING_MILLISECONDS,
+    ) {
+        if ($doctrinePollingMilliseconds <= 0) {
+            throw new \InvalidArgumentException('Doctrine polling interval must be positive milliseconds.');
+        }
+        if ($doctrinePollingMilliseconds > self::MAX_DOCTRINE_POLLING_MILLISECONDS) {
+            throw new \InvalidArgumentException('Doctrine polling interval must not exceed 1000 milliseconds.');
+        }
         if (!is_finite($durationSeconds)) {
             throw new \InvalidArgumentException('Duration must be finite seconds.');
         }
@@ -46,7 +60,7 @@ final readonly class RunOptionsDTO
     /** @return array<string, mixed> */
     public function configuration(): array
     {
-        $settings = ['workload' => $this->scenario->value, 'mode' => $this->smoke ? 'smoke' : 'measured', 'smoke' => $this->smoke, 'duration_seconds' => $this->durationSeconds, 'synchronous_desired' => $this->synchronous->value, 'clock_basis' => 'same-host hrtime nanoseconds; elapsed spans, not wall time'];
+        $settings = ['workload' => $this->scenario->value, 'mode' => $this->smoke ? 'smoke' : 'measured', 'smoke' => $this->smoke, 'duration_seconds' => $this->durationSeconds, 'synchronous_desired' => $this->synchronous->value, 'doctrine_polling_milliseconds' => $this->doctrinePollingMilliseconds, 'clock_basis' => 'same-host hrtime nanoseconds; elapsed spans, not wall time'];
 
         return $settings + match ($this->scenario) {
             Scenario::Application => ['rate' => self::APPLICATION_RATE, 'handler_milliseconds' => self::HANDLER_MILLISECONDS, 'capacity' => self::APPLICATION_CAPACITY],
