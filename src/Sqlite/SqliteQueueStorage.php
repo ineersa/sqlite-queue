@@ -137,6 +137,37 @@ final class SqliteQueueStorage
     }
 
     /**
+     * Immutable readback from the owning connection.
+     *
+     * @return array{
+     *     journal_mode: string,
+     *     synchronous: string,
+     *     busy_timeout: int,
+     *     wal_autocheckpoint: int,
+     *     sqlite_version: string
+     * }
+     */
+    public function configuration(): array
+    {
+        $connection = $this->requireConnection();
+        $synchronous = $this->synchronousMode();
+
+        return [
+            'journal_mode' => (string) $connection->query('PRAGMA journal_mode')->fetchColumn(),
+            'synchronous' => $synchronous->value,
+            'busy_timeout' => (int) $connection->query('PRAGMA busy_timeout')->fetchColumn(),
+            'wal_autocheckpoint' => (int) $connection->query('PRAGMA wal_autocheckpoint')->fetchColumn(),
+            'sqlite_version' => (string) $connection->query('SELECT sqlite_version()')->fetchColumn(),
+        ];
+    }
+
+    public static function validateSynchronousMode(SqliteSynchronousMode $synchronous): void
+    {
+        // Enum already bounds the accepted set; keep the call site explicit for CLI/bundle wiring.
+        unset($synchronous);
+    }
+
+    /**
      * Insert one message after sampling availability inside the write transaction.
      *
      * @param \Closure(): int $availableAt

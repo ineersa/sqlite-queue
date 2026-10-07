@@ -7,25 +7,24 @@ namespace Ineersa\SqliteQueue\Sqlite;
 use Amp\Cancellation;
 use Amp\DeferredCancellation;
 use Amp\Future;
+use Amp\NullCancellation;
+use Amp\Parallel\Context\ContextException;
 use Amp\Parallel\Context\ProcessContext;
 
+use function Amp\async;
+
 /**
- * Observable handle for the same SQLite worker the vendor connector starts.
+ * Lifecycle owner for one package PDO worker process.
  *
- * Vendor SqliteConnector calls SqliteWorkerContextFactory, which delegates to Amp and retains
- * this handle to that same worker. The driver alone owns joining the process context. This
- * handle supplies independent observation and termination because the locked driver's idle
- * graceful close has no timeout, marks the connection closed before awaiting, and cannot be
- * interrupted by repeating close(). Temporary integration workaround until the driver offers
- * a bounded close/abort API; not a replacement SQL driver.
- *
- * Always constructed with a live process: creation belongs to SqliteWorkerContextFactory.
- *
- * The handle owns the token that stops its pipe reads. Cancelling those reads releases
- * the readability watchers they hold, which is what lets the broker process exit.
+ * Owns pipe drains and joins the process context at most once. Forced termination uses
+ * ProcessContext::close() and tolerates the expected missing-result failure. AMPHP owns
+ * underlying process-exit tracking.
  */
 final class SqliteWorkerHandle
 {
+    /** @var Future<mixed>|null */
+    private ?Future $joined = null;
+
     /**
      * @param ProcessContext<mixed, mixed, mixed> $context
      * @param list<Future<void>>                  $drains
@@ -42,7 +41,7 @@ final class SqliteWorkerHandle
         return $this->context->getPid();
     }
 
-    /** The driver owns join(); observing pipe EOF avoids joining its context twice. */
+    /** Observe pipe EOF. This is not proof that the process has been reaped. */
     public function awaitExit(): void
     {
         foreach ($this->drains as $drain) {
@@ -51,45 +50,90 @@ final class SqliteWorkerHandle
     }
 
     /**
-     * Kill the owned child without joining it.
+     * Join the process context once and share that outcome.
      *
-     * A repeated connection close() cannot stop a worker that stopped answering: the driver
-     * marks its connection closed before the graceful close returns, and a later close()
-     * returns immediately. ProcessContext::close() kills the child unconditionally, so it
-     * works even though the channel flag can read closed while the worker still runs.
+     * After SIGKILL the join may throw before the underlying process wait because the
+     * worker cannot send its return-value message. Callers must tolerate that path and
+     * must never retry this method.
      */
+    public function join(?Cancellation $cancellation = null): mixed
+    {
+        $this->joined ??= async(function (): mixed {
+            try {
+                return $this->context->join();
+            } catch (ContextException $error) {
+                // Forced termination commonly loses the exit-result message. AMPHP still
+                // tracks process exit; treat the missing result as an expected terminal state.
+                return $error;
+            }
+        });
+
+        return $this->joined->await($cancellation ?? new NullCancellation());
+    }
+
+    /** Kill the owned child without joining it. */
     public function forceStop(): void
     {
         $this->context->close();
     }
 
     /**
-     * Kill the owned child, then observe its pipes until EOF or the shared budget expires.
+     * Force-stop the child, then observe pipes until EOF or the shared budget expires.
      *
-     * Cancellation is required: this runs inside a shutdown budget, and a timeout created here
-     * would extend that budget behind the caller's back. The pipes can outlive the child, so the
-     * observation must be bounded — a shell launcher that never exits keeps their write ends
-     * open, and EOF never arrives.
+     * Cancellation is required: this runs inside a shutdown budget. A timeout created here
+     * would extend that budget behind the caller's back.
      */
     public function close(Cancellation $budget): void
     {
-        // The child must be gone even when the graceful close or a drain gives up.
         $this->forceStop();
+        try {
+            // Absorb the expected missing-result exception once without retrying join().
+            $this->join($budget);
+        } catch (\Throwable) {
+        }
         try {
             foreach ($this->drains as $drain) {
                 $drain->await($budget);
             }
         } finally {
-            // Cancel the pipe reads before dropping their futures. A read that stays pending holds
-            // an enabled, referenced readability watcher, and the event loop cannot exit while such
-            // a watcher remains, so releasing the pipes is what lets the broker process stop.
             $this->drainCancellation->cancel();
-            // A pipe still open past the budget is abandoned: nothing can act on its result
-            // after shutdown, so its error must not reach the event loop handler.
             foreach ($this->drains as $drain) {
                 $drain->ignore();
             }
             $this->drains = [];
         }
+    }
+
+    /**
+     * Join a gracefully exited child once, then release owned pipe readers.
+     *
+     * Use this after a successful close exchange. Forced termination still uses close().
+     */
+    public function finish(Cancellation $budget): void
+    {
+        try {
+            $this->join($budget);
+        } finally {
+            try {
+                foreach ($this->drains as $drain) {
+                    $drain->await($budget);
+                }
+            } finally {
+                $this->drainCancellation->cancel();
+                foreach ($this->drains as $drain) {
+                    $drain->ignore();
+                }
+                $this->drains = [];
+            }
+        }
+    }
+
+    /** Expose the live process channel for the parent proxy. */
+    /**
+     * @return ProcessContext<mixed, mixed, mixed>
+     */
+    public function context(): ProcessContext
+    {
+        return $this->context;
     }
 }

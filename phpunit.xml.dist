@@ -17,6 +17,9 @@
         <testsuite name="queue">
             <directory>tests/Queue</directory>
         </testsuite>
+        <testsuite name="sqlite">
+            <directory>tests/Sqlite</directory>
+        </testsuite>
         <testsuite name="driver">
             <directory>tests/Driver</directory>
         </testsuite>
