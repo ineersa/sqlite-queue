@@ -49,10 +49,10 @@ function test_flex(): int
     return report('test:flex', ['bash', 'tests/Messenger/Fixtures/flex-install.sh'], timeout: null);
 }
 
-#[AsTask(name: 'test:driver', namespace: '', description: 'Run async-driver tests; save JUnit XML and logs.')]
-function test_driver(#[AsOption(description: 'PHPUnit test-name filter.')] ?string $filter = null): int
+#[AsTask(name: 'test:sqlite', namespace: '', description: 'Run package SQLite worker and storage tests; save JUnit XML and logs.')]
+function test_sqlite(#[AsOption(description: 'PHPUnit test-name filter.')] ?string $filter = null): int
 {
-    return run_tests('test:driver', 'driver', $filter);
+    return run_tests('test:sqlite', 'sqlite', $filter);
 }
 
 #[AsTask(name: 'test:bench', namespace: '', description: 'Run benchmark correctness tests; save JUnit XML and logs.')]

@@ -20,9 +20,6 @@
         <testsuite name="sqlite">
             <directory>tests/Sqlite</directory>
         </testsuite>
-        <testsuite name="driver">
-            <directory>tests/Driver</directory>
-        </testsuite>
         <testsuite name="benchmark">
             <directory>tests/Bench</directory>
         </testsuite>
