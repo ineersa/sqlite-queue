@@ -6,11 +6,11 @@ Run the broker as a separate process. Applications send messages through the PHP
 
 ## Requirements
 
-- PHP `^8.5` and `ext-sqlite3`, with SQLite 3.31.0 or newer.
+- PHP `^8.5` and `ext-pdo_sqlite`, with SQLite 3.31.0 or newer.
 - Unix sockets and `ext-posix` for the broker. The broker command also requires `ext-pcntl`.
 - Symfony `^8.0`. FrameworkBundle is required for Symfony application integration, but not for standalone client use.
 
-Composer installs the runtime dependencies, including Amp, Revolt, the async SQLite driver, and Symfony Messenger, Console, Clock, Lock, and Filesystem. Doctrine is not a runtime dependency.
+Composer installs the runtime dependencies, including Amp, Revolt, and Symfony Messenger, Console, Clock, Lock, and Filesystem. Doctrine is not a runtime dependency.
 
 The package is not published on Packagist. Install it through a Composer VCS or path repository. See [Configure and run Messenger](docs/messenger-setup.md).
 
@@ -33,6 +33,7 @@ Start the broker with `vendor/bin/sqlite-queue broker`, then connect with `Clien
 - Reservations expire after 60 seconds by default. Configure `--redeliver-timeout` for your handlers. There is no automatic lease renewal.
 - A connection failure can hide a committed operation. The client does not reconnect or replay it automatically.
 - A receipt belongs to the connection that received it. A replacement connection cannot acknowledge an old receipt.
+- Cancellation stops an operation before the broker dispatches it to the SQLite worker. After dispatch, the operation may still commit. An ACK can therefore succeed after the client disconnects. Send delay starts after the worker acquires its write transaction.
 
 See [Package contracts](docs/contracts.md) for the full guarantees and limits.
 
@@ -40,7 +41,7 @@ See [Package contracts](docs/contracts.md) for the full guarantees and limits.
 
 - [Broker protocol](docs/broker-protocol.md): framing, limits, errors, and connection recovery.
 - [Queue engine](docs/queue-engine.md): PHP APIs, schema, and reservation checks.
-- [SQLite driver behavior](docs/driver-verification.md): process model and transaction restrictions.
+- [SQLite worker](docs/sqlite-worker.md): process model, budgets, and durability modes.
 - [Benchmark runner](bench/README.md): run paired Doctrine SQLite and broker Messenger workloads.
 - [Benchmark method](docs/benchmark-method.md) and [baseline results](docs/benchmark-baseline.md): measurement definitions and limitations. These results do not establish a broker performance advantage.
 - [Doctrine and broker comparison](docs/benchmark-comparison.md): measured results, failures, and the archived paired capture.

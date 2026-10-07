@@ -4,9 +4,9 @@ This reference describes the supported APIs and delivery guarantees. The [protoc
 
 ## Supported environment
 
-The package requires PHP `^8.5`, `ext-sqlite3`, and SQLite 3.31.0 or newer. Symfony components use `^8.0`. FrameworkBundle is required for bundle integration, not for standalone use. Broker execution requires Unix sockets and `ext-posix`; its command also requires `ext-pcntl`.
+The package requires PHP `^8.5`, `ext-pdo_sqlite`, and SQLite 3.31.0 or newer. Symfony components use `^8.0`. FrameworkBundle is required for bundle integration, not for standalone use. Broker execution requires Unix sockets and `ext-posix`; its command also requires `ext-pcntl`.
 
-The package uses `fabpot/amphp-sqlite3` as its async SQLite driver. Each connection has a separate SQLite worker process. See [SQLite driver behavior](driver-verification.md) for transaction restrictions and observed compatibility.
+The broker keeps one persistent Amp child that owns native PDO SQLite. Queue policy and fixed prepared statements run in that child. The parent remains asynchronous for sockets, WAIT, and process supervision. See [SQLite worker](sqlite-worker.md).
 
 Doctrine DBAL and Doctrine Messenger are not runtime dependencies. Applications that choose a Doctrine failure transport install those dependencies themselves.
 
@@ -28,7 +28,7 @@ The writing connection uses WAL and synchronous NORMAL by default. NORMAL preser
 
 Choose synchronous FULL for stronger commit durability across OS crashes and power loss, assuming storage honors synchronization. Durability still depends on SQLite, the filesystem, and the host. A process-crash or reopen check does not simulate power loss.
 
-Transactions remain short. They do not include handlers, socket I/O, or waits for future messages. The driver does not support data-changing `RETURNING` statements, so claim uses select, conditional update, and payload read in one immediate transaction. See [schema and ordering](queue-engine.md#schema-and-ordering).
+Transactions remain short. They do not include handlers, socket I/O, or waits for future messages. Claim uses select, conditional update, and payload read in one immediate transaction. See [schema and ordering](queue-engine.md#schema-and-ordering).
 
 Eligible messages are selected in insertion-sequence order. Delayed or reserved rows do not block a later eligible message or another queue. Concurrent consumers have no promised completion order. There is no priority scheduling.
 
@@ -49,17 +49,19 @@ Receipt failures distinguish malformed syntax, no active reservation, owner mism
 
 Delivery is at least once, not exactly once. Receipt checks protect queue state, but cannot undo an external effect performed by a slow or stale worker. Make external effects safe to repeat.
 
-## Uncertain operations
+## Uncertain operations and cancellation
 
 A mutation can commit before its reply reaches the client. Missing confirmation does not prove that the mutation failed.
 
 On an uncertain send, receive, ACK, or reject, the client raises a transport exception and becomes unusable. It does not reconnect or replay. The caller decides how to handle the unknown outcome before creating a new connection. A new connection cannot reuse old receipts.
 
+Cancellation stops an operation before the broker dispatches it to the SQLite worker. After dispatch, the worker finishes the operation and the parent consumes the terminal result. A valid ACK may therefore commit after the client disconnects. A cancelled claim can retain its reservation until the original visibility expiry without delivering the receipt to the cancelled session. Send delay starts after the worker acquires its write transaction, not while the request waits in the parent.
+
 The package stores no operation IDs or deduplication history. A deliberate Messenger retry publishes a new message; it does not retransmit the old exchange. Applications decide whether to stop or restart workers after transport failure.
 
 ## Delays and waits
 
-Delay uses integer milliseconds, including positive subsecond values. Send persists the original availability deadline as Unix wall-clock milliseconds. No code path makes a message eligible before that deadline. Restart keeps future deadlines and makes overdue messages eligible immediately.
+Delay uses integer milliseconds, including positive subsecond values. Send persists the availability deadline as Unix wall-clock milliseconds sampled after transaction acquisition. No code path makes a message eligible before that deadline. Restart keeps future deadlines and makes overdue messages eligible immediately.
 
 Clock changes can advance or postpone eligibility. Duration timers are not a realtime guarantee; an already armed wake timer can run late after a forward wall-clock jump. Storage eligibility checks still decide whether receive can claim a message.
 
@@ -76,3 +78,5 @@ The broker allows 64 connections. Payload, control, and frame limits are listed 
 The broker exclusively locks its database and socket paths for its lifetime. Directories and files must be private. Startup refuses any existing endpoint. Normal shutdown removes only the broker's own socket. After an abrupt exit, verify that no listener owns a leftover socket before removing it.
 
 Readiness is a JSON `ready` event after locks, storage initialization, and socket binding succeed. Process creation alone is not readiness. The package does not daemonize or supervise itself.
+
+Startup has a 15-second budget. A dispatched worker exchange has a 10-second parent deadline. Shutdown shares one five-second budget. See [SQLite worker](sqlite-worker.md#budgets).

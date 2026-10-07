@@ -23,7 +23,7 @@ The example uses native PHP serialization. Accept only trusted messages with thi
 
 ## Start the broker
 
-1. Check that CLI PHP has `sqlite3`, `pcntl`, and `posix` enabled.
+1. Check that CLI PHP has `pdo_sqlite`, `pcntl`, and `posix` enabled.
 2. Create a private directory owned by the user running the broker and consumers:
 
    ```sh

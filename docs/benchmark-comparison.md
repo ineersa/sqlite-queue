@@ -2,6 +2,10 @@
 
 The native benchmark measures configured Symfony buses and stock `messenger:consume`. The [method](benchmark-method.md) defines its workload, completion boundaries, and coverage limits. Observations from the earlier synthetic runner are not interchangeable repetitions of this experiment.
 
+## Matched polling baseline for the PDO worker rewrite
+
+Primary Doctrine comparisons for the operation-level PDO worker use `--sleep=0.05`, matching Hatfield's 50 ms idle poll. Historical captures below used `--sleep=0.001`. Keep those results as aggressive-polling history. Do not compare old 1 ms idle CPU against new 50 ms idle CPU and attribute the difference to PDO. New PDO-worker throughput numbers belong in a later capture under the same 50 ms setting; this document does not invent them.
+
 ## Idle fix and unprofiled rerun
 
 Revision `e3b371a` keeps established sessions idle until their next request. The five-second handshake bound remains; the thirty-second partial-frame bound starts at the first prefix bytes. Deterministic tests explicitly fire handshake and incomplete-frame deadlines and verify that an idle receipt owner can still ACK without reconnecting. Full QA passed with 460 tests and 3,554 assertions.
