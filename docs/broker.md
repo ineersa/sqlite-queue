@@ -24,9 +24,9 @@ The executable uses the package's runtime Symfony Console dependency. A no-dev i
 ## Run under a supervisor in production
 
 1. Run the foreground command under systemd, supervisord, Docker, PM2, or another external supervisor. Do not daemonize it or put it in the background inside the managed command.
-2. Configure restart after failure and wait for the `ready` event before admitting clients. The broker exits nonzero on fatal storage or worker failure instead of replacing SQLite connections inside the running process.
-3. Send SIGTERM for graceful shutdown. Allow more than the broker's five-second cleanup budget before forced termination.
-4. Configure the supervisor to clean up the whole process tree, including the PDO SQLite worker and any Amp shell launcher, before starting a replacement broker.
+2. Configure restart after failure and wait for the `ready` event before admitting clients. The broker exits nonzero on fatal storage failure instead of replacing SQLite connections inside the running process.
+3. Send SIGTERM for graceful shutdown. Set the supervisor's forced-termination deadline explicitly.
+4. Verify broker process exit before starting a replacement. The driver owns its SQLite child; configure the supervisor to clean up the whole process group after an abrupt broker exit.
 5. Make client applications reconnect explicitly after failure. Do not replay unconfirmed operations automatically or reuse receipts from an old connection.
 
 After an abrupt exit, follow the endpoint verification instructions in [Stop or restart](#stop-or-restart). Do not add an unconditional socket deletion to the supervisor's startup command.
@@ -97,9 +97,9 @@ Client methods accept an optional Amp `Cancellation`. Cancellation during an exc
 
 Send SIGTERM or SIGINT, or press Ctrl-C in the foreground terminal. Wait for process exit before restarting. Normal stop removes the owned socket but preserves the database. Symfony FlockStore lock sidecars stay on disk under the private resource directories, which preserves the lock namespace.
 
-Startup has a 15-second budget covering worker spawn and readiness. A dispatched storage exchange has a 10-second parent deadline. Shutdown shares one five-second cleanup budget across client draining, worker close, and child teardown. If that budget expires, the broker attempts to terminate its SQLite worker. It removes only its own socket and then releases the database and endpoint locks.
+Shutdown shares one five-second budget across client draining and driver close. The broker passes the remaining budget to the driver, which terminates an unresponsive child. Cleanup removes only the broker's own socket and then releases the database and endpoint locks.
 
-The cleanup budget is not an exact process-exit deadline. Signal delivery and process reaping depend on the operating system. A stalled event loop or a stopped child or shell launcher can prevent cleanup from finishing. Configure the supervisor to terminate and reap the whole process tree after its grace period.
+SQLite's 5,000-millisecond busy timeout does not bound a whole operation. Waiting for SQL does not block socket or signal handling. Use an external supervisor for a hard process-exit deadline. See [cancellation and budgets](sqlite-worker.md#cancellation-and-budgets).
 
 If an endpoint remains after an abrupt exit, do not delete it just because a connection attempt fails. Verify that no broker or other listener owns it before removal, or choose another endpoint. Startup refuses existing sockets, regular files, and symlinks.
 

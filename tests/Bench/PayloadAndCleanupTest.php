@@ -76,31 +76,24 @@ final class PayloadAndCleanupTest extends TestCase
         $this->assertSame([], $signals);
     }
 
-    public function testStoppedPersistenceSurvivesBrokerDeathUntilOwnedCleanup(): void
+    public function testDirectFabpotBrokerRegistersItsLibraryStorageIdentity(): void
     {
         $fixture = new \Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase();
         $process = new \Symfony\Component\Process\Process([\PHP_BINARY, \dirname(__DIR__, 2).'/bin/sqlite-queue', 'broker', '--database='.$fixture->path(), '--endpoint='.$fixture->path('broker.sock'), '--synchronous=full'], timeout: 10);
-        $worker = 0;
         try {
             $process->start();
             $this->assertTrue($process->waitUntil(static fn (string $type, string $data): bool => str_contains($data, '"event":"ready"')));
             $ready = json_decode(trim($process->getOutput()), true, flags: \JSON_THROW_ON_ERROR);
-            $worker = $ready['persistence_pid'];
+            $this->assertSame('fabpot', $ready['storage_execution']);
+            $this->assertArrayNotHasKey('persistence_pid', $ready);
             $resources = new Resources(Clock::system(), static fn (string $path): string|false => @file_get_contents($path), static fn (string $bytes): bool => true, 100, 4096);
-            $resources->register(Role::Broker, $ready['pid']);
-            $resources->register(Role::Persistence, $worker);
-            $this->assertTrue(posix_kill($worker, \SIGSTOP));
-            $deadline = hrtime(true) + 10_000_000_000;
-            do {
-                $stat = file_get_contents('/proc/'.$worker.'/stat');
-                $stopped = 1 === preg_match('/\) T /', $stat);
-                if (hrtime(true) >= $deadline) {
-                    $this->fail('Persistence worker did not enter stopped state.');
-                }
-            } while (!$stopped);
-            $process->signal(\SIGKILL);
+            $resources->registerBroker($ready);
+            $this->assertSame([], $resources->coverage()['not_present_roles']);
+            $registry = $resources->coverage()['registry'];
+            $this->assertSame([Role::Broker->value, Role::Persistence->value], array_keys($registry));
+            $this->assertNotSame($registry[Role::Broker->value]['pid'], $registry[Role::Persistence->value]['pid']);
+            $process->signal(\SIGTERM);
             $process->wait();
-            $this->assertStringContainsString(') T ', file_get_contents('/proc/'.$worker.'/stat'));
             $signals = [];
             $result = $resources->cleanup(static function (int $pid) use (&$signals): bool {
                 $signals[] = $pid;
@@ -108,7 +101,7 @@ final class PayloadAndCleanupTest extends TestCase
                 return posix_kill($pid, \SIGKILL);
             }, 10);
             $this->assertTrue($result['complete']);
-            $this->assertContains($worker, $signals);
+            $this->assertSame([], $signals);
             $this->assertArrayHasKey(Role::Persistence->value, $result['roles']);
         } finally {
             $process->stop(0);

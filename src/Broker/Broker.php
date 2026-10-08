@@ -20,8 +20,8 @@ use Ineersa\SqliteQueue\Protocol\Frame;
 use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Protocol\Operation;
 use Ineersa\SqliteQueue\Protocol\ProtocolException;
-use Ineersa\SqliteQueue\Sqlite\Exception\StorageCapacityException;
-use Ineersa\SqliteQueue\Sqlite\SqliteQueueWorker;
+use Ineersa\SqliteQueue\Queue;
+use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use Revolt\EventLoop;
 use Symfony\Component\Filesystem\Filesystem;
@@ -55,15 +55,15 @@ final class Broker
     /** Fully acquired by BrokerFactory; a constructed broker is ready to serve. */
     public function __construct(
         private readonly ServerSocket $server,
-        private readonly SqliteQueueWorker $worker,
+        private readonly Queue $queue,
+        private readonly SqliteQueueStorage $storage,
         private readonly BrokerLifetimeLocks $locks,
         private readonly SocketIdentity $socketIdentity,
         private readonly \Closure $clock,
     ) {
         $this->deadline = new DeferredCancellation();
         $this->notifier = new QueueNotifier(
-            $this->worker->earliestEligibility(...),
-            $this->worker->awaitCapacity(...),
+            $this->queue->earliestEligibility(...),
             $this->clock,
             function (\Throwable $error): void {
                 $this->failed = true;
@@ -85,25 +85,15 @@ final class Broker
         $subscription = $cancellation?->subscribe(function (): void {
             $this->stop();
         });
-        $monitor = async(function (): void {
-            try {
-                $this->worker->handle()->awaitExit();
-            } catch (\Throwable) {
-                // A failed result channel also signals child death. Never log worker content.
-            }
-            if (!$this->stopping) {
-                $this->failed = true;
-                $this->stop();
-            }
-        });
+        $failure = null;
         try {
             $cancellation?->throwIfRequested();
             if (!$this->stopping) {
                 $ready?->__invoke([
-                    'synchronous_effective' => $this->worker->synchronousMode()->value,
                     'event' => BrokerEventEnum::Ready->value,
                     'pid' => getmypid(),
-                    'persistence_pid' => $this->worker->handle()->pid(),
+                    'storage_execution' => 'fabpot',
+                    'synchronous_effective' => $this->storage->synchronousMode()->value,
                     'database' => $this->locks->database,
                     'endpoint' => $this->locks->endpoint,
                 ]);
@@ -130,14 +120,13 @@ final class Broker
                 });
                 $this->clients[$key] = ['socket' => $socket, 'ownerId' => $ownerId, 'lifetime' => $lifetime, 'future' => $future];
             }
+        } catch (\Throwable $error) {
+            $failure = $error;
         } finally {
             // stop() arms the shared deadline on its first call, before it closes anything, so the
             // budget already covers every step below and this path must never arm a second timer.
-            // The referenced timer keeps the loop alive until it fires or is disarmed, so no step
-            // is ever released by the loop running out of work instead of by this deadline.
             $this->stop();
             $budget = $this->deadline->getCancellation();
-            $failure = null;
             foreach ($this->clients as $client) {
                 try {
                     $client['future']->await($budget);
@@ -145,16 +134,8 @@ final class Broker
                     $failure ??= $error;
                 }
             }
-            // Every step runs: an earlier failure must not leave the persistence child alive.
-            foreach ($this->shutdown($budget) as $step) {
-                try {
-                    $this->awaitStep($step, $budget);
-                } catch (\Throwable $error) {
-                    $failure ??= $error;
-                }
-            }
             try {
-                $monitor->await($budget);
+                $this->storage->close($budget);
             } catch (\Throwable $error) {
                 $failure ??= $error;
             }
@@ -162,10 +143,6 @@ final class Broker
             if (null !== $subscription) {
                 $cancellation?->unsubscribe($subscription);
             }
-            // Identity-checked socket removal and lock release are collected like every other
-            // step: a late failure must not mask the earlier error that actually failed the
-            // shutdown. They are not budgeted, because the child is already force-stopped and
-            // the release must happen before another broker may take the database or endpoint.
             try {
                 $this->releaseEndpointAndLocks();
             } catch (\Throwable $error) {
@@ -187,8 +164,6 @@ final class Broker
             // socket closes, so the budget covers every step that follows. Later requests, including
             // the serving loop's own stop() in its finally, share that one deadline and never rearm it.
             $this->armShutdownDeadline();
-            // Synchronously refuse later dispatch before tearing down waiters or sockets.
-            $this->worker->beginClose();
         }
         $this->server->close();
         $this->notifier->close();
@@ -203,31 +178,8 @@ final class Broker
     {
         $this->shutdownTimer = EventLoop::delay(self::SHUTDOWN_BUDGET_SECONDS, function (): void {
             $this->failed = true;
-            // Escalate before releasing the awaits, so the child is dead before any caller resumes.
-            $this->releaseBudgetAfter($this->deadline, $this->worker->handle()->forceStop(...));
+            $this->deadline->cancel(new \RuntimeException('Broker shutdown budget exhausted.'));
         });
-    }
-
-    /**
-     * Runs the shutdown escalation, then releases the budget exactly once.
-     *
-     * A force-stop failure must not escape into the event loop, and it must not leave the budget
-     * unreleased either: the failure becomes the cancellation cause, so the awaiters resume with
-     * the real reason instead of waiting for a deadline that already fired.
-     *
-     * @param DeferredCancellation $deadline  the single shutdown budget to release
-     * @param \Closure(): void     $forceStop
-     */
-    private function releaseBudgetAfter(DeferredCancellation $deadline, \Closure $forceStop): void
-    {
-        $cause = new \RuntimeException('Broker shutdown budget exhausted.');
-        try {
-            $forceStop();
-        } catch (\Throwable $error) {
-            $cause = $error;
-        } finally {
-            $deadline->cancel($cause);
-        }
     }
 
     /** The deadline has served its purpose once every awaited shutdown step has returned. */
@@ -238,16 +190,6 @@ final class Broker
         }
         EventLoop::cancel($this->shutdownTimer);
         $this->shutdownTimer = null;
-    }
-
-    /** @return list<\Closure(): void> Storage steps whose failure must not skip later steps. */
-    private function shutdown(Cancellation $budget): array
-    {
-        return [
-            function () use ($budget): void {
-                $this->worker->close($budget);
-            },
-        ];
     }
 
     /**
@@ -272,22 +214,6 @@ final class Broker
         }
         if (null !== $failure) {
             throw $failure;
-        }
-    }
-
-    /**
-     * Wait for one shutdown step under the shared budget.
-     *
-     * @param \Closure(): void $step
-     */
-    private function awaitStep(\Closure $step, Cancellation $budget): void
-    {
-        $future = async($step);
-        try {
-            $future->await($budget);
-        } catch (CancelledException $cancelled) {
-            $future->ignore();
-            throw $cancelled;
         }
     }
 
@@ -316,9 +242,6 @@ final class Broker
                     } catch (ClientContextClosedException) {
                         // Disconnect and shutdown cancellation end the session, not the broker.
                         return;
-                    } catch (StorageCapacityException) {
-                        // Local admission refusal closes only this session. The storage lane stays up.
-                        return;
                     } catch (InvalidReceiptException $error) {
                         $response = self::error($expected, ErrorCode::fromReceiptException($error));
                     } catch (ProtocolException $error) {
@@ -343,13 +266,23 @@ final class Broker
                         return;
                     }
                 }
+                unset($request);
                 Frame::write($socket, $response->encode(), new TimeoutCancellation(self::WRITE_TIMEOUT));
+                unset($response);
                 ++$expected;
+                if ($this->stopping) {
+                    return;
+                }
+                $this->yieldToEventLoop();
+                $this->assertRunning();
+                $lifetime->throwIfRequested();
             }
 
             return;
         } catch (ProtocolException $error) {
             $response = self::error($expected, $error->errorCode);
+        } catch (CancelledException) {
+            return;
         } catch (\Throwable) {
             // Read/write timeout, cancellation, or peer failure ends only this session.
             return;
@@ -437,7 +370,7 @@ final class Broker
             throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid delay.');
         }
 
-        $inserted = $this->worker->send($name, $request->body, $request->headers, $delay, $lifetime);
+        $inserted = $this->queue->send($name, $request->body, $request->headers, $delay, $lifetime);
         // Notify only after the committed mutation, even when the publisher session is already gone.
         $this->notifier->notify($name);
 
@@ -448,7 +381,7 @@ final class Broker
     {
         $this->assertNoPayload($request);
         $name = $this->queueName($request->control[ControlField::Queue->value] ?? null);
-        $delivery = $this->worker->receive($name, $ownerId, $lifetime);
+        $delivery = $this->queue->receive($name, $ownerId, $lifetime);
         if (null === $delivery) {
             return self::ok($id, null);
         }
@@ -543,9 +476,9 @@ final class Broker
             throw new ProtocolException(ErrorCode::InvalidRequest, 'Missing receipt.');
         }
         if (Operation::Acknowledge === $operation) {
-            $this->worker->acknowledge($receipt, $ownerId, $lifetime);
+            $this->queue->acknowledge($receipt, $ownerId, $lifetime);
         } else {
-            $this->worker->reject($receipt, $ownerId, $lifetime);
+            $this->queue->reject($receipt, $ownerId, $lifetime);
         }
 
         return self::ok($id, null);
@@ -604,6 +537,23 @@ final class Broker
         // Shutdown may have run in another fiber while a frame read was suspended.
         if ($this->stopping) {
             throw new ProtocolException(ErrorCode::BrokerShuttingDown, 'Broker is stopping.');
+        }
+    }
+
+    /** One next-iteration checkpoint after a completed public response, outside transactions. */
+    private function yieldToEventLoop(): void
+    {
+        if ($this->stopping) {
+            return;
+        }
+        $suspension = EventLoop::getSuspension();
+        $callback = EventLoop::defer(static function () use ($suspension): void {
+            $suspension->resume();
+        });
+        try {
+            $suspension->suspend();
+        } finally {
+            EventLoop::cancel($callback);
         }
     }
 }

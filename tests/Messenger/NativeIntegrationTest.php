@@ -22,7 +22,6 @@ use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\ControllableClock;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Handler\NativeProbeMessageHandler;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeProbeMessage;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\NativeKernel;
-use Ineersa\SqliteQueue\Tests\Support\ControlledWorkerClock;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -49,8 +48,6 @@ use function Amp\async;
 #[RequiresOperatingSystem('Linux')]
 final class NativeIntegrationTest extends TestCase
 {
-    use ControlledWorkerClock;
-
     private const int SAFETY_SECONDS = 15;
 
     private ?IsolatedDatabase $database = null;
@@ -701,8 +698,6 @@ final class NativeIntegrationTest extends TestCase
     private function setNow(int $value): void
     {
         $this->now = $value;
-        $database = $this->database?->path() ?? throw new \LogicException('Missing database.');
-        (new Filesystem())->dumpFile($database.'.clock', (string) $value);
     }
 
     private function startBroker(): void
@@ -713,8 +708,7 @@ final class NativeIntegrationTest extends TestCase
             $database,
             $this->endpoint,
             5_000,
-            $this->syncedClock(fn (): int => $this->now, $database),
-            workers: $this->workerFactory($database, fn (): int => $this->now),
+            fn (): int => $this->now,
         ))->create();
         $this->brokerFuture = async(fn (): int => $this->broker->run(static function (array $event) use ($ready): void {
             if (!$ready->isComplete()) {

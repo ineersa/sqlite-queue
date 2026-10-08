@@ -69,6 +69,9 @@ final class Runner
         foreach ($results as $id => $result) {
             $text .= '| '.$id.' | '.$result['execution_status'].' | '.$result['integrity_status'].' | '.$result['accounting_status'].' | '.($result['unique_completions'] ?? 'unknown')." |\n";
         }
+        if (\in_array(Role::Persistence->value, $results['broker']['resources']['coverage_details']['not_present_roles'] ?? [], true)) {
+            $text .= "\nBroker storage runs in-process. The persistence process is not present; broker CPU and memory include local storage.\n";
+        }
         if (Scenario::Idle === $this->options->scenario) {
             $text .= "\nThe declared no-publication interval and isolated-arrival pickup cohort are separate. Idle CPU and IO use boundary snapshots, not periodic peaks. Empty receives use fixed per-phase count and active-duration histograms; these are actor-phase counts, not exact parent-window events. Exact WAIT registration and wake counts are unavailable.\n";
         }
@@ -80,7 +83,7 @@ final class Runner
             $text .= "\nSynthetic application-shaped workflow, not production or keepalive-failure reproduction. The execution handler synchronously waits for the declared handler milliseconds, dispatches a correlated result through Messenger, and the separate result/control worker handles and ACKs it. Workflow counts require both messages to settle cleanly; total message ACKs are separate. No LLM or network request runs.\n";
         }
         if (Scenario::Retention === $this->options->scenario) {
-            $text .= "\nRetention keeps the same broker, persistence process and publisher/consumer connections across all declared cycles. Each memory point follows complete ACK drain, settling and an empty-inventory audit. Raw cycle and resource series stream to disk. Smoke uses two cycles of two messages and is only a control-path check. Non-smoke endpoint deltas and observed ranges are characterization, not a leak-free verdict. Broker PHP memory and live-state gauges remain unavailable.\n";
+            $text .= "\nRetention keeps the same registered processes and publisher/consumer connections across all declared cycles. Each memory point follows complete ACK drain, settling and an empty-inventory audit. Raw cycle and resource series stream to disk. Smoke uses two cycles of two messages and is only a control-path check. Non-smoke endpoint deltas and observed ranges are characterization, not a leak-free verdict. Broker PHP memory and live-state gauges remain unavailable.\n";
         }
         $text .= "\nProduct-total resource accounting is partial. Publisher and observer share a process, and exited-process accounting is unavailable. Phase-boundary per-role samples are not complete product totals or continuous peaks.\n";
         $text .= "\nRead summary.json for the frozen schedule, phase-specific rates, finite cohort timing, latency coverage. Failures are retained without retries.\n";
@@ -157,14 +160,13 @@ final class Runner
                         break;
                     }
                 }
-                if (!\is_array($readyData) || !\is_int($readyData['pid'] ?? null) || !\is_int($readyData['persistence_pid'] ?? null)) {
+                if (!\is_array($readyData)) {
                     throw new \RuntimeException('Broker readiness lacks resource identities.');
                 }
                 if (($readyData['synchronous_effective'] ?? null) !== $this->options->synchronous->value) {
                     throw new \RuntimeException('Broker owning connection synchronous readback does not match the selected mode.');
                 }
-                $resources->register(Role::Broker, $readyData['pid']);
-                $resources->register(Role::Persistence, $readyData['persistence_pid']);
+                $resources->registerBroker($readyData);
                 Runtime::saveJson($directory.'/broker.ready.json', $readyData);
             }
             $environment = ['BENCH_PROJECT' => $directory, 'BENCH_DATABASE' => $database, 'BENCH_DSN' => Backend::Broker === $backend ? 'sqlite-queue://async?endpoint='.$short.'/broker.sock' : 'doctrine-benchmark://async', 'BENCH_CONTROL' => $short.'/control.sock', 'BENCH_RUN' => basename(\dirname($directory)), 'BENCH_ROLE' => 'consumer', 'BENCH_TELEMETRY' => $directory.'/consumer.operations.jsonl'];
@@ -246,7 +248,7 @@ final class Runner
             $recorder->flush();
             $warmupEnd = $boundary(Phase::Reset);
             $this->phaseBarrier($actorControls, Phase::Reset, hrtime(true) + Config::STARTUP_TIMEOUT_S * 1000000000);
-            $durability = $this->owningDurability($directory, $backend);
+            $durability = $this->owningDurability($directory, $backend, $resources);
             Runtime::saveJson($directory.'/durability.json', $durability);
 
             Manifest::recordDurability(\dirname($directory), basename($directory), $durability);
@@ -653,7 +655,7 @@ final class Runner
                 $auditStart = $boundary(Phase::Audit);
                 $inventory = $this->inventory($root, $database, $backend);
                 $equivalent = 0 === $inventory['remaining'] && 0 === $inventory['ready'] && 0 === $inventory['inflight'];
-                $context = ['retention_cycle' => $cycle, 'historical_completions' => $historical, 'warmup_completed_messages' => self::WARMUP_MESSAGES, 'lifetime_completed_messages' => self::WARMUP_MESSAGES + $historical, 'historical_scope' => 'measured cycles; excludes fixed warmup', 'equivalent_empty_point' => $equivalent, 'inventory' => $inventory, 'topology' => 'same publisher, consumer, broker and persistence identities'];
+                $context = ['retention_cycle' => $cycle, 'historical_completions' => $historical, 'warmup_completed_messages' => self::WARMUP_MESSAGES, 'lifetime_completed_messages' => self::WARMUP_MESSAGES + $historical, 'historical_scope' => 'measured cycles; excludes fixed warmup', 'equivalent_empty_point' => $equivalent, 'inventory' => $inventory, 'topology' => 'same publisher, consumer and registered storage process identities'];
                 $snapshot(Phase::Settle, $context);
                 $record = $context + ['measure_start_ns' => $measureStart, 'measure_end_ns' => $measureEnd, 'drain_start_ns' => $drainStart, 'drain_end_ns' => $drainEnd, 'settle_start_ns' => $settleStart, 'audit_start_ns' => $auditStart, 'observation_ns' => hrtime(true), 'declared_messages' => 0 === $cycle ? 0 : $this->options->effectiveCycleMessages()];
                 $line = json_encode($record, \JSON_THROW_ON_ERROR)."\n";
@@ -845,7 +847,7 @@ final class Runner
     }
 
     /** @return array<string, mixed> */
-    private function owningDurability(string $directory, Backend $backend): array
+    private function owningDurability(string $directory, Backend $backend, Resources $resources): array
     {
         $desired = $this->options->synchronous->value;
         if (Backend::Broker === $backend) {
@@ -854,7 +856,15 @@ final class Runner
                 throw new \RuntimeException('Broker owning connection readback mismatch.');
             }
 
-            return ['desired' => $desired, 'effective' => $desired, 'authority' => 'broker worker configuration readback before readiness', 'pid' => $ready['persistence_pid']];
+            $execution = $ready['storage_execution'] ?? null;
+            $authority = match ($execution) {
+                'fabpot' => 'driver connection configuration readback before readiness',
+                'in_process' => 'broker in-process configuration readback before readiness',
+                null => 'broker worker configuration readback before readiness',
+                default => throw new \RuntimeException('Unknown broker storage execution topology.'),
+            };
+
+            return ['desired' => $desired, 'effective' => $desired, 'authority' => $authority, 'pid' => $resources->registeredPid('in_process' === $execution ? Role::Broker : Role::Persistence)];
         }
         $expected = ['publisher.operations.jsonl.async.durability.json', 'consumer.operations.jsonl.async.durability.json'];
         if (Scenario::Application === $this->options->scenario) {

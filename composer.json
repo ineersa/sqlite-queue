@@ -4,13 +4,20 @@
     "license": "MIT",
     "type": "symfony-bundle",
     "bin": ["bin/sqlite-queue"],
+    "repositories": [
+        {
+            "type": "vcs",
+            "url": "https://github.com/ineersa/amp-sqlite3",
+            "only": ["fabpot/amphp-sqlite3"]
+        }
+    ],
     "require": {
         "php": "^8.5",
-        "ext-pdo_sqlite": "*",
+        "ext-sqlite3": "*",
         "amphp/amp": "^3.1",
-        "amphp/parallel": "^2.3",
         "amphp/socket": "^2.4",
         "amphp/sync": "^2.3",
+        "fabpot/amphp-sqlite3": "dev-development",
         "revolt/event-loop": "^1.0",
         "symfony/clock": "^8.0",
         "symfony/console": "^8.0",
@@ -20,8 +27,8 @@
     },
     "require-dev": {
         "ext-pcntl": "*",
+        "ext-pdo_sqlite": "*",
         "ext-posix": "*",
-        "ext-sqlite3": "*",
         "doctrine/dbal": "^4.3",
         "friendsofphp/php-cs-fixer": "^3.95",
         "jolicode/castor": "^1.0",

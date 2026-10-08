@@ -1,30 +1,24 @@
-# SQLite worker
+# SQLite storage
 
-The broker keeps sockets, WAIT, and process supervision asynchronous in the parent process. One persistent child owns native PDO SQLite and runs complete queue operations. Amp starts that child and carries one request and one terminal response per operation.
+The broker uses one asynchronous connection from the `ineersa/amp-sqlite3` fork. This package owns queue policy, SQL, and transaction boundaries. The driver owns SQLite execution, its child process, and internal IPC. There is no package-owned worker protocol, pipeline, or connection pool.
 
 ## Process model
 
-`SqliteWorkerContextFactory` starts exactly one package-owned worker. The child opens the database, configures WAL and the selected synchronous mode, prepares the fixed statements, and constructs queue policy with a fresh epoch.
+`BrokerFactory` opens storage, verifies WAL and the selected synchronous mode, creates the schema, and constructs `Queue` with a fresh epoch. Queue and notifier share the factory's clock.
 
-This experimental parent proxy pipelines up to four operations through one FIFO writer and one independent response reader. The child still executes each operation and transaction sequentially. It never waits to fill a batch.
+An Amp mutex serializes complete storage operations on the writing connection. Contention and driver calls suspend fibers without blocking the broker's event loop. Sockets, WAIT timers, and signals remain available while SQLite runs. Transactions do not contain handlers or client socket I/O.
 
-The in-flight payload budget is twice the maximum message payload. Total admission is limited to 128 operations and 64 maximum payloads, including queued work and retained completions. Sends reserve their actual payload size; claims reserve the maximum possible reply. Credits remain charged until the result is consumed and the sender releases its data.
+Readiness reports `storage_execution: "fabpot"` and the effective synchronous mode. It omits `persistence_pid` because the package does not supervise the driver's child. Driver failures stop service when a storage operation observes them. The broker does not independently monitor idle child exits or replace failed connections.
 
-Caller cancellation removes queued work without consuming a wire ID. After the channel send begins, the worker finishes the operation and the parent consumes its terminal result. Domain receipt failures affect only that request. Storage, IPC, timeout, and malformed-reply failures fail the lane and stop the broker. Several dispatched operations can have unknown outcomes after one channel failure. Known terminal results remain known. The broker does not replace the worker or replay operations.
+## Cancellation and budgets
 
-Readiness reports the worker PID as `persistence_pid` and the effective synchronous mode from the owning child connection. The parent does not open a second SQLite connection for configuration evidence.
+Startup cancellation reaches the driver's connection handshake. Subsequent schema queries have no package-wide startup deadline. SQLite `busy_timeout` remains 5,000 milliseconds; it is not an overall operation deadline.
 
-## Budgets
+Connection cancellation can prevent storage work before it begins. It does not revoke dispatched SQL. Missing confirmation remains an unknown outcome, even if shutdown later terminates the driver child. The package never replays an operation automatically.
 
-| Phase | Budget | Starts |
-| --- | ---: | --- |
-| Startup | 15 seconds | Before spawning the worker |
-| Dispatched exchange | 10 seconds | Immediately before channel send |
-| Shutdown | 5 seconds total | At the first stop request |
+Shutdown shares one five-second budget across client draining and driver close. Storage passes that cancellation to the driver's `SqliteCancellableConnection`. Driver close also has its own five-second ceiling. Expiry interrupts pending close writes, reads, or join and forces child termination through Amp. Cleanup removes the owned socket and releases locks afterward.
 
-SQLite `busy_timeout` remains 5,000 milliseconds. Each dispatched request has its own exchange deadline, including time behind earlier requests in the child. Other replies do not extend it. A timeout fails the lane, terminates the worker, and releases waiting callers. It does not retract an already validated response.
-
-Shutdown stops admission, removes queued work, and drains dispatched operations before sending one Close through the same writer and reader. It shares one budget across client drain, close, and child teardown. Graceful close joins the Amp process context once. Forced termination uses `ProcessContext::close()` and tolerates the expected missing-result failure. Amp owns process-exit tracking. Pipe EOF alone is not proof of reaping.
+Use an external supervisor for a hard process-exit deadline. Configure it to clean up the entire process group after an abrupt broker exit.
 
 ## Durability
 
@@ -37,4 +31,4 @@ Use `--synchronous=normal|full`, bundle `sqlite_queue.synchronous`, or `Sqlite\S
 
 ## Embedding
 
-Applications should use the broker and client. Local `Queue` and `SqliteQueueStorage` remain package-owned policy and PDO storage for the worker. They are not a second public network API. Existing databases need no schema migration. Claim selects the payload and conditionally reserves that row in one immediate transaction; the worker does not use data-changing `RETURNING`.
+Applications use the same broker command, clients, DSNs, and frames. Existing databases need no schema migration. Receive selects the ID and payload, conditionally reserves the row, and commits in one immediate transaction. It does not use data-changing `RETURNING`.

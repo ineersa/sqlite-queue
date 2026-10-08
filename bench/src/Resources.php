@@ -7,8 +7,12 @@ namespace Ineersa\SqliteQueue\Bench;
 /** Fixed known-role registry. Records stream to disk; no whole-host scan or retained series. */
 final class Resources
 {
+    private const int MAX_STORAGE_DESCENDANTS = 8;
+
     /** @var array<string, array{pid: int, start_ticks: int}> */
     private array $registry = [];
+    /** @var list<string> Roles intentionally absent from this process topology. */
+    private array $notPresentRoles = [];
     private int $lost = 0;
 
     /** @param \Closure(string): (string|false) $read
@@ -31,6 +35,44 @@ final class Resources
             throw new \RuntimeException('Cannot register process identity for '.$role->value);
         }
         $this->registry[$role->value] = ['pid' => $pid, 'start_ticks' => $stat['start_ticks']];
+    }
+
+    public function registeredPid(Role $role): int
+    {
+        return ($this->registry[$role->value] ?? throw new \RuntimeException('Process role is not registered: '.$role->value))['pid'];
+    }
+
+    /** @param array<string, mixed> $ready Owning broker readiness, including legacy worker records. */
+    public function registerBroker(array $ready): void
+    {
+        $pid = $ready['pid'] ?? null;
+        if (!\is_int($pid) || $pid <= 0) {
+            throw new \RuntimeException('Broker readiness lacks a positive process identity.');
+        }
+        if ('in_process' === ($ready['storage_execution'] ?? null)) {
+            if (\array_key_exists('persistence_pid', $ready)) {
+                throw new \RuntimeException('In-process storage must not report a persistence process.');
+            }
+            $this->register(Role::Broker, $pid);
+            $this->notPresentRoles = [Role::Persistence->value];
+
+            return;
+        }
+        if ('fabpot' === ($ready['storage_execution'] ?? null)) {
+            $this->register(Role::Broker, $pid);
+            $this->register(Role::Persistence, $this->libraryStoragePid($pid));
+
+            return;
+        }
+        if (\array_key_exists('storage_execution', $ready)) {
+            throw new \RuntimeException('Unknown broker storage execution topology.');
+        }
+        $persistence = $ready['persistence_pid'] ?? null;
+        if (!\is_int($persistence) || $persistence <= 0 || $persistence === $pid) {
+            throw new \RuntimeException('Legacy broker readiness requires a distinct persistence identity.');
+        }
+        $this->register(Role::Broker, $pid);
+        $this->register(Role::Persistence, $persistence);
     }
 
     /** @param \Closure(int): bool $kill signals only an original, confirmed owned identity
@@ -95,7 +137,7 @@ final class Resources
     /** @return array<string, mixed> */
     public function coverage(): array
     {
-        return ['registry' => $this->registry, 'lost_samples' => $this->lost, 'sampling_policy' => 'phase boundaries only', 'pss_policy' => 'phase-only', 'product_total' => 'partial: publisher and observer share a process', 'process_exit_accounting' => 'unavailable', 'broker_php_and_gauges' => 'unavailable'];
+        return ['registry' => $this->registry, 'not_present_roles' => $this->notPresentRoles, 'lost_samples' => $this->lost, 'sampling_policy' => 'phase boundaries only', 'pss_policy' => 'phase-only', 'product_total' => 'partial: publisher and observer share a process', 'process_exit_accounting' => 'unavailable', 'broker_php_and_gauges' => 'unavailable'];
     }
 
     /** @param iterable<array<string, mixed>> $rows
@@ -149,6 +191,40 @@ final class Resources
         }
 
         return ['phase_roles' => $phases, 'coverage' => 'boundary-to-boundary only; pre-first-sample and process-exit work unavailable', 'memory_policy' => 'current snapshots, not active peaks or retention evidence'];
+    }
+
+    /** Discover the library's child for measurement only; production does not wrap its factory. */
+    private function libraryStoragePid(int $brokerPid): int
+    {
+        $parents = [$brokerPid];
+        $visited = 0;
+        $workers = [];
+        while ([] !== $parents) {
+            if (++$visited > self::MAX_STORAGE_DESCENDANTS) {
+                throw new \RuntimeException('Unexpected broker child-process topology.');
+            }
+            $parent = array_shift($parents);
+            $children = ($this->read)('/proc/'.$parent.'/task/'.$parent.'/children');
+            if (false === $children || '' === trim($children)) {
+                continue;
+            }
+            foreach (explode(' ', trim($children)) as $child) {
+                if (!ctype_digit($child)) {
+                    throw new \RuntimeException('Invalid broker descendant process identity.');
+                }
+                $pid = (int) $child;
+                $command = ($this->read)('/proc/'.$pid.'/cmdline');
+                if (false !== $command && str_contains($command, 'amp-process') && !str_contains($command, '/bin/sh')) {
+                    $workers[] = $pid;
+                }
+                $parents[] = $pid;
+            }
+        }
+        if (1 !== \count($workers)) {
+            throw new \RuntimeException('Expected one fabpot storage process for resource accounting.');
+        }
+
+        return $workers[0];
     }
 
     /** @param array{pid: int, start_ticks: int} $identity

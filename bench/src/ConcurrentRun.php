@@ -66,8 +66,7 @@ final readonly class ConcurrentRun
                         if (($ready['synchronous_effective'] ?? null) !== $this->options->synchronous->value) {
                             throw new \RuntimeException('Broker durability mismatch.');
                         }
-                        $resources->register(Role::Broker, $ready['pid']);
-                        $resources->register(Role::Persistence, $ready['persistence_pid']);
+                        $resources->registerBroker($ready);
                         $durability['broker'] = $ready;
                         Runtime::saveJson($directory.'/broker.ready.json', $ready);
                         break;

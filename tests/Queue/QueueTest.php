@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Tests\Queue;
 
 use Amp\DeferredCancellation;
+use Fabpot\Amp\Sqlite\SqliteConnection;
 use Ineersa\SqliteQueue\DTO\DeliveryDTO;
 use Ineersa\SqliteQueue\Exception\ClientContextClosedException;
 use Ineersa\SqliteQueue\Exception\ExpiredReceiptException;
@@ -20,7 +21,6 @@ use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTestCase;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
-use Pdo\Sqlite;
 use PHPUnit\Framework\Attributes\DataProvider;
 
 final class QueueTest extends ProcessTestCase
@@ -489,16 +489,14 @@ final class QueueTest extends ProcessTestCase
         $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
     }
 
-    public function testCloseClearsStatementAndConnectionOwnership(): void
+    public function testCloseClearsConnectionOwnership(): void
     {
         $storage = $this->openStorage();
         $this->storages[] = $storage;
         $storage->insert('jobs', str_repeat('p', 1024), str_repeat('h', 128), fn (): int => $this->now);
         $storage->close();
         $connection = (new \ReflectionProperty($storage, 'connection'))->getValue($storage);
-        $statements = (new \ReflectionProperty($storage, 'statements'))->getValue($storage);
         $this->assertNull($connection);
-        $this->assertNull($statements);
         $this->expectException(\RuntimeException::class);
         $storage->earliestEligibility('jobs');
     }
@@ -525,9 +523,12 @@ final class QueueTest extends ProcessTestCase
         $this->storages[] = $storage;
         $queue->send($this->queueName('jobs'), 'confirmed');
         $connection = (new \ReflectionProperty($storage, 'connection'))->getValue($storage);
-        $this->assertInstanceOf(Sqlite::class, $connection);
-        $pages = (int) $connection->query('PRAGMA page_count')->fetchColumn();
-        $connection->exec('PRAGMA max_page_count='.$pages);
+        $this->assertInstanceOf(SqliteConnection::class, $connection);
+        $result = $connection->query('PRAGMA page_count');
+        $row = $result->fetchRow();
+        $result->close();
+        $this->assertNotNull($row);
+        $connection->query('PRAGMA max_page_count='.(int) $row['page_count'])->close();
         $failure = null;
         try {
             $queue->send($this->queueName('jobs'), str_repeat('x', 1_000_000));

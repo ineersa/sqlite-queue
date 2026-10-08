@@ -15,6 +15,7 @@ use Ineersa\SqliteQueue\Exception\NoActiveReservationException;
 use Ineersa\SqliteQueue\Exception\ReceiptEpochMismatchException;
 use Ineersa\SqliteQueue\Exception\ReceiptOwnerMismatchException;
 use Ineersa\SqliteQueue\Exception\ReceiptTokenMismatchException;
+use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Sqlite\SettlementResultEnum;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
@@ -62,6 +63,7 @@ final class Queue
         if ($delay < 0) {
             throw new \InvalidArgumentException('Delay must be nonnegative milliseconds.');
         }
+        $this->assertPayloadBounds($body, $headers);
         $this->assertActive($cancellation ?? new NullCancellation());
 
         return $this->storage->insert(
@@ -75,6 +77,9 @@ final class Queue
     /** Immediately claim one eligible message, or return null. Never waits for future work. */
     public function receive(QueueName $queue, string $ownerId, ?Cancellation $cancellation = null): ?DeliveryDTO
     {
+        if ('' === $ownerId) {
+            throw new \InvalidArgumentException('Owner identity must be a non-empty string.');
+        }
         $this->assertActive($cancellation ?? new NullCancellation());
         $token = bin2hex(random_bytes(self::RESERVATION_TOKEN_BYTES));
         $claimed = $this->storage->claim(
@@ -125,6 +130,9 @@ final class Queue
 
     private function settle(string $receipt, string $ownerId, ?Cancellation $cancellation): void
     {
+        if ('' === $ownerId) {
+            throw new \InvalidArgumentException('Owner identity must be a non-empty string.');
+        }
         if (1 !== preg_match('/\A([1-9][0-9]*):([a-f0-9]{64})\z/D', $receipt, $parts)) {
             throw new MalformedReceiptException();
         }
@@ -161,6 +169,18 @@ final class Queue
             $cancellation->throwIfRequested();
         } catch (CancelledException $error) {
             throw new ClientContextClosedException('The client connection lifetime was cancelled.', previous: $error);
+        }
+    }
+
+    private function assertPayloadBounds(string $body, string $headers): void
+    {
+        $bodyLength = \strlen($body);
+        $headersLength = \strlen($headers);
+        if ($bodyLength > Limits::MAX_PAYLOAD
+            || $headersLength > Limits::MAX_PAYLOAD
+            || $bodyLength + $headersLength > Limits::MAX_PAYLOAD
+        ) {
+            throw new \InvalidArgumentException('Payload exceeds the supported frame budget.');
         }
     }
 

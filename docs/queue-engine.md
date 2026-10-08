@@ -1,8 +1,8 @@
 # SQLite queue engine
 
-`Ineersa\SqliteQueue\Queue` owns message policy. `Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage` owns one native PDO SQLite connection, schema setup, fixed prepared statements, and transaction boundaries. SQLite is authoritative. The engine stores no message cache, tracks no live client sessions, performs no application deserialization, and has no Symfony dependency.
+`Ineersa\SqliteQueue\Queue` owns message policy. `Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage` owns one asynchronous driver connection, schema setup, SQL, and transaction boundaries. SQLite is authoritative. The engine stores no message cache, tracks no live client sessions, and performs no application deserialization.
 
-In production, both classes run inside the broker's persistent Amp worker. The parent proxy exchanges one complete operation at a time. This document describes the local policy and storage APIs that the worker invokes. It does not implement the broker socket loop, WAIT coordination, or Messenger transport. Broker waiting uses `earliestEligibility()` as a scheduling hint only.
+Both classes run in the broker. Driver calls suspend fibers while SQLite executes in the driver's child process. The broker owns sockets, WAIT coordination, and session lifetime. Broker waiting uses `earliestEligibility()` as a scheduling hint only.
 
 ## Opening and ownership
 
@@ -32,15 +32,15 @@ try {
 
 The database directory must exist. Queue names are independent of the database path. Construct `QueueName` from untrusted strings; invalid names fail at construction. Names contain 1 to 255 ASCII letters, digits, dots, underscores, or hyphens and start with a letter or digit. Paths, empty names, and NUL bytes are rejected. Bodies and headers can contain arbitrary bytes, including empty strings.
 
-`SqliteQueueStorage::open(string $path, SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal)` opens one PDO connection with exception error mode, associative fetches, and immediate transactions. Only NORMAL and FULL are supported. The NORMAL default is the product durability policy. Use `SqliteQueueStorage::open($path, SqliteSynchronousMode::Full)` for FULL. Initialization verifies WAL and the selected synchronous mode, enables foreign keys and extended result codes, sets `busy_timeout` to 5,000 milliseconds and `wal_autocheckpoint` to 1,000 pages, and creates the table and indexes if absent. In-memory databases are not supported. The database is dedicated queue storage. Do not modify its schema or open it independently while the broker owns it.
+`SqliteQueueStorage::open(string $path, SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal, ?Cancellation $cancellation = null)` opens one asynchronous driver connection with immediate transactions. The optional cancellation applies to the connection handshake, not subsequent schema queries. Only NORMAL and FULL are supported. Use `SqliteQueueStorage::open($path, SqliteSynchronousMode::Full)` for FULL. Initialization verifies WAL and the selected synchronous mode, sets `busy_timeout` to 5,000 milliseconds and `wal_autocheckpoint` to 1,000 pages, and creates the table and indexes if absent. In-memory databases are not supported. Do not modify the schema or open the database independently while the broker owns it.
 
-`new SqliteQueueStorage(Pdo\Sqlite $connection, SqliteSynchronousMode $synchronous)` takes exclusive ownership of an existing PDO connection. Initialization failure closes it. Do not use the transferred connection concurrently or change its schema or settings after construction.
+`new SqliteQueueStorage(SqliteCancellableConnection $connection, SqliteSynchronousMode $synchronous, LocalMutex $mutex)` takes exclusive ownership of a driver connection. Initialization failure closes it. Do not use the transferred connection concurrently or change its schema or settings after construction.
 
 `new Queue(SqliteQueueStorage $storage, int $visibilityTimeout = 60000, ?Closure $clock = null)` is message policy only. It does not open, configure, or close storage. Invalid visibility fails without closing the caller-owned storage dependency.
 
 The optional clock is a `Closure(): int` returning nonnegative Unix wall-clock milliseconds. The default samples `floor(microtime(true) * 1000)`. Send, claim, and settlement sample deadlines after the write transaction begins. Queue supplies the clock and deadline calculation; storage invokes them inside the transaction. No monotonic deadline is persisted. Delays and visibility timeouts must fit the signed integer timestamp range. Visibility must be positive; delay may be zero but not negative.
 
-Always close storage in `finally`. Close is idempotent, and closed storage rejects subsequent operations. Engines cannot be cloned. Production callers use the broker worker, not a second parent-process PDO connection.
+Always close storage in `finally`. `close(?Cancellation $cancellation = null)` accepts an existing shutdown budget; without one, the driver's default close ceiling applies. Close is idempotent, and closed storage rejects subsequent operations. Engines cannot be cloned. Broker clients do not open a second SQLite connection.
 
 ## API
 
@@ -58,7 +58,7 @@ Queue owns receipt generation and interpretation. It creates the storage epoch a
 
 Callers own client lifetime. Create a new owner identity for each connection and pass that identity into receive and settlement. Pass an Amp cancellation for the connection lifetime. Cancel it on disconnect. Queue maps a requested cancellation to `ClientContextClosedException`, with the original Amp cancellation as its cause. This is not a receipt rejection.
 
-Cancellation can prevent a local call before storage begins. Once a storage operation starts, it finishes normally. In the broker, the equivalent boundary is admission before the worker channel send. A completed claim can retain its reservation without disclosing its receipt to a disconnected caller. A disconnect during an in-flight mutation cannot prove that the mutation did not commit.
+Cancellation can prevent a call before storage begins. It does not revoke dispatched SQL. A completed claim can retain its reservation without disclosing its receipt to a disconnected caller. A disconnect or forced driver shutdown during a mutation cannot prove that the mutation did not commit.
 
 ## Schema and ordering
 
@@ -68,7 +68,7 @@ There is one application table, `queue_messages`, for every named queue. SQLite 
 | --- | --- |
 | `id INTEGER PRIMARY KEY AUTOINCREMENT` | Insertion sequence and message identity. Normal deletion cannot recycle it. |
 | `queue TEXT NOT NULL` | Logical queue name from a validated `QueueName`. |
-| `body BLOB NOT NULL`, `headers BLOB NOT NULL` | Opaque bytes, bound as `PDO::PARAM_LOB`. Type checks reject non-BLOB values. |
+| `body BLOB NOT NULL`, `headers BLOB NOT NULL` | Opaque bytes, bound as `SqliteBlob`. Type checks reject non-BLOB values. |
 | `available_at INTEGER NOT NULL` | Original send deadline. Never reset by claim or restart. |
 | `reserved_until INTEGER` | Current visibility expiry, initially null. |
 | `reservation_token TEXT` | Random 256-bit token for this delivery, initially null. |
@@ -84,15 +84,15 @@ A constraint requires all four reservation fields to be null or all four to be p
 The claim selects the lowest eligible ID:
 
 ```sql
-SELECT id FROM queue_messages
+SELECT id, body, headers, available_at FROM queue_messages
 WHERE queue = ? AND available_at <= ?
   AND (reserved_until IS NULL OR reserved_until <= ?)
 ORDER BY id LIMIT 1
 ```
 
-The worker executes one operation at a time. Each mutation uses an immediate PDO transaction. Receive selects an ID, conditionally updates its reservation using the same eligibility predicate, reads the payload inside that transaction, and commits before returning it. A zero-row conditional update or empty selection rolls back and returns `null`. There is no DML `RETURNING`.
+An Amp mutex serializes full storage operations. Each mutation uses an immediate driver transaction. Receive selects the ID and payload, conditionally updates the reservation using the same eligibility predicate, validates the payload, and commits before returning it. A zero-row conditional update or empty selection rolls back and returns `null`. There is no DML `RETURNING`.
 
-Concurrent writers acquire SQLite's write lock before selection. Committed insertions therefore define the ID order. This promises eligible-message ordering, not consumer completion order. The broker owns one database connection through its worker. SQLite serializes writers from independent connections to the same file.
+Concurrent writers acquire SQLite's write lock before selection. Committed insertions therefore define the ID order. This promises eligible-message ordering, not consumer completion order. The broker owns one driver connection. SQLite serializes writers from independent connections to the same file.
 
 ## Visibility and receipts
 

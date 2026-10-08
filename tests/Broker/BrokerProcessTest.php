@@ -87,8 +87,7 @@ final class BrokerProcessTest extends TestCase
         $database = $this->fixture->path();
         $first = $this->startBroker($database, $this->socket);
         $pid = $first->getPid();
-        $owned = $this->trackOwned($pid);
-        $this->assertCount(1, $owned['workers'], 'The broker must own exactly one persistence worker.');
+        $this->trackOwned($pid);
 
         $client = $this->client();
         $body = random_bytes(64);
@@ -163,44 +162,6 @@ final class BrokerProcessTest extends TestCase
         $this->assertFileDoesNotExist($this->socket);
     }
 
-    public function testIdlePersistenceDeathFailsBrokerAndPreservesConfirmedData(): void
-    {
-        $database = $this->fixture->path();
-        $broker = $this->startBroker($database, $this->socket);
-        $owned = $this->trackOwned($broker->getPid());
-        $this->assertCount(1, $owned['workers'], 'The broker must own exactly one persistence worker.');
-        $worker = $owned['workers'][0];
-
-        $client = $this->client();
-        $confirmed = $client->send('jobs', 'confirmed message');
-        $this->assertGreaterThan(0, $confirmed);
-        $client->close();
-        array_pop($this->clients);
-
-        $this->assertNotSame(0, posix_geteuid());
-        $this->assertSame(posix_geteuid(), fileowner('/proc/'.$worker), 'The killed process must be this user\'s persistence worker.');
-        $this->assertTrue(posix_kill($worker, \SIGKILL), 'The test must kill only the persistence worker.');
-
-        $this->assertNotSame(0, $broker->join(new TimeoutCancellation(10)), 'An idle persistence death must fail the broker without another client request.');
-        $this->assertTrackedGone();
-        $this->assertFileDoesNotExist($this->socket, 'A failed broker must release the endpoint.');
-        $this->assertFileExists($database, 'A failed broker must preserve confirmed data.');
-
-        $restarted = $this->startBroker($database, $this->socket);
-        $this->trackOwned($restarted->getPid());
-        $client = $this->client();
-        $delivery = $client->receive('jobs');
-        $this->assertNotNull($delivery, 'A confirmation must survive a persistence failure.');
-        $this->assertSame($confirmed, $delivery->id);
-        $this->assertSame('confirmed message', $delivery->body);
-        $client->acknowledge($delivery->receipt);
-        $client->close();
-        array_pop($this->clients);
-        $this->stopBroker($restarted);
-        $this->assertTrackedGone();
-        $this->assertFileExists($database);
-    }
-
     public function testInvalidStorageFailsStartupAndReleasesOwnership(): void
     {
         $database = $this->fixture->path();
@@ -208,7 +169,6 @@ final class BrokerProcessTest extends TestCase
         file_put_contents($database, $invalid);
         chmod($database, 0o600);
 
-        $before = ProcessTree::ownedBy(getmypid());
         $failed = $this->conflictingBroker($database, $this->socket);
         $this->tracked[] = $failed->getPid();
 
@@ -219,9 +179,6 @@ final class BrokerProcessTest extends TestCase
         $this->assertNotSame(0, $failed->join(new TimeoutCancellation(10)), 'Unreadable storage must fail startup.');
         $this->assertStringNotContainsString('ready', $stdout, 'Readiness must not precede storage initialization.');
         $this->assertSame($invalid, file_get_contents($database), 'Failed startup must not modify the rejected database file.');
-        $after = ProcessTree::ownedBy(getmypid());
-        $this->assertSame([], array_values(array_diff($after['workers'], $before['workers'])), 'Failed startup left an owned persistence worker.');
-        $this->assertSame([], array_values(array_diff($after['launchers'], $before['launchers'])), 'Failed startup left an owned worker launcher.');
         $this->assertTrackedGone();
 
         unlink($database);
@@ -240,8 +197,6 @@ final class BrokerProcessTest extends TestCase
         $database = $this->fixture->path();
         $before = glob($this->fixture->directory().'/*');
         $this->assertSame([], false === $before ? [] : $before, 'The fixture directory must start empty.');
-        $owned = ProcessTree::ownedBy(getmypid());
-
         $process = Process::start([
             \PHP_BINARY,
             '-d',
@@ -264,9 +219,6 @@ final class BrokerProcessTest extends TestCase
 
         $after = glob($this->fixture->directory().'/*');
         $this->assertSame([], false === $after ? [] : $after, 'A refused startup must not create a database, endpoint, or lock file.');
-        $started = ProcessTree::ownedBy(getmypid());
-        $this->assertSame([], array_values(array_diff($started['workers'], $owned['workers'])), 'A refused startup left a persistence worker.');
-        $this->assertSame([], array_values(array_diff($started['launchers'], $owned['launchers'])), 'A refused startup left a worker launcher.');
     }
 
     public function testBrokerStopsWhenTheSignalArrivesInsideTheSelectWindow(): void
@@ -275,21 +227,19 @@ final class BrokerProcessTest extends TestCase
         $log = $this->fixture->path('signal-window.log');
         $probe = $this->startSignalWindowProbe($database, $log);
         $pid = $probe->getPid();
-        $owned = $this->trackOwned($pid);
-        $this->assertCount(1, $owned['workers'], 'The probe broker must own exactly one persistence worker.');
-        $worker = $owned['workers'][0];
+        $this->trackOwned($pid);
 
         $marker = $this->awaitProbeMarker($log, ['lost-window', 'deadline']);
         if ('lost-window' === $marker) {
             // The probe delivered SIGTERM while the driver had already drained its signal queue
             // and was about to block without a deadline, which is the window where a signal
             // cannot wake the loop. The broker must still stop on its own.
-            $this->assertBrokerStopsOnItsOwn($probe, $pid, $worker);
+            $this->assertBrokerStopsOnItsOwn($probe, $pid);
         } else {
             // The loop never waited without a deadline, so the probe found no window to target.
             // The broker must still stop when the signal arrives from outside.
             $this->assertTrue(posix_kill($pid, \SIGTERM), 'The test must signal the broker the way a shell kill does.');
-            $this->assertBrokerStops($probe, $pid, $worker, 'A signalled broker must stop.');
+            $this->assertBrokerStops($probe, $pid, 'A signalled broker must stop.');
         }
 
         $this->assertNotContains('lost-window', $this->probeMarkers($log), 'The broker must never wait for events without a deadline.');
@@ -304,8 +254,7 @@ final class BrokerProcessTest extends TestCase
             $database = $this->fixture->path();
             $controlPath = $this->fixture->path('control.sock');
             [$broker, $control] = $this->startControlledClockBroker($database, $this->socket, $controlPath, self::CONTROLLED_NOW_MS);
-            $owned = $this->trackOwned($broker->getPid());
-            $this->assertCount(1, $owned['workers']);
+            $this->trackOwned($broker->getPid());
 
             $waiter = $this->client();
             $publisher = $this->client();
@@ -335,8 +284,7 @@ final class BrokerProcessTest extends TestCase
             $database = $this->fixture->path();
             $controlPath = $this->fixture->path('control.sock');
             [$broker, $control] = $this->startControlledClockBroker($database, $this->socket, $controlPath, self::CONTROLLED_NOW_MS);
-            $owned = $this->trackOwned($broker->getPid());
-            $this->assertCount(1, $owned['workers']);
+            $this->trackOwned($broker->getPid());
 
             $client = $this->client();
             $readyAt = self::CONTROLLED_NOW_MS + self::SUBSECOND_DELAY_MS;
@@ -367,8 +315,7 @@ final class BrokerProcessTest extends TestCase
         async(function (): void {
             $database = $this->fixture->path();
             $broker = $this->startBroker($database, $this->socket);
-            $owned = $this->trackOwned($broker->getPid());
-            $this->assertCount(1, $owned['workers']);
+            $this->trackOwned($broker->getPid());
 
             $client = $this->client();
             $id = $client->send('jobs', 'due', delay: self::REAL_TIMER_DELAY_MS);
@@ -564,8 +511,7 @@ final class BrokerProcessTest extends TestCase
         async(function (): void {
             $database = $this->fixture->path();
             $broker = $this->startBroker($database, $this->socket);
-            $owned = $this->trackOwned($broker->getPid());
-            $this->assertCount(1, $owned['workers']);
+            $this->trackOwned($broker->getPid());
 
             $waiter = $this->client();
             $publisher = $this->client();
@@ -600,6 +546,8 @@ final class BrokerProcessTest extends TestCase
         $this->assertSame('ready', $ready['event'] ?? null, 'Readiness must be reported as a positive event.');
         $this->assertSame($process->getPid(), $ready['pid'] ?? null);
         $this->assertSame($socket, $ready['endpoint'] ?? null);
+        $this->assertSame('fabpot', $ready['storage_execution'] ?? null);
+        $this->assertArrayNotHasKey('persistence_pid', $ready);
         $this->processes[] = $process;
 
         return $process;
@@ -626,6 +574,8 @@ final class BrokerProcessTest extends TestCase
         $this->assertSame('ready', $ready['event'] ?? null, 'The controlled-clock probe must report readiness.');
         $this->assertSame($process->getPid(), $ready['pid'] ?? null);
         $this->assertSame($socket, $ready['endpoint'] ?? null);
+        $this->assertSame('fabpot', $ready['storage_execution'] ?? null);
+        $this->assertArrayNotHasKey('persistence_pid', $ready);
         $this->processes[] = $process;
         $control = connect('unix://'.$controlPath, cancellation: new TimeoutCancellation(5));
         $this->controls[] = $control;
@@ -782,12 +732,12 @@ final class BrokerProcessTest extends TestCase
         return $entries;
     }
 
-    private function assertBrokerStopsOnItsOwn(Process $probe, int $pid, int $worker): void
+    private function assertBrokerStopsOnItsOwn(Process $probe, int $pid): void
     {
-        $this->assertBrokerStops($probe, $pid, $worker, 'A signal delivered inside the select window must still stop the broker.');
+        $this->assertBrokerStops($probe, $pid, 'A signal delivered inside the select window must still stop the broker.');
     }
 
-    private function assertBrokerStops(Process $probe, int $pid, int $worker, string $message): void
+    private function assertBrokerStops(Process $probe, int $pid, string $message): void
     {
         try {
             $exit = $probe->join(new TimeoutCancellation(self::SIGNAL_BOUND_SECONDS));
@@ -795,6 +745,7 @@ final class BrokerProcessTest extends TestCase
             $this->fail($message.' Safety timeout: '.$error->getMessage());
         }
         $this->assertSame(0, $exit, $message);
+        $this->assertArrayNotHasKey($pid, ProcessTree::snapshot(), $message);
     }
 
     private function spawn(string $database, string $socket): Process
@@ -818,13 +769,12 @@ final class BrokerProcessTest extends TestCase
         return $client;
     }
 
-    /** @return array{launchers: list<int>, workers: list<int>} */
+    /** @return list<int> */
     private function trackOwned(int $pid): array
     {
-        $owned = ProcessTree::ownedBy($pid);
-        $this->tracked = [...$this->tracked, ...$owned['launchers'], ...$owned['workers'], $pid];
+        $this->tracked = [...$this->tracked, $pid];
 
-        return $owned;
+        return [$pid];
     }
 
     private function stopBroker(Process $broker): void
