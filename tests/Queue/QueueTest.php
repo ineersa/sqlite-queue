@@ -328,11 +328,14 @@ final class QueueTest extends ProcessTestCase
     {
         $queue = $this->open();
         $queue->send($this->queueName('jobs'), 'one');
+        $oversized = str_repeat('x', Limits::MAX_PAYLOAD + 1);
+        $this->bindExec('UPDATE queue_messages SET body = ?', $oversized);
         $this->exec('CREATE TRIGGER lose_claim BEFORE UPDATE ON queue_messages BEGIN SELECT RAISE(IGNORE); END;');
         $session = $this->owner();
         $this->assertNull($queue->receive($this->queueName('jobs'), $session));
         $this->assertNull($this->scalar('SELECT reservation_token FROM queue_messages'));
         $this->exec('DROP TRIGGER lose_claim');
+        $this->bindExec('UPDATE queue_messages SET body = ?', 'one');
         $this->assertSame('one', $queue->receive($this->queueName('jobs'), $session)->body);
     }
 
@@ -373,7 +376,7 @@ final class QueueTest extends ProcessTestCase
         $queue->receive($this->queueName('jobs'), $this->owner());
         $database = new \SQLite3($this->database->path());
         try {
-            $result = $database->query("EXPLAIN QUERY PLAN SELECT id FROM queue_messages WHERE queue = 'jobs' AND available_at <= 1700000000000 AND (reserved_until IS NULL OR reserved_until <= 1700000000000) ORDER BY id LIMIT 1");
+            $result = $database->query("EXPLAIN QUERY PLAN SELECT id, body, headers, available_at FROM queue_messages WHERE queue = 'jobs' AND available_at <= 1700000000000 AND (reserved_until IS NULL OR reserved_until <= 1700000000000) ORDER BY id LIMIT 1");
             $details = [];
             while (false !== ($row = $result->fetchArray(\SQLITE3_ASSOC))) {
                 $details[] = $row['detail'];

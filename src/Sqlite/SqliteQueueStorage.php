@@ -20,9 +20,8 @@ final class SqliteQueueStorage
     private const int WAL_AUTOCHECKPOINT_PAGES = 1_000;
     private const string SQLITE_MINIMUM_VERSION = '3.31.0';
     private const string STATEMENT_INSERT = 'insert';
-    private const string STATEMENT_ELIGIBLE_ID = 'eligible_id';
+    private const string STATEMENT_ELIGIBLE = 'eligible';
     private const string STATEMENT_RESERVE = 'reserve';
-    private const string STATEMENT_PAYLOAD = 'payload';
     private const string STATEMENT_DELETE = 'delete';
     private const string STATEMENT_DIAGNOSE = 'diagnose';
     private const string STATEMENT_EARLIEST = 'earliest_eligibility';
@@ -53,9 +52,8 @@ final class SqliteQueueStorage
     private ?Sqlite $connection = null;
     /** @var array{
      *     insert: \PDOStatement,
-     *     eligible_id: \PDOStatement,
+     *     eligible: \PDOStatement,
      *     reserve: \PDOStatement,
-     *     payload: \PDOStatement,
      *     delete: \PDOStatement,
      *     diagnose: \PDOStatement,
      *     earliest_eligibility: \PDOStatement
@@ -78,16 +76,13 @@ final class SqliteQueueStorage
                 self::STATEMENT_INSERT => $connection->prepare(
                     'INSERT INTO queue_messages (queue, body, headers, available_at) VALUES (?, ?, ?, ?)',
                 ),
-                self::STATEMENT_ELIGIBLE_ID => $connection->prepare(
-                    'SELECT id FROM queue_messages WHERE queue = ? AND available_at <= ?
+                self::STATEMENT_ELIGIBLE => $connection->prepare(
+                    'SELECT id, body, headers, available_at FROM queue_messages WHERE queue = ? AND available_at <= ?
                      AND (reserved_until IS NULL OR reserved_until <= ?) ORDER BY id LIMIT 1',
                 ),
                 self::STATEMENT_RESERVE => $connection->prepare(
                     'UPDATE queue_messages SET reserved_until = ?, reservation_token = ?, owner_id = ?, broker_epoch = ?
                      WHERE id = ? AND queue = ? AND available_at <= ? AND (reserved_until IS NULL OR reserved_until <= ?)',
-                ),
-                self::STATEMENT_PAYLOAD => $connection->prepare(
-                    'SELECT body, headers, available_at FROM queue_messages WHERE id = ?',
                 ),
                 self::STATEMENT_DELETE => $connection->prepare(
                     'DELETE FROM queue_messages WHERE id = ? AND reservation_token = ? AND owner_id = ? AND broker_epoch = ? AND reserved_until > ?',
@@ -227,11 +222,10 @@ final class SqliteQueueStorage
      */
     public function claim(string $queue, string $ownerId, string $epoch, string $token, \Closure $clock, \Closure $reservationDeadline): ?array
     {
-        $eligible = $this->statement(self::STATEMENT_ELIGIBLE_ID);
+        $eligible = $this->statement(self::STATEMENT_ELIGIBLE);
         $reserve = $this->statement(self::STATEMENT_RESERVE);
-        $payloadStatement = $this->statement(self::STATEMENT_PAYLOAD);
 
-        return $this->transaction(static function () use ($queue, $ownerId, $epoch, $token, $clock, $reservationDeadline, $eligible, $reserve, $payloadStatement): ?array {
+        return $this->transaction(static function () use ($queue, $ownerId, $epoch, $token, $clock, $reservationDeadline, $eligible, $reserve): ?array {
             $now = $clock();
             $expires = $reservationDeadline($now);
             try {
@@ -270,23 +264,13 @@ final class SqliteQueueStorage
             if (1 !== $changed) {
                 throw new \RuntimeException('Reservation UPDATE did not affect exactly one row.');
             }
-            try {
-                $payloadStatement->bindValue(1, $id, \PDO::PARAM_INT);
-                $payloadStatement->execute();
-                $payload = $payloadStatement->fetch(\PDO::FETCH_ASSOC);
-            } finally {
-                self::releaseStatement($payloadStatement);
-            }
-            if (false === $payload) {
-                throw new \RuntimeException('Stored message is missing or has invalid payload types.');
-            }
-            $body = self::payloadBytes($payload['body'] ?? null, 'body');
-            $headers = self::payloadBytes($payload['headers'] ?? null, 'headers');
+            $body = self::payloadBytes($row['body'] ?? null, 'body');
+            $headers = self::payloadBytes($row['headers'] ?? null, 'headers');
             self::assertBoundedPayload($body, $headers);
-            if (!is_numeric($payload['available_at'] ?? null)) {
+            if (!is_numeric($row['available_at'] ?? null)) {
                 throw new \RuntimeException('Stored availability deadline must be an integer.');
             }
-            $availableAt = (int) $payload['available_at'];
+            $availableAt = (int) $row['available_at'];
             if ($availableAt < 0) {
                 throw new \RuntimeException('Stored availability deadline must be nonnegative.');
             }
@@ -543,9 +527,8 @@ final class SqliteQueueStorage
     /**
      * @return array{
      *     insert: \PDOStatement,
-     *     eligible_id: \PDOStatement,
+     *     eligible: \PDOStatement,
      *     reserve: \PDOStatement,
-     *     payload: \PDOStatement,
      *     delete: \PDOStatement,
      *     diagnose: \PDOStatement,
      *     earliest_eligibility: \PDOStatement
