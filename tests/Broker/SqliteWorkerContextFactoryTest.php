@@ -110,7 +110,7 @@ final class SqliteWorkerContextFactoryTest extends TestCase
             // watcher that keeps the loop alive.
             $this->turnEventLoop();
             $watched = $this->enabledReadableWatchers();
-            $this->assertCount(2, $watched, 'Both pipe reads must hold an enabled, referenced watcher before shutdown.');
+            $this->assertCount(3, $watched, 'Both pipe drains and the response reader must hold readability watchers before shutdown.');
 
             $launcher = $this->launcherFor($handle->pid());
             if (null === $launcher) {
@@ -144,8 +144,9 @@ final class SqliteWorkerContextFactoryTest extends TestCase
                 $this->turnEventLoop();
                 $driver = EventLoop::getDriver();
                 foreach ($watched as $id) {
-                    $this->assertContains($id, $driver->getIdentifiers(), 'A cancelled pipe read must not be rebuilt.');
-                    $this->assertFalse($driver->isEnabled($id), 'A cancelled pipe read must release its readability watcher, or the loop cannot exit.');
+                    if (\in_array($id, $driver->getIdentifiers(), true)) {
+                        $this->assertFalse($driver->isEnabled($id), 'Cleanup must disable or remove every owned readability watcher.');
+                    }
                 }
 
                 // A settled read releases the stream's read slot; a pending one rejects a second read.
@@ -191,11 +192,13 @@ final class SqliteWorkerContextFactoryTest extends TestCase
             // sqlite3 extension is loaded from.
             putenv('PHP_INI_SCAN_DIR='.(\is_string($existingScan) && '' !== $existingScan ? $existingScan.':' : ':').$scan->directory());
 
-            async(function () use ($marker, $directive, $markerValue, $configValue, $temporary): void {
+            async(function () use ($marker, $directive, $markerValue, $configValue, $temporary, $scan): void {
+                $reportPath = $scan->directory().'/environment.json';
                 $factory = new SqliteWorkerContextFactory([
                     __DIR__.'/Fixtures/persistence-env-probe.php',
                     $marker,
                     $directive,
+                    $reportPath,
                 ]);
                 $this->factory = $factory;
                 $database = $this->database();
@@ -205,8 +208,7 @@ final class SqliteWorkerContextFactoryTest extends TestCase
                     SqliteSynchronousMode::Normal,
                     new TimeoutCancellation(10),
                 );
-                $context = $worker->handle()->context();
-                $report = $context->receive(new TimeoutCancellation(10));
+                $report = json_decode(file_get_contents($reportPath), true, flags: \JSON_THROW_ON_ERROR);
                 $this->assertIsArray($report);
                 $this->assertSame(\PHP_BINARY, $report['php_binary'] ?? null, 'The child must run the broker interpreter.');
                 $this->assertSame(\PHP_SAPI, $report['sapi'] ?? null);
@@ -215,8 +217,8 @@ final class SqliteWorkerContextFactoryTest extends TestCase
                 $this->assertSame($configValue, $report['config'] ?? null, 'The child must read the broker PHP configuration.');
                 $this->assertTrue($report['sqlite3'] ?? null, 'The child must keep loading sqlite3 from the scan directory.');
 
-                // This probe has no queue operations; joining here proves a clean exit instead of a kill.
-                $this->assertNull($context->join(new TimeoutCancellation(10)));
+                // Keep response and join ownership in the proxy and handle, including Close.
+                $worker->close(new TimeoutCancellation(10));
             })->await(new TimeoutCancellation(20));
         } finally {
             foreach ($restore as $name => $value) {

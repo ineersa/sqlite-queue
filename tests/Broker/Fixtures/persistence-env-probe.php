@@ -11,14 +11,13 @@ use Ineersa\SqliteQueue\Sqlite\SqliteWorkerStatusEnum;
 /*
  * Reports what the persistence child received from the broker process.
  *
- * Answers the production init handshake first, then sends the environment report
- * that SqliteWorkerContextFactoryTest receives after create() returns. The first
- * argument names the environment variable the caller set, and the second names an
- * ini directive the caller configured. The child exits immediately after the report.
+ * Writes environment evidence before init completes, then answers Close through
+ * the normal protocol so the proxy remains the sole response reader.
  */
 return static function (Channel $channel) use ($argv): null {
     $marker = $argv[1] ?? '';
     $directive = $argv[2] ?? '';
+    $reportPath = $argv[3] ?? throw new \RuntimeException('Environment probe requires a report path.');
 
     $request = $channel->receive();
     if (!\is_array($request)
@@ -30,6 +29,17 @@ return static function (Channel $channel) use ($argv): null {
         throw new \RuntimeException('Environment probe expected a validated init request.');
     }
 
+    $report = [
+        'php_binary' => \PHP_BINARY,
+        'sapi' => \PHP_SAPI,
+        'marker' => getenv($marker),
+        'tmpdir' => getenv('TMPDIR'),
+        'config' => \ini_get($directive),
+        'sqlite3' => \extension_loaded('sqlite3'),
+    ];
+    if (false === file_put_contents($reportPath, json_encode($report, \JSON_THROW_ON_ERROR))) {
+        throw new \RuntimeException('Environment probe could not write its report.');
+    }
     $channel->send([
         'id' => 1,
         'op' => SqliteWorkerOperationEnum::Init->value,
@@ -43,13 +53,15 @@ return static function (Channel $channel) use ($argv): null {
         ],
     ]);
 
+    $close = $channel->receive();
+    if (!\is_array($close) || SqliteWorkerOperationEnum::Close->value !== ($close['op'] ?? null)) {
+        throw new \RuntimeException('Environment probe expected Close.');
+    }
     $channel->send([
-        'php_binary' => \PHP_BINARY,
-        'sapi' => \PHP_SAPI,
-        'marker' => getenv($marker),
-        'tmpdir' => getenv('TMPDIR'),
-        'config' => \ini_get($directive),
-        'sqlite3' => \extension_loaded('sqlite3'),
+        'id' => $close['id'],
+        'op' => SqliteWorkerOperationEnum::Close->value,
+        'status' => SqliteWorkerStatusEnum::Ok->value,
+        'result' => true,
     ]);
 
     return null;

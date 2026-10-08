@@ -884,7 +884,7 @@ final class BrokerTest extends TestCase
                 $proxy = (new \ReflectionProperty($broker, 'worker'))->getValue($broker);
                 $this->assertInstanceOf(\Ineersa\SqliteQueue\Sqlite\SqliteQueueWorker::class, $proxy);
                 // Close is in flight against a stopped launcher; wait one turn then escalate.
-                while (!$brokerFuture->isComplete() && !(new \ReflectionProperty($proxy, 'closing'))->getValue($proxy)) {
+                while (!$brokerFuture->isComplete() && \Ineersa\SqliteQueue\Sqlite\SqliteWorkerLifecycleEnum::Open === (new \ReflectionProperty($proxy, 'lifecycle'))->getValue($proxy)) {
                     \Amp\delay(0, cancellation: $safety);
                 }
                 $this->assertFalse($brokerFuture->isComplete(), 'Driver close must still await the stopped launcher.');
@@ -1010,8 +1010,7 @@ final class BrokerTest extends TestCase
             $worker = (new \ReflectionProperty(Broker::class, 'worker'))->getValue($broker);
             $this->assertInstanceOf(\Ineersa\SqliteQueue\Sqlite\SqliteQueueWorker::class, $worker);
             // Fail the next storage operation without racing the independent worker-death monitor.
-            (new \ReflectionProperty($worker, 'failed'))->setValue($worker, true);
-            (new \ReflectionProperty($worker, 'closing'))->setValue($worker, true);
+            (new \ReflectionProperty($worker, 'lifecycle'))->setValue($worker, \Ineersa\SqliteQueue\Sqlite\SqliteWorkerLifecycleEnum::Failed);
 
             $peer->write((new Frame(['v' => 1, 'id' => 1, 'op' => 'send', 'queue' => 'jobs', 'delay' => 0], 'must fail'))->encode());
             $this->assertNull(Frame::read($peer, new TimeoutCancellation(10)), 'Fatal storage failure must close without writing an error frame.');
