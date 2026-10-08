@@ -45,7 +45,21 @@ final readonly class Frame
         if (null === $prefix) {
             return null;
         }
-        $prefix .= self::exact($socket, Limits::LENGTH_PREFIX_BYTES - \strlen($prefix), $cancellation);
+
+        return self::readAfterPrefix($socket, $prefix, $cancellation);
+    }
+
+    /** Completes a frame after the first one to four length-prefix bytes have arrived. */
+    public static function readAfterPrefix(Socket $socket, string $prefix, Cancellation $cancellation): self
+    {
+        $prefixLength = \strlen($prefix);
+        if (0 === $prefixLength) {
+            throw new \InvalidArgumentException('Frame prefix must not be empty.');
+        }
+        if ($prefixLength > Limits::LENGTH_PREFIX_BYTES) {
+            throw new \InvalidArgumentException('Frame prefix exceeds the length-prefix size.');
+        }
+        $prefix .= self::exact($socket, Limits::LENGTH_PREFIX_BYTES - $prefixLength, $cancellation);
         $length = (int) unpack('Nlength', $prefix)['length'];
         if (!self::isFrameLength($length)) {
             throw new ProtocolException(ErrorCode::FrameTooLarge, 'Invalid frame length.');

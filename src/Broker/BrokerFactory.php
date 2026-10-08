@@ -5,14 +5,10 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Broker;
 
 use Amp\Cancellation;
+use Amp\CompositeCancellation;
 use Amp\TimeoutCancellation;
-use Fabpot\Amp\Sqlite\SqliteConfig;
-use Fabpot\Amp\Sqlite\SqliteConnector;
-use Fabpot\Amp\Sqlite\SqliteJournalMode;
-use Fabpot\Amp\Sqlite\SqliteSynchronousMode;
-use Fabpot\Amp\Sqlite\SqliteTransactionMode;
 use Ineersa\SqliteQueue\Queue;
-use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
+use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 use Ineersa\SqliteQueue\Sqlite\SqliteWorkerContextFactory;
 use Symfony\Component\Filesystem\Exception\IOException;
 use Symfony\Component\Filesystem\Filesystem;
@@ -28,14 +24,19 @@ use function Amp\Socket\listen;
  */
 final class BrokerFactory
 {
-    private const int BUSY_TIMEOUT_MS = 5000;
-    /** Budget for observing the SQLite worker pipes while a failed startup releases resources, in seconds. */
-    private const int RELEASE_BUDGET_SECONDS = 5;
+    /** Total budget for worker spawn, initialization, and readiness, in seconds. */
+    private const float STARTUP_BUDGET_SECONDS = 15.0;
+    /** Budget for observing the SQLite worker while a failed startup releases resources, in seconds. */
+    private const float RELEASE_BUDGET_SECONDS = 5.0;
+
+    private readonly SqliteWorkerContextFactory $workers;
 
     /**
-     * @param int                    $visibilityTimeout redelivery delay in milliseconds; defaults to Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS
-     * @param (\Closure(): int)|null $clock             deterministic millisecond clock for tests; the wall clock otherwise
-     * @param ?Cancellation          $cancellation      cooperative cancellation for the blocking startup only; serving cancellation stays on Broker::run()
+     * @param SqliteSynchronousMode       $synchronous       NORMAL is the product default; FULL enables stronger commit durability
+     * @param int                         $visibilityTimeout redelivery delay in milliseconds; defaults to Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS
+     * @param (\Closure(): int)|null      $clock             parent wall-clock milliseconds for notifier timers; never a worker clock
+     * @param ?Cancellation               $cancellation      cooperative cancellation for the blocking startup only; serving cancellation stays on Broker::run()
+     * @param ?SqliteWorkerContextFactory $workers           production uses the package default; tests may inject a controlled-clock bootstrap
      */
     public function __construct(
         private readonly string $database,
@@ -43,7 +44,13 @@ final class BrokerFactory
         private readonly int $visibilityTimeout = Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS,
         private readonly ?\Closure $clock = null,
         private readonly ?Cancellation $cancellation = null,
+        private readonly SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal,
+        ?SqliteWorkerContextFactory $workers = null,
     ) {
+        if ($visibilityTimeout <= 0) {
+            throw new \InvalidArgumentException('Visibility timeout must be positive milliseconds.');
+        }
+        $this->workers = $workers ?? new SqliteWorkerContextFactory();
     }
 
     public function create(): Broker
@@ -54,10 +61,12 @@ final class BrokerFactory
         if (!\function_exists('posix_geteuid')) {
             throw new \RuntimeException('The broker requires the posix extension to validate file ownership.');
         }
+        if (!\extension_loaded('pdo_sqlite')) {
+            throw new \RuntimeException('The broker requires the pdo_sqlite extension.');
+        }
         /** @var list<callable(): void> */
         $release = [];
         $filesystem = new Filesystem();
-        $workerFactory = new SqliteWorkerContextFactory();
         try {
             $locks = new BrokerLifetimeLocks($this->database, $this->endpoint);
             $release[] = $locks->close(...);
@@ -66,24 +75,22 @@ final class BrokerFactory
             if ($filesystem->exists($locks->endpoint) || is_link($locks->endpoint)) {
                 throw new \RuntimeException('Endpoint already exists; it will not be removed without verified ownership.');
             }
-            $config = (new SqliteConfig($locks->database))
-                ->withJournalMode(SqliteJournalMode::Wal)
-                ->withSynchronousMode(SqliteSynchronousMode::Full)
-                ->withTransactionMode(SqliteTransactionMode::Immediate)
-                ->withBusyTimeout(self::BUSY_TIMEOUT_MS);
-            $connection = (new SqliteConnector($workerFactory))->connect($config, $this->cancellation);
-            $worker = $workerFactory->worker();
-            // Pushed before the connection so cleanup still closes the connection first.
+
+            $startup = new TimeoutCancellation(self::STARTUP_BUDGET_SECONDS);
+            $budget = null === $this->cancellation
+                ? $startup
+                : new CompositeCancellation($this->cancellation, $startup);
+            $worker = $this->workers->create(
+                $locks->database,
+                $this->visibilityTimeout,
+                $this->synchronous,
+                $budget,
+            );
             $release[] = static function () use ($worker): void {
                 $worker->close(new TimeoutCancellation(self::RELEASE_BUDGET_SECONDS));
             };
-            $release[] = $connection->close(...);
-            // Storage becomes the sole connection owner after construction succeeds.
-            $storage = new SqliteQueueStorage($connection);
-            array_pop($release);
-            $release[] = $storage->close(...);
+
             $clock = $this->clock ?? static fn (): int => (int) floor(microtime(true) * 1000);
-            $queue = new Queue($storage, $this->visibilityTimeout, $clock);
             $mask = umask(0077);
             try {
                 $server = listen('unix://'.$locks->endpoint);
@@ -103,13 +110,10 @@ final class BrokerFactory
                 throw new \RuntimeException('Cannot make socket private.', 0, $error);
             }
 
-            return new Broker($server, $queue, $storage, $worker, $locks, $socketIdentity, $clock);
+            return new Broker($server, $worker, $locks, $socketIdentity, $clock);
         } catch (\Throwable $error) {
-            // Kill any spawned child before graceful releases: connect() may fail after the
-            // connector starts the worker but before the handle is assigned, and a stuck
-            // worker would block the connection close below.
             try {
-                $workerFactory->forceStopAll();
+                $this->workers->forceStopAll();
             } catch (\Throwable) {
                 // Best-effort: the original failure is what the caller receives.
             }

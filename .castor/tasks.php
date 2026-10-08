@@ -49,10 +49,10 @@ function test_flex(): int
     return report('test:flex', ['bash', 'tests/Messenger/Fixtures/flex-install.sh'], timeout: null);
 }
 
-#[AsTask(name: 'test:driver', namespace: '', description: 'Run async-driver tests; save JUnit XML and logs.')]
-function test_driver(#[AsOption(description: 'PHPUnit test-name filter.')] ?string $filter = null): int
+#[AsTask(name: 'test:sqlite', namespace: '', description: 'Run package SQLite worker and storage tests; save JUnit XML and logs.')]
+function test_sqlite(#[AsOption(description: 'PHPUnit test-name filter.')] ?string $filter = null): int
 {
-    return run_tests('test:driver', 'driver', $filter);
+    return run_tests('test:sqlite', 'sqlite', $filter);
 }
 
 #[AsTask(name: 'test:bench', namespace: '', description: 'Run benchmark correctness tests; save JUnit XML and logs.')]
@@ -69,10 +69,13 @@ function test_broker(#[AsOption(description: 'PHPUnit test-name filter.')] ?stri
 
 #[AsTask(name: 'bench', namespace: '', description: 'Capture a benchmark; save the capture path and progress in the task log.')]
 function bench(
-    #[AsOption(description: 'Run smoke workloads, not a performance capture.')] bool $smoke = false,
-    #[AsOption(description: 'Workload name or all.')] string $workload = 'all',
+    #[AsOption(description: 'Tiny control-path checks, not performance evidence.')] bool $smoke = false,
+    #[AsOption(description: 'Roundtrip, concurrent, application, idle or retention.')] string $workload = 'roundtrip',
+    #[AsOption(description: 'Measured window in seconds.')] float $duration = 60,
+    #[AsOption(description: 'WAL synchronous mode for both backends: normal or full.')] string $synchronous = 'normal',
+    #[AsOption(description: 'Doctrine idle poll interval in milliseconds; broker uses WAIT.')] string $pollingMs = '50',
 ): int {
-    $command = [\PHP_BINARY, 'bin/benchmark', 'run', '--no-ansi', '--no-interaction', '--workload='.$workload];
+    $command = [\PHP_BINARY, 'bin/benchmark', 'run', '--no-ansi', '--no-interaction', '--workload='.$workload, '--duration='.$duration, '--synchronous='.$synchronous, '--polling-ms='.$pollingMs];
     if ($smoke) {
         $command[] = '--smoke';
     }

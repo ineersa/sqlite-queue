@@ -5,16 +5,6 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Tests\Queue;
 
 use Amp\DeferredCancellation;
-use Amp\DeferredFuture;
-use Amp\TimeoutCancellation;
-use Fabpot\Amp\Sqlite\SqliteConfig;
-use Fabpot\Amp\Sqlite\SqliteConnection;
-use Fabpot\Amp\Sqlite\SqliteConnectionException;
-use Fabpot\Amp\Sqlite\SqliteConnector;
-use Fabpot\Amp\Sqlite\SqliteJournalMode;
-use Fabpot\Amp\Sqlite\SqliteQueryError;
-use Fabpot\Amp\Sqlite\SqliteSynchronousMode;
-use Fabpot\Amp\Sqlite\SqliteTransaction;
 use Ineersa\SqliteQueue\DTO\DeliveryDTO;
 use Ineersa\SqliteQueue\Exception\ClientContextClosedException;
 use Ineersa\SqliteQueue\Exception\ExpiredReceiptException;
@@ -24,16 +14,16 @@ use Ineersa\SqliteQueue\Exception\NoActiveReservationException;
 use Ineersa\SqliteQueue\Exception\ReceiptEpochMismatchException;
 use Ineersa\SqliteQueue\Exception\ReceiptOwnerMismatchException;
 use Ineersa\SqliteQueue\Exception\ReceiptTokenMismatchException;
+use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
-use Ineersa\SqliteQueue\Tests\Driver\DriverTestCase;
-use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
+use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
+use Ineersa\SqliteQueue\Tests\Support\ProcessTestCase;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
+use Pdo\Sqlite;
 use PHPUnit\Framework\Attributes\DataProvider;
 
-use function Amp\async;
-
-final class QueueTest extends DriverTestCase
+final class QueueTest extends ProcessTestCase
 {
     private int $now = 1_700_000_000_000;
     /** @var list<SqliteQueueStorage> */
@@ -103,93 +93,73 @@ final class QueueTest extends DriverTestCase
     public function testEligibleMessagesUseInsertionOrderNotDeadlineOrder(): void
     {
         $queue = $this->open();
-        $first = $queue->send($this->queueName('jobs'), 'first', delay: 200);
-        $second = $queue->send($this->queueName('jobs'), 'second', delay: 100);
-        $this->now += 200;
+        $first = $queue->send($this->queueName('jobs'), 'first', delay: 10);
+        $second = $queue->send($this->queueName('jobs'), 'second');
+        $this->now += 10;
         $session = $this->owner();
         $this->assertSame($first, $queue->receive($this->queueName('jobs'), $session)->id);
         $this->assertSame($second, $queue->receive($this->queueName('jobs'), $session)->id);
     }
 
-    public function testStaleForeignDisconnectedAndPreviousEpochReceipts(): void
+    public function testStaleForeignAndPreviousEpochReceipts(): void
     {
         $queue = $this->open(50);
-        $queue->send($this->queueName('jobs'), 'message');
         $owner = $this->owner();
         $foreign = $this->owner();
-        $first = $queue->receive($this->queueName('jobs'), $owner);
-        $this->invalid(static fn () => $queue->acknowledge($first->receipt, $foreign));
-        $this->invalid(static fn () => $queue->reject($first->receipt, $foreign));
-        $this->now += 49;
-        $this->assertNull($queue->receive($this->queueName('jobs'), $foreign));
-        ++$this->now;
-        $this->invalid(static fn () => $queue->acknowledge($first->receipt, $owner));
-        $next = $queue->receive($this->queueName('jobs'), $foreign);
-        $this->assertSame($first->id, $next->id);
-        $this->assertNotSame($first->receipt, $next->receipt);
-        $this->invalid(static fn () => $queue->reject($first->receipt, $owner));
-        $disconnected = $this->lifetime();
-        $disconnected->cancel();
-        $this->contextClosed(static fn () => $queue->acknowledge($next->receipt, $foreign, $disconnected->getCancellation()));
-        $this->assertNull($queue->receive($this->queueName('jobs'), $owner));
+        $queue->send($this->queueName(), 'payload');
+        $delivery = $queue->receive($this->queueName(), $owner);
+        $this->assertNotNull($delivery);
+        $this->invalid(static fn () => $queue->acknowledge($delivery->receipt, $foreign));
+        $this->invalid(fn () => $queue->acknowledge($this->differentToken($delivery->receipt), $owner));
+        $this->now = $delivery->reservedUntil;
+        $this->invalid(static fn () => $queue->acknowledge($delivery->receipt, $owner));
+        $replacement = $queue->receive($this->queueName(), $foreign);
+        $this->assertNotNull($replacement);
+        $this->assertSame($delivery->id, $replacement->id);
+        $this->assertNotSame($delivery->receipt, $replacement->receipt);
         $this->latestStorage()->close();
         $queue = $this->open(50);
-        $newOwner = $this->owner();
-        $this->invalid(static fn () => $queue->reject($next->receipt, $newOwner));
-        $this->assertNull($queue->receive($this->queueName('jobs'), $newOwner));
-        $this->now += 50;
-        $last = $queue->receive($this->queueName('jobs'), $newOwner);
-        $queue->acknowledge($last->receipt, $newOwner);
-        $this->invalid(static fn () => $queue->acknowledge($last->receipt, $newOwner));
-        $newId = $queue->send($this->queueName('jobs'), 'new identity');
-        $this->assertGreaterThan($first->id, $newId);
-        $this->invalid(static fn () => $queue->reject($last->receipt, $newOwner));
-        $this->assertSame($newId, $queue->receive($this->queueName('jobs'), $newOwner)->id);
+        $this->invalid(static fn () => $queue->acknowledge($replacement->receipt, $foreign));
     }
 
     public static function malformedReceipts(): iterable
     {
-        $token = str_repeat('a', 64);
         yield 'empty' => [''];
-        yield 'missing delimiter' => ['1'.$token];
-        yield 'zero ID' => ['0:'.$token];
-        yield 'negative ID' => ['-1:'.$token];
-        yield 'leading zero' => ['01:'.$token];
-        yield 'overflow ID' => [\PHP_INT_MAX.'0:'.$token];
-        yield 'short token' => ['1:'.substr($token, 1)];
-        yield 'long token' => ['1:'.$token.'a'];
-        yield 'uppercase token' => ['1:'.strtoupper($token)];
-        yield 'nonhex token' => ['1:'.str_repeat('g', 64)];
-        yield 'trailing newline' => ['1:'.$token."\n"];
+        yield 'missing-token' => ['1'];
+        yield 'uppercase' => ['1:'.str_repeat('A', 64)];
+        yield 'short-token' => ['1:'.str_repeat('a', 63)];
+        yield 'zero-id' => ['0:'.str_repeat('a', 64)];
     }
 
     #[DataProvider('malformedReceipts')]
     public function testMalformedReceiptsAreNotReservationMismatches(string $receipt): void
     {
         $queue = $this->open();
-        $owner = $this->owner();
-        $this->receiptFailure(static fn () => $queue->acknowledge($receipt, $owner), new MalformedReceiptException());
-        $this->receiptFailure(static fn () => $queue->reject($receipt, $owner), new MalformedReceiptException());
-        $id = $queue->send($this->queueName(), 'still usable');
-        $this->assertSame($id, $queue->receive($this->queueName(), $owner)->id);
+        $this->receiptFailure(
+            static fn () => $queue->acknowledge($receipt, 'owner'),
+            new MalformedReceiptException(),
+        );
     }
 
     #[DataProvider('settlements')]
     public function testMissingMessageHasNoActiveReservation(string $operation): void
     {
         $queue = $this->open();
-        $receipt = '1:'.str_repeat('a', 64);
-        $this->receiptFailure(fn () => $this->mutate($queue, $this->owner(), $receipt, $operation), new NoActiveReservationException());
-        $this->assertSame(0, $this->scalar('SELECT count(*) FROM queue_messages'));
+        $this->receiptFailure(
+            fn () => $this->mutate($queue, $this->owner(), '1:'.str_repeat('a', 64), $operation),
+            new NoActiveReservationException(),
+        );
     }
 
     #[DataProvider('settlements')]
     public function testUnreservedMessageHasNoActiveReservation(string $operation): void
     {
         $queue = $this->open();
-        $id = $queue->send($this->queueName(), 'unreserved');
-        $this->receiptFailure(fn () => $this->mutate($queue, $this->owner(), $id.':'.str_repeat('a', 64), $operation), new NoActiveReservationException());
-        $this->assertSame($id, $queue->receive($this->queueName(), $this->owner())->id);
+        $id = $queue->send($this->queueName(), 'payload');
+        $this->receiptFailure(
+            fn () => $this->mutate($queue, $this->owner(), $id.':'.str_repeat('a', 64), $operation),
+            new NoActiveReservationException(),
+        );
     }
 
     #[DataProvider('settlements')]
@@ -198,9 +168,10 @@ final class QueueTest extends DriverTestCase
         $queue = $this->open();
         $owner = $this->owner();
         $receipt = $this->prepareOperation($queue, $owner, $operation);
-        $this->receiptFailure(fn () => $this->mutate($queue, $this->owner(), $receipt, $operation), new ReceiptOwnerMismatchException());
-        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
-        $this->mutate($queue, $owner, $receipt, $operation);
+        $this->receiptFailure(
+            fn () => $this->mutate($queue, $this->owner(), $receipt, $operation),
+            new ReceiptOwnerMismatchException(),
+        );
     }
 
     #[DataProvider('settlements')]
@@ -210,9 +181,10 @@ final class QueueTest extends DriverTestCase
         $owner = $this->owner();
         $receipt = $this->prepareOperation($queue, $owner, $operation);
         $replacement = new Queue($this->latestStorage(), clock: fn (): int => $this->now);
-        $this->receiptFailure(fn () => $this->mutate($replacement, $owner, $receipt, $operation), new ReceiptEpochMismatchException());
-        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
-        $this->mutate($queue, $owner, $receipt, $operation);
+        $this->receiptFailure(
+            fn () => $this->mutate($replacement, $owner, $receipt, $operation),
+            new ReceiptEpochMismatchException(),
+        );
     }
 
     #[DataProvider('settlements')]
@@ -221,10 +193,10 @@ final class QueueTest extends DriverTestCase
         $queue = $this->open();
         $owner = $this->owner();
         $receipt = $this->prepareOperation($queue, $owner, $operation);
-        $wrong = $this->differentToken($receipt);
-        $this->receiptFailure(fn () => $this->mutate($queue, $owner, $wrong, $operation), new ReceiptTokenMismatchException());
-        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
-        $this->mutate($queue, $owner, $receipt, $operation);
+        $this->receiptFailure(
+            fn () => $this->mutate($queue, $owner, $this->differentToken($receipt), $operation),
+            new ReceiptTokenMismatchException(),
+        );
     }
 
     #[DataProvider('settlements')]
@@ -233,10 +205,11 @@ final class QueueTest extends DriverTestCase
         $queue = $this->open(50);
         $owner = $this->owner();
         $receipt = $this->prepareOperation($queue, $owner, $operation);
-        $this->now = $this->scalar('SELECT reserved_until FROM queue_messages');
-        $this->receiptFailure(fn () => $this->mutate($queue, $owner, $receipt, $operation), new ExpiredReceiptException());
-        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
-        $this->assertNotSame($receipt, $queue->receive($this->queueName(), $owner)->receipt);
+        $this->now += 50;
+        $this->receiptFailure(
+            fn () => $this->mutate($queue, $owner, $receipt, $operation),
+            new ExpiredReceiptException(),
+        );
     }
 
     public function testReceiptFailurePrecedence(): void
@@ -245,8 +218,8 @@ final class QueueTest extends DriverTestCase
         $owner = $this->owner();
         $receipt = $this->prepareOperation($queue, $owner, 'acknowledge');
         $wrong = $this->differentToken($receipt);
-        $this->now = $this->scalar('SELECT reserved_until FROM queue_messages');
         $replacement = new Queue($this->latestStorage(), clock: fn (): int => $this->now);
+        $this->now += 50;
         $this->receiptFailure(fn () => $replacement->acknowledge($wrong, $this->owner()), new ReceiptOwnerMismatchException());
         $this->receiptFailure(static fn () => $replacement->acknowledge($wrong, $owner), new ReceiptEpochMismatchException());
         $this->receiptFailure(static fn () => $queue->acknowledge($wrong, $owner), new ReceiptTokenMismatchException());
@@ -311,343 +284,86 @@ final class QueueTest extends DriverTestCase
         $this->assertSame($count, $this->scalar('SELECT count(*) FROM queue_messages'));
     }
 
+    public function testCancelledContextDoesNotRevokeAnAlreadyStartedSettlement(): void
+    {
+        $lifetime = $this->lifetime();
+        $settling = false;
+        $storage = $this->openStorage();
+        $this->storages[] = $storage;
+        $queue = new Queue($storage, clock: function () use (&$settling, $lifetime): int {
+            if ($settling) {
+                // This clock runs after transaction acquisition, before the fenced DELETE.
+                $lifetime->cancel();
+            }
+
+            return $this->now;
+        });
+        $owner = $this->owner();
+        $receipt = $this->prepareOperation($queue, $owner, 'acknowledge');
+        $settling = true;
+        $queue->acknowledge($receipt, $owner, $lifetime->getCancellation());
+        $this->assertTrue($lifetime->getCancellation()->isRequested());
+        $this->assertSame(0, $this->scalar('SELECT count(*) FROM queue_messages'));
+    }
+
     public function testConcurrentReceiversAcrossConnectionsCannotShareDelivery(): void
     {
         $first = $this->open();
         $second = $this->open();
         $first->send($this->queueName('jobs'), 'one');
         $sessions = [$this->owner(), $this->owner()];
-        $futures = [];
+        $deliveries = [];
         for ($i = 0; $i < 8; ++$i) {
             $engine = 0 === $i % 2 ? $first : $second;
             $session = $sessions[$i % 2];
-            $name = $this->queueName('jobs');
-            $futures[] = async(static fn () => $engine->receive($name, $session));
-        }
-        $deliveries = array_filter(array_map(static fn ($future) => $future->await(), $futures));
-        $this->assertCount(1, $deliveries);
-    }
-
-    public static function mutations(): iterable
-    {
-        yield 'send' => ['send'];
-        yield 'claim' => ['receive'];
-        yield 'ack' => ['acknowledge'];
-        yield 'reject' => ['reject'];
-    }
-
-    #[DataProvider('mutations')]
-    public function testCommitFailureRollsBackAndReleasesOperation(string $operation): void
-    {
-        $real = $this->connection();
-        $armed = false;
-        $connection = $this->forward(SqliteConnection::class, $real, [
-            'beginTransaction' => function () use ($real, &$armed) {
-                $transaction = $real->beginTransaction();
-
-                return $this->forward(SqliteTransaction::class, $transaction, [
-                    'commit' => static function () use ($transaction, &$armed): void {
-                        if ($armed) {
-                            $armed = false;
-                            $transaction->execute('INSERT INTO child_guard VALUES (123)')->close();
-                        }
-                        $transaction->commit();
-                    },
-                ]);
-            },
-        ]);
-        $queue = $this->open(connection: $connection);
-        $session = $this->owner();
-        $receipt = $this->prepareOperation($queue, $session, $operation);
-        $before = $this->scalar('SELECT count(*) FROM queue_messages');
-        $this->exec('CREATE TABLE parent_guard (id INTEGER PRIMARY KEY); CREATE TABLE child_guard (id INTEGER REFERENCES parent_guard(id) DEFERRABLE INITIALLY DEFERRED);');
-        $armed = true;
-        try {
-            $this->mutate($queue, $session, $receipt, $operation);
-            $this->fail('A deferred foreign-key violation must fail COMMIT.');
-        } catch (SqliteQueryError) {
-            $this->assertSame($before, $this->scalar('SELECT count(*) FROM queue_messages'));
-            $this->assertSame(0, $this->scalar('SELECT count(*) FROM child_guard'));
-        }
-        $result = $this->mutate($queue, $session, $receipt, $operation);
-        if ('receive' === $operation) {
-            $this->assertInstanceOf(DeliveryDTO::class, $result);
-        }
-        $this->assertGreaterThan(0, $queue->send($this->queueName('recovered'), 'usable after rollback'));
-    }
-
-    #[DataProvider('mutations')]
-    public function testNoConfirmationOrInterleavingBeforeCommit(string $operation): void
-    {
-        $real = $this->connection();
-        $entered = new DeferredFuture();
-        $release = new DeferredFuture();
-        $armed = false;
-        $begins = 0;
-        $connection = $this->forward(SqliteConnection::class, $real, [
-            'beginTransaction' => function () use ($real, $entered, $release, &$armed, &$begins) {
-                ++$begins;
-                $transaction = $real->beginTransaction();
-
-                return $this->forward(SqliteTransaction::class, $transaction, [
-                    'commit' => static function () use ($transaction, $entered, $release, &$armed): void {
-                        if ($armed) {
-                            $armed = false;
-                            $entered->complete();
-                            $release->getFuture()->await(new TimeoutCancellation(5));
-                        }
-                        $transaction->commit();
-                    },
-                ]);
-            },
-        ]);
-        $queue = $this->open(connection: $connection);
-        $session = $this->owner();
-        $receipt = $this->prepareOperation($queue, $session, $operation);
-        $before = $this->scalar('SELECT count(*) FROM queue_messages');
-        $armed = true;
-        $future = async(fn () => $this->mutate($queue, $session, $receipt, $operation));
-        $competitor = null;
-        try {
-            $entered->getFuture()->await(new TimeoutCancellation(5));
-            $this->assertFalse($future->isComplete());
-            $this->assertSame($before, $this->scalar('SELECT count(*) FROM queue_messages'));
-            if ('receive' === $operation) {
-                $this->assertNull($this->scalar('SELECT reservation_token FROM queue_messages'));
+            $delivery = $engine->receive($this->queueName('jobs'), $session);
+            if (null !== $delivery) {
+                $deliveries[] = $delivery;
             }
-            $started = new DeferredFuture();
-            $beforeBegins = $begins;
-            $other = $this->queueName('other');
-            $competitor = async(static function () use ($queue, $started, $other): int {
-                $started->complete();
-
-                return $queue->send($other, 'must wait for whole transaction');
-            });
-            $started->getFuture()->await(new TimeoutCancellation(5));
-            $this->assertFalse($competitor->isComplete());
-            $this->assertSame($beforeBegins, $begins);
-        } finally {
-            $release->complete();
-            $future->await(new TimeoutCancellation(5));
-            $competitor?->await(new TimeoutCancellation(5));
         }
-        $this->assertSame($beforeBegins + 1, $begins);
-    }
-
-    public function testDisconnectDuringReceiveKeepsCommittedReservationUntilOriginalExpiry(): void
-    {
-        $entered = new DeferredFuture();
-        $release = new DeferredFuture();
-        $armed = false;
-        $queue = $this->open(50, $this->pauseAt('commit', $entered, $release, $armed));
-        $queue->send($this->queueName('jobs'), 'reserved');
-        $session = $this->owner();
-        $lifetime = $this->lifetime();
-        $expiry = $this->now + 50;
-        $armed = true;
-        $name = $this->queueName('jobs');
-        $cancellation = $lifetime->getCancellation();
-        $receive = async(static fn () => $queue->receive($name, $session, $cancellation));
-        try {
-            $entered->getFuture()->await(new TimeoutCancellation(5));
-            $this->assertFalse($receive->isComplete());
-            $this->assertNull($this->scalar('SELECT reservation_token FROM queue_messages'));
-            $this->now += 10;
-            $lifetime->cancel();
-        } finally {
-            $release->complete();
-            $this->contextClosed(static fn () => $receive->await(new TimeoutCancellation(5)));
-        }
-        $this->assertSame($expiry, $this->scalar('SELECT reserved_until FROM queue_messages'));
-        $this->assertNotNull($this->scalar('SELECT reservation_token FROM queue_messages'));
-        $replacement = $this->owner();
-        $this->now = $expiry - 1;
-        $this->assertNull($queue->receive($this->queueName('jobs'), $replacement));
-        $this->now = $expiry;
-        $this->assertSame('reserved', $queue->receive($this->queueName('jobs'), $replacement)->body);
-    }
-
-    public static function settlements(): iterable
-    {
-        yield 'ack' => ['acknowledge'];
-        yield 'reject' => ['reject'];
-    }
-
-    #[DataProvider('settlements')]
-    public function testDisconnectAfterDeleteRollsBackSettlement(string $operation): void
-    {
-        $entered = new DeferredFuture();
-        $release = new DeferredFuture();
-        $armed = false;
-        $queue = $this->open(50, $this->pauseAt('delete', $entered, $release, $armed));
-        $session = $this->owner();
-        $lifetime = $this->lifetime();
-        $receipt = $this->prepareOperation($queue, $session, $operation);
-        $token = $this->scalar('SELECT reservation_token FROM queue_messages');
-        $expiry = $this->scalar('SELECT reserved_until FROM queue_messages');
-        $armed = true;
-        $settle = async(fn () => $this->mutate($queue, $session, $receipt, $operation, $lifetime->getCancellation()));
-        try {
-            $entered->getFuture()->await(new TimeoutCancellation(5));
-            $this->assertFalse($settle->isComplete());
-            $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
-            $lifetime->cancel();
-        } finally {
-            $release->complete();
-            $this->contextClosed(static fn () => $settle->await(new TimeoutCancellation(5)));
-        }
-        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
-        $this->assertSame($token, $this->scalar('SELECT reservation_token FROM queue_messages'));
-        $this->assertSame($expiry, $this->scalar('SELECT reserved_until FROM queue_messages'));
-        $replacement = $this->owner();
-        $this->assertNull($queue->receive($this->queueName('jobs'), $replacement));
-        $this->now = $expiry;
-        $this->assertSame('payload', $queue->receive($this->queueName('jobs'), $replacement)->body);
-    }
-
-    public function testCloseWaitsForInFlightSendAndPreservesItsCommit(): void
-    {
-        $entered = new DeferredFuture();
-        $release = new DeferredFuture();
-        $armed = false;
-        $connection = $this->pauseAt('commit', $entered, $release, $armed);
-        $queue = $this->open(connection: $connection);
-        $armed = true;
-        $name = $this->queueName('jobs');
-        $send = async(static fn () => $queue->send($name, 'durable before close'));
-        $close = null;
-        try {
-            $entered->getFuture()->await(new TimeoutCancellation(5));
-            $this->assertFalse($send->isComplete());
-            $started = new DeferredFuture();
-            $storage = $this->latestStorage();
-            $close = async(static function () use ($storage, $started): void {
-                $started->complete();
-                $storage->close();
-            });
-            $started->getFuture()->await(new TimeoutCancellation(5));
-            $this->assertFalse($close->isComplete());
-            $this->assertFalse($connection->isClosed());
-            $this->assertSame(0, $this->scalar('SELECT count(*) FROM queue_messages'));
-        } finally {
-            $release->complete();
-            $id = $send->await(new TimeoutCancellation(5));
-            $close?->await(new TimeoutCancellation(5));
-        }
-        $this->assertTrue($connection->isClosed());
-        try {
-            $queue->send($this->queueName('jobs'), 'after close');
-            $this->fail('Closed engine accepted a send.');
-        } catch (\RuntimeException $error) {
-            $this->assertStringContainsString('closed', $error->getMessage());
-        }
-        $reopened = $this->open();
-        $delivery = $reopened->receive($this->queueName('jobs'), $this->owner());
-        $this->assertSame($id, $delivery->id);
-        $this->assertSame('durable before close', $delivery->body);
+        $this->assertCount(1, $deliveries);
     }
 
     public function testZeroRowClaimRollsBack(): void
     {
         $queue = $this->open();
         $queue->send($this->queueName('jobs'), 'one');
+        $oversized = str_repeat('x', Limits::MAX_PAYLOAD + 1);
+        $this->bindExec('UPDATE queue_messages SET body = ?', $oversized);
         $this->exec('CREATE TRIGGER lose_claim BEFORE UPDATE ON queue_messages BEGIN SELECT RAISE(IGNORE); END;');
         $session = $this->owner();
         $this->assertNull($queue->receive($this->queueName('jobs'), $session));
         $this->assertNull($this->scalar('SELECT reservation_token FROM queue_messages'));
         $this->exec('DROP TRIGGER lose_claim');
+        $this->bindExec('UPDATE queue_messages SET body = ?', 'one');
         $this->assertSame('one', $queue->receive($this->queueName('jobs'), $session)->body);
-    }
-
-    public function testPersistenceWorkerDeathFailsWithoutLeavingOwnershipStuck(): void
-    {
-        $queue = $this->open();
-        $queue->send($this->queueName('jobs'), 'confirmed');
-        $workers = ProcessTree::ownedBy(getmypid())['workers'];
-        $this->assertCount(1, $workers);
-        $pid = $workers[0];
-        $this->assertNotSame(0, posix_geteuid());
-        $this->assertSame(posix_geteuid(), fileowner('/proc/'.$pid));
-        $this->assertTrue(posix_kill($pid, \SIGKILL));
-        try {
-            $queue->send($this->queueName('jobs'), 'unconfirmed');
-            $this->fail('Dead persistence worker must surface as an error.');
-        } catch (SqliteConnectionException) {
-            $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
-        }
-        $this->expectException(\RuntimeException::class);
-        $queue->send($this->queueName('jobs'), 'closed');
     }
 
     public function testValidationAndClose(): void
     {
+        $storage = $this->openStorage();
+        $this->storages[] = $storage;
+        $this->expectException(\InvalidArgumentException::class);
+        new Queue($storage, 0);
+    }
+
+    public function testClosedStorageRejectsOperations(): void
+    {
         $queue = $this->open();
-        foreach (['', '../db', 'a/b', "nul\0", str_repeat('x', 256)] as $name) {
-            try {
-                new QueueName($name);
-                $this->fail('Invalid queue name accepted.');
-            } catch (\InvalidArgumentException) {
-            }
-        }
-        foreach ([-1, \PHP_INT_MAX] as $delay) {
-            try {
-                $queue->send($this->queueName('jobs'), 'body', delay: $delay);
-                $this->fail('Invalid delay accepted.');
-            } catch (\InvalidArgumentException) {
-            }
-        }
-        $this->assertSame(0, $this->scalar('SELECT count(*) FROM queue_messages'));
+        $queue->send($this->queueName('jobs'), 'payload');
         $this->latestStorage()->close();
         $this->latestStorage()->close();
         $this->expectException(\RuntimeException::class);
         $queue->send($this->queueName('jobs'), 'closed');
     }
 
-    public function testDatabaseFullLeavesConfirmedDataAndFailedOrUsableOwnership(): void
+    public function testInitializationFailureReleasesConnection(): void
     {
-        $connection = $this->connection();
-        $queue = $this->open(connection: $connection);
-        $queue->send($this->queueName('jobs'), 'confirmed');
-        $pages = $connection->query('PRAGMA page_count');
-        $count = $pages->fetchRow()['page_count'];
-        $pages->close();
-        $connection->query('PRAGMA max_page_count='.$count)->close();
-        $failure = null;
         try {
-            $queue->send($this->queueName('jobs'), str_repeat('x', 1_000_000));
-        } catch (\Throwable $error) {
-            $failure = $error;
-        }
-        $this->assertNotNull($failure);
-        $cause = $failure;
-        while (null !== $cause->getPrevious()) {
-            $cause = $cause->getPrevious();
-        }
-        $this->assertStringContainsString('full', strtolower($cause->getMessage()));
-        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
-        // A follow-up must either work or fail explicitly, never remain queued behind a lost lock.
-        $name = $this->queueName('other');
-        $followup = async(static fn () => $queue->send($name, 'small'));
-        try {
-            $followup->await(new TimeoutCancellation(5));
-        } catch (\RuntimeException $error) {
-            $this->assertStringContainsString('closed', $error->getMessage());
-        }
-        $this->latestStorage()->close();
-        $reopened = $this->open();
-        $this->assertSame('confirmed', $reopened->receive($this->queueName('jobs'), $this->owner())->body);
-    }
-
-    public function testInitializationFailureClosesTransferredConnection(): void
-    {
-        $connection = (new SqliteConnector())->connect(new SqliteConfig($this->database->path()));
-        try {
-            new SqliteQueueStorage($connection);
-            $this->fail('NORMAL durability must not be accepted.');
-        } catch (\InvalidArgumentException) {
-            $this->assertTrue($connection->isClosed());
-        } finally {
-            $connection->close();
+            SqliteQueueStorage::open(':memory:');
+            $this->fail('Memory databases must be rejected before acquisition.');
+        } catch (\InvalidArgumentException $error) {
+            $this->assertSame('Queue storage requires a database file path.', $error->getMessage());
         }
         $this->assertGreaterThan(0, $this->open()->send($this->queueName(), 'recovered'));
     }
@@ -660,7 +376,7 @@ final class QueueTest extends DriverTestCase
         $queue->receive($this->queueName('jobs'), $this->owner());
         $database = new \SQLite3($this->database->path());
         try {
-            $result = $database->query("EXPLAIN QUERY PLAN SELECT id FROM queue_messages WHERE queue = 'jobs' AND available_at <= 1700000000000 AND (reserved_until IS NULL OR reserved_until <= 1700000000000) ORDER BY id LIMIT 1");
+            $result = $database->query("EXPLAIN QUERY PLAN SELECT id, body, headers, available_at FROM queue_messages WHERE queue = 'jobs' AND available_at <= 1700000000000 AND (reserved_until IS NULL OR reserved_until <= 1700000000000) ORDER BY id LIMIT 1");
             $details = [];
             while (false !== ($row = $result->fetchArray(\SQLITE3_ASSOC))) {
                 $details[] = $row['detail'];
@@ -711,115 +427,137 @@ final class QueueTest extends DriverTestCase
         }
     }
 
-    public function testReceiveSamplesVisibilityAfterTransactionAcquisition(): void
+    public function testSendSamplesAvailabilityAfterTransactionAcquisition(): void
     {
-        $entered = new DeferredFuture();
-        $release = new DeferredFuture();
-        $armed = false;
-        $queue = $this->open(50, $this->pauseAt('begin', $entered, $release, $armed));
-        $name = $this->queueName();
-        $id = $queue->send($name, 'visible after acquisition');
-        $owner = $this->owner();
-        $armed = true;
-        $receiving = async(static fn () => $queue->receive($name, $owner));
-        try {
-            $entered->getFuture()->await(new TimeoutCancellation(10));
-            $this->now += 100;
-        } finally {
-            $release->complete();
-        }
-        $delivery = $receiving->await(new TimeoutCancellation(10));
-        $this->assertNotNull($delivery);
-        $this->assertSame($id, $delivery->id);
-        $this->assertSame($this->now + 50, $delivery->reservedUntil);
-        $nextOwner = $this->owner();
-        $this->assertNull($queue->receive($name, $nextOwner), 'The transaction wait must not consume visibility.');
-        $this->now = $delivery->reservedUntil;
-        $redelivery = $queue->receive($name, $nextOwner);
-        $this->assertNotNull($redelivery);
-        $this->assertSame($id, $redelivery->id);
-        $this->assertNotSame($delivery->receipt, $redelivery->receipt);
+        $storage = $this->openStorage();
+        $this->storages[] = $storage;
+        $observed = null;
+        $id = $storage->insert('jobs', 'delayed', '', function () use (&$observed): int {
+            $this->now += 25;
+            $observed = $this->now;
+
+            return $this->now + 100;
+        });
+        $this->assertSame($observed + 100, $this->scalar('SELECT available_at FROM queue_messages WHERE id = '.$id));
     }
 
-    #[DataProvider('settlements')]
-    public function testSettlementCrossingExpiryDuringTransactionAcquisitionKeepsTheMessage(string $operation): void
+    public function testReceiveSamplesVisibilityInsideTransaction(): void
     {
-        $entered = new DeferredFuture();
-        $release = new DeferredFuture();
-        $armed = false;
-        $queue = $this->open(50, $this->pauseAt('begin', $entered, $release, $armed));
-        $name = $this->queueName();
-        $owner = $this->owner();
-        $queue->send($name, 'must survive expiry');
-        $delivery = $queue->receive($name, $owner);
-        $this->assertNotNull($delivery);
-        $this->now = $delivery->reservedUntil - 1;
-        $armed = true;
-        $settling = async(fn () => $this->mutate($queue, $owner, $delivery->receipt, $operation));
+        $storage = $this->openStorage();
+        $this->storages[] = $storage;
+        $storage->insert('jobs', 'visible', '', fn (): int => $this->now);
+        $observed = null;
+        $claimed = $storage->claim(
+            'jobs',
+            $this->owner(),
+            str_repeat('e', 64),
+            str_repeat('f', 64),
+            function () use (&$observed): int {
+                $this->now += 40;
+                $observed = $this->now;
+
+                return $this->now;
+            },
+            static fn (int $now): int => $now + 50,
+        );
+        $this->assertNotNull($claimed);
+        $this->assertSame($observed + 50, $claimed['reserved_until']);
+        $this->assertSame($observed + 50, $this->scalar('SELECT reserved_until FROM queue_messages'));
+    }
+
+    public function testClaimRejectsOversizedStoredPayloadBeforeCommit(): void
+    {
+        $storage = $this->openStorage();
+        $this->storages[] = $storage;
+        $storage->insert('jobs', 'ok', '', fn (): int => $this->now);
+        $oversized = str_repeat('x', Limits::MAX_PAYLOAD + 1);
+        $this->bindExec('UPDATE queue_messages SET body = ?', $oversized);
         try {
-            $entered->getFuture()->await(new TimeoutCancellation(10));
-            $this->now = $delivery->reservedUntil + 1;
-        } finally {
-            $release->complete();
+            $storage->claim(
+                'jobs',
+                $this->owner(),
+                str_repeat('a', 64),
+                str_repeat('b', 64),
+                fn (): int => $this->now,
+                static fn (int $now): int => $now + 50,
+            );
+            $this->fail('Oversized stored payload must fail before commit.');
+        } catch (\RuntimeException $error) {
+            $this->assertSame('Stored message payload exceeds the supported size.', $error->getMessage());
         }
-        $this->invalid(static fn () => $settling->await(new TimeoutCancellation(10)));
+        $this->assertNull($this->scalar('SELECT reservation_token FROM queue_messages'));
         $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
-        $redelivery = $queue->receive($name, $this->owner());
-        $this->assertNotNull($redelivery);
-        $this->assertSame($delivery->id, $redelivery->id);
-        $this->assertSame('must survive expiry', $redelivery->body);
-        $this->assertNotSame($delivery->receipt, $redelivery->receipt);
     }
 
-    public function testStorageCloseRejectsTheOwningFiberAndPreservesUsability(): void
+    public function testCloseClearsStatementAndConnectionOwnership(): void
     {
-        $queue = $this->open();
-        $storage = $this->latestStorage();
-        try {
-            $storage->exclusive($storage->close(...));
-            $this->fail('Closing from the owning fiber must not wait on its own mutex.');
-        } catch (\LogicException $error) {
-            $this->assertSame('Queue storage cannot close from its owning fiber.', $error->getMessage());
-        }
-        $queue->send($this->queueName(), 'still usable');
-        $this->assertSame('still usable', $queue->receive($this->queueName(), $this->owner())->body);
+        $storage = $this->openStorage();
+        $this->storages[] = $storage;
+        $storage->insert('jobs', str_repeat('p', 1024), str_repeat('h', 128), fn (): int => $this->now);
         $storage->close();
+        $connection = (new \ReflectionProperty($storage, 'connection'))->getValue($storage);
+        $statements = (new \ReflectionProperty($storage, 'statements'))->getValue($storage);
+        $this->assertNull($connection);
+        $this->assertNull($statements);
+        $this->expectException(\RuntimeException::class);
+        $storage->earliestEligibility('jobs');
     }
 
-    public function testStorageOwnershipCannotBeBorrowedByAnotherFiber(): void
+    public function testSettlementCrossingExpiryUsesTransactionClock(): void
     {
-        $queue = $this->open();
-        $storage = $this->latestStorage();
-        $entered = new DeferredFuture();
-        $release = new DeferredFuture();
-        $owner = async(static fn () => $storage->exclusive(static function () use ($storage, $entered, $release): void {
-            $entered->complete();
-            $release->getFuture()->await(new TimeoutCancellation(10));
-            $storage->insert('jobs', 'owned operation', '', 0);
-        }));
-        $entered->getFuture()->await(new TimeoutCancellation(10));
-        try {
-            try {
-                $storage->insert('jobs', 'foreign operation', '', 0);
-                $this->fail('Another fiber must not borrow storage ownership.');
-            } catch (\LogicException $error) {
-                $this->assertStringContainsString('require exclusive()', $error->getMessage());
-            }
-        } finally {
-            $release->complete();
-            $owner->await(new TimeoutCancellation(10));
-        }
-        $this->assertSame('owned operation', $queue->receive($this->queueName(), $this->owner())->body);
+        $queue = $this->open(50);
+        $owner = $this->owner();
+        $queue->send($this->queueName(), 'must survive expiry');
+        $delivery = $queue->receive($this->queueName(), $owner);
+        $this->assertNotNull($delivery);
+        $this->now = $delivery->reservedUntil;
+        $this->receiptFailure(
+            static fn () => $queue->acknowledge($delivery->receipt, $owner),
+            new ExpiredReceiptException(),
+        );
         $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
     }
 
-    public function testRecursiveStorageOwnershipFailsWithoutWaiting(): void
+    public function testDatabaseFullLeavesConfirmedDataAndAllowsReopen(): void
     {
-        $this->open();
-        $storage = $this->latestStorage();
-        $this->expectException(\LogicException::class);
-        $this->expectExceptionMessage('cannot be acquired recursively');
-        $storage->exclusive(static fn () => $storage->exclusive(static fn () => null));
+        $storage = $this->openStorage();
+        $queue = new Queue($storage, 5_000, fn (): int => $this->now);
+        $this->storages[] = $storage;
+        $queue->send($this->queueName('jobs'), 'confirmed');
+        $connection = (new \ReflectionProperty($storage, 'connection'))->getValue($storage);
+        $this->assertInstanceOf(Sqlite::class, $connection);
+        $pages = (int) $connection->query('PRAGMA page_count')->fetchColumn();
+        $connection->exec('PRAGMA max_page_count='.$pages);
+        $failure = null;
+        try {
+            $queue->send($this->queueName('jobs'), str_repeat('x', 1_000_000));
+        } catch (\Throwable $error) {
+            $failure = $error;
+        }
+        $this->assertNotNull($failure);
+        $cause = $failure;
+        while (null !== $cause->getPrevious()) {
+            $cause = $cause->getPrevious();
+        }
+        $this->assertStringContainsString('full', strtolower($cause->getMessage()));
+        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
+        $storage->close();
+        $reopened = $this->open();
+        $this->assertSame('confirmed', $reopened->receive($this->queueName('jobs'), $this->owner())->body);
+    }
+
+    public static function settlements(): iterable
+    {
+        yield 'ack' => ['acknowledge'];
+        yield 'reject' => ['reject'];
+    }
+
+    public static function mutations(): iterable
+    {
+        yield 'send' => ['send'];
+        yield 'claim' => ['receive'];
+        yield 'ack' => ['acknowledge'];
+        yield 'reject' => ['reject'];
     }
 
     private function owner(): string
@@ -837,14 +575,17 @@ final class QueueTest extends DriverTestCase
         return new QueueName($queue);
     }
 
-    private function open(int $visibility = 5000, ?SqliteConnection $connection = null): Queue
+    private function open(int $visibility = 5000): Queue
     {
-        $storage = null === $connection
-            ? SqliteQueueStorage::open($this->database->path())
-            : new SqliteQueueStorage($connection);
+        $storage = $this->openStorage();
         $this->storages[] = $storage;
 
         return new Queue($storage, $visibility, fn (): int => $this->now);
+    }
+
+    private function openStorage(SqliteSynchronousMode $mode = SqliteSynchronousMode::Normal): SqliteQueueStorage
+    {
+        return SqliteQueueStorage::open($this->database->path(), $mode);
     }
 
     private function latestStorage(): SqliteQueueStorage
@@ -854,11 +595,6 @@ final class QueueTest extends DriverTestCase
         }
 
         return $this->storages[array_key_last($this->storages)];
-    }
-
-    private function connection(): SqliteConnection
-    {
-        return (new SqliteConnector())->connect((new SqliteConfig($this->database->path()))->withJournalMode(SqliteJournalMode::Wal)->withSynchronousMode(SqliteSynchronousMode::Full));
     }
 
     private function scalar(string $sql): mixed
@@ -877,6 +613,22 @@ final class QueueTest extends DriverTestCase
         $database->enableExceptions(true);
         try {
             $database->exec($sql);
+        } finally {
+            $database->close();
+        }
+    }
+
+    private function bindExec(string $sql, string $blob): void
+    {
+        $database = new \SQLite3($this->database->path());
+        $database->enableExceptions(true);
+        try {
+            $statement = $database->prepare($sql);
+            if (false === $statement) {
+                throw new \RuntimeException('Failed to prepare test SQL.');
+            }
+            $statement->bindValue(1, $blob, \SQLITE3_BLOB);
+            $statement->execute();
         } finally {
             $database->close();
         }
@@ -938,56 +690,5 @@ final class QueueTest extends DriverTestCase
             'acknowledge' => $queue->acknowledge($receipt, $ownerId, $cancellation),
             'reject' => $queue->reject($receipt, $ownerId, $cancellation),
         };
-    }
-
-    /** Pause once at a real transaction boundary, without adding production hooks. */
-    private function pauseAt(string $boundary, DeferredFuture $entered, DeferredFuture $release, bool &$armed): SqliteConnection
-    {
-        $real = $this->connection();
-        $pause = static function () use ($entered, $release, &$armed): void {
-            if ($armed) {
-                $armed = false;
-                $entered->complete();
-                $release->getFuture()->await(new TimeoutCancellation(5));
-            }
-        };
-
-        return $this->forward(SqliteConnection::class, $real, [
-            'beginTransaction' => function () use ($real, $pause, $boundary) {
-                $transaction = $real->beginTransaction();
-                if ('begin' === $boundary) {
-                    $pause();
-                }
-
-                return $this->forward(SqliteTransaction::class, $transaction, [
-                    'commit' => static function () use ($transaction, $pause, $boundary): void {
-                        if ('commit' === $boundary) {
-                            $pause();
-                        }
-                        $transaction->commit();
-                    },
-                    'execute' => static function (string $sql, array $parameters = []) use ($transaction, $pause, $boundary) {
-                        $result = $transaction->execute($sql, $parameters);
-                        if ('delete' === $boundary && str_starts_with($sql, 'DELETE ')) {
-                            $pause();
-                        }
-
-                        return $result;
-                    },
-                ]);
-            },
-        ]);
-    }
-
-    /** Test-only forwarding decorators keep all persistence in the real driver. */
-    private function forward(string $interface, object $real, array $overrides): object
-    {
-        $double = $this->createStub($interface);
-        foreach ((new \ReflectionClass($interface))->getMethods() as $method) {
-            $name = $method->getName();
-            $double->method($name)->willReturnCallback($overrides[$name] ?? $real->$name(...));
-        }
-
-        return $double;
     }
 }

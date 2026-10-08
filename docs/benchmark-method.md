@@ -1,68 +1,73 @@
-# Baseline method v1
+# Native Messenger measurement method
 
-This reference defines the Doctrine SQLite baseline measurement method. The runner uses the standard Symfony Doctrine transport, `PhpSerializer`, a real Messenger `Worker`, and a payload-verification handler. There is no application kernel, fake candidate, or custom claim SQL.
+Method `native-messenger-diagnostic` measures a package-owned Symfony application using configured buses, real transports, and stock `messenger:consume`. Historical synthetic-runner measurements are separate experiments and must not be pooled with these observations.
 
-## Workloads and budgets
+## Reference pair
 
-Every workload has one retained warmup repetition and three measured repetitions. Each repetition uses a fresh database. Warmup covers the same workload, but its samples do not enter measured-run variation. Each measured repetition has its own startup; operation latency excludes startup. Reports retain startup metadata and process lifetime resource costs.
+Doctrine uses its stock Messenger transport with PHP 8.5 PDO SQLite immediate transactions. The broker uses the current package adapter and native bundle integration. There is no custom Doctrine empty-poll optimization or automatic replay of failed publish or ACK operations.
 
-| Name | Publishers | Consumers | Messages per repetition | Scheduling |
-| --- | ---: | ---: | ---: | --- |
-| roundtrip | 1 | 1 | 150 | Publisher waits for the preceding ACK before the next send |
-| concurrent | 3 | 2 | 150 | 50 per publisher, unpaced saturation |
-| many-to-one | 4 | 1 | 160 | 40 per publisher, unpaced saturation |
-| backlog | 1 prefill | 2 | 240 | 80 per queue across three queues, prefilled before consumer release |
-| idle | 1 | 1 | 20 | Empty-poll readiness, 1.5 s idle, then fixed 100 ms publication targets |
-| delayed | 1 | 1 | 40 plus one probe | Empty-poll readiness, 2000 ms DelayStamp, 50 ms publication targets, plus a separate 300 ms probe |
+Both backends use WAL, immediate transactions, a 5000ms busy timeout, and a 3600-second redelivery interval. `--synchronous=normal|full` selects the same mode for both, defaulting to NORMAL. Before measurement, the actual Doctrine transport connections read back their pragmas, and broker readiness reports readback from its owning storage connection. Desired and effective modes are recorded in configuration, manifest, and per-run results. The read-only audit connection is not authoritative for synchronous mode. Do not pool NORMAL and FULL captures.
 
-Messages alternate between 256-byte and 16,384-byte deterministic binary payloads. Every delivery regenerates the bytes from its correlation ID and verifies the digest. There is no simulated handler work beyond verification. Named queues rotate at the receiver wrapper; the wrapper delegates each receive and ACK to the standard Doctrine transport. It does not retry transport errors.
+NORMAL preserves commits across application or process crashes, but OS crashes or power loss can lose recent committed publications or ACKs. Confirmed sends may vanish and ACKed messages may reappear. NORMAL does not guarantee at-least-once across power loss. FULL retains stronger commit durability if storage honors synchronization. Payloads alternate between 256 bytes and 16 KiB. The serializer and payload-validation handler are shared. Broker workers use native single-receiver WAIT integration. Doctrine workers use the named 1ms polling reference.
 
-Worker polling is 1000 microseconds, with one message per receive. Doctrine's visibility timeout is explicitly 3600 seconds. No keepalive is needed for this short handler. The runner does not restart a failed worker. Doctrine's internal receive retries remain unchanged; exhausted retries appear as failures, not silently repeated runs. Internal retry counts are not exposed by its public interface and are not separately measured.
+Outside the concurrent workload, the publisher and observer share a process. Concurrent publishers run in three separate processes. Broker consumers and publishers have no diagnostic SQL connections. The observer audits storage through a separate read-only process after measurement and drain. Resource reports do not pretend that shared publisher and observer costs are isolated product costs.
 
-The idle workload is the controlled offered-load case. Targets advance from one monotonic start timestamp, not from completion of the previous send. Scheduling lag and unfinished sends remain visible when the sender falls behind. Saturation workloads do not claim a fixed offered rate.
+## Scenarios
 
-## Durability and ownership
+| Workload | Declared question |
+| --- | --- |
+| `roundtrip` | Unloaded public latency with one message in flight. Socket control signals completion without per-message marker files. |
+| `idle` | Connected empty-queue CPU, I/O, and receive activity. Two isolated pickups follow in a separate phase. |
+| `concurrent` | A released 3,000-message cohort with three publishers and two consumers. Finite drain time, not sustained capacity. |
+| `application` | Execution-to-control result routing with two consumers and declared synchronous handler waiting. |
+| `retention` | At least twenty publish/drain cycles with the same processes and clients, followed by audited-empty memory observations. |
 
-Every DBAL connection explicitly sets WAL, synchronous FULL, a 5000 ms busy timeout, and a 1000-page auto-checkpoint. The runner reads back effective settings on each child connection. Schema setup finishes before children start. An explicit final `wal_checkpoint(TRUNCATE)` runs outside measured operations and its result is recorded.
+Application offers five workflows/s with 100ms handler work and at most sixteen outstanding workflows. Stalled sends do not trigger catch-up bursts. Actual attempts and completions are recorded; this is not a configurable offered-rate capacity test.
 
-Confirmed send and ACK are measured at the commit boundary. This is not a power-loss test; SQLite and the filesystem still determine power-loss guarantees.
+Application handlers dispatch correlated results through Messenger. Reports distinguish message ACKs from workflows whose root and result both complete cleanly. The workflow is synthetic. It does not reproduce real LLM latency, external side effects, keepalive incidents, or multi-receiver native selection.
 
-Children receive a minimal environment, explicit file paths, and no inherited application DSN. Readiness files include their actual PIDs. Start files carry parent clock readings. Every child has a finite runtime; the coordinator has a repetition deadline and a TERM/KILL cleanup path. Database cleanup names only the files it created. Raw evidence remains under the unique run directory.
+## Phases and schedule
 
-## Timing definitions
+The lifecycle records boot, connected baseline, same-process warmup, measurement, bounded drain, settling, audit, and shutdown. Scenario-specific idle, pickup, and retention-cycle boundaries remain separate. Warmup exercises both payloads and the relevant routes without restarting workers.
 
-All elapsed durations use `hrtime(true)`. A 20-round parent/child clock probe brackets each child reading between parent request and reply readings. Cross-process durations require an offset interval containing zero with width below 2 ms, plus per-child start-order checks. Linux supplies the common `CLOCK_MONOTONIC` domain. Probe brackets, source hashes, and clocks remain in the report. Values below the measured bracket width need caution; the probe is not a nanosecond calibration.
+Each invocation freezes settings and runs Doctrine first, then the broker. Defaults are 60 seconds per backend and one pair, about two minutes plus setup for a time-based workload. A recorded revision identifies the source only when changes are committed before measurement. There is no pilot or repetition option. Retention is cycle based rather than a duration-based capacity test. Non-smoke uses twenty cycles of one hundred messages. Retention smoke uses two cycles of two messages and does not establish retention behavior. Concurrent smoke uses twelve messages. Smoke captures prove wiring and accounting only.
 
-| Metric | Start | End |
-| --- | --- | --- |
-| send_ms | Publish invocation | Transport send returns after commit |
-| publish_to_handler_ms | Publish invocation | Handler entry |
-| confirmation_to_handler_ms | Publish confirmation | Handler entry, possibly before confirmation |
-| ack_ms | ACK invocation | ACK returns |
-| full_cycle_ms | Publish invocation | Correlated ACK confirmation |
-| delayed_lateness_ms | Stored eligibility deadline | Handler entry |
-| requested_deadline_lateness_ms | Requested wall-clock deadline | Handler entry |
+Failed repetitions remain in place. A later clean repetition does not replace them. Changes to offered rates or instrumentation create a separate experiment.
 
-The receiver reads stored eligibility after the handler and before ACK. That diagnostic query contributes to the full cycle but not the ACK duration. The future candidate must use equivalent diagnostics or a new matched baseline. The roundtrip publisher waits on a test-owned ACK marker outside the timed transport calls.
+## Time and completion accounting
 
-Doctrine truncates `DelayStamp` milliseconds to whole seconds and stores datetimes at second resolution. Even a whole-second delay can become eligible before the requested millisecond deadline. The report retains stored-deadline lateness, requested-deadline lateness, and their quantization difference. The 300 ms probe is separately recorded and excluded from measured latency distributions. It remains included in send, delivery, and ACK integrity counts. No delay-performance comparison may call this precision equivalent to the broker's required millisecond semantics.
+Monotonic observations record send invocation/return, receive invocation and yielded delivery, handler entry/exit, and ACK invocation/return. Iterable lifetime and active receive time are distinct so handler execution between yields is not attributed to transport work.
 
-Wall clocks must remain stable during delayed tests. A clock adjustment can affect persisted eligibility and lateness. The runner does not claim immunity to host clock changes.
+Public-operation failures retain their stage and exception details. A throwing send or ACK has an uncertain commit outcome unless the evidence establishes otherwise. Handler-entry observations survive settlement failure. Missing terminal telemetry or recorder losses make accounting partial.
 
-## Statistics, failures, and resources
+Fixed-window goodput counts unique valid ACK completions in the declared half-open interval. Cohort completion also includes later drain ACKs. Workflow completion requires both root and result settlement; result arrival alone is insufficient. Time-based rates use declared windows. Concurrent rates use the finite cohort duration. Publish attempts, confirmations, completions, and derived backlog remain separate.
 
-Percentiles use nearest rank with no trimming. Reports retain p50, p95, p99, maximum, count, and every scheduled repetition. Metrics with fewer than 1000 samples are labeled tail-inconclusive. The initial budgets therefore describe variability and failure behavior, not a defensible p99 win.
+Offline disk-backed analysis joins streamed observations and expected IDs after drain. It reports counts, missing boundaries, p50, p95, p99, means, and payload-specific distributions. Confirmation-to-delivery gaps may be negative. Tail adequacy is explicit. Do not average per-run p99 values or interpret short smoke percentiles as capacity evidence.
 
-A send can commit before its confirmation reaches the publisher. Negative confirmation-to-handler durations remain negative. Missing, corrupt, duplicate, rejected, unacknowledged, and unknown messages make the repetition incomplete. Failed runs keep their observed distributions, clearly labeled incomplete. Unfinished counts are based on unique acknowledged IDs rather than raw ACK count. No report removes outliers or selects favorable repetitions.
+## Observer cost and resources
 
-The coordinator samples descendant CPU, resident memory, and process count. Sampled tree peaks are lower bounds, not exact simultaneous peaks. Each child's final `getrusage()` records CPU time and high-water RSS, and its footer records PHP peak memory. Missing footers mean final resource totals are incomplete. The coordinator's CPU and PHP peak memory are reported separately. Idle CPU is the sampled child-tree CPU delta during the explicit empty interval. The baseline owns no broker or persistence worker; the candidate must include both.
+Telemetry and control buffers have fixed bounds. Recording is buffered rather than flushed for every event. Offline correlation uses disk-backed storage; raw streams are not loaded wholesale into PHP arrays.
 
-The coordinator checks child progress and samples resources at roughly 20 ms intervals. After publishers finish, it also queries the shared database inventory at that interval until the queue drains. These reads add measurement overhead. A comparison must match this cadence and diagnostic cost, or revise the method and capture both backends again.
+Resources use known PID/start-time identities, including the persistence PID from broker readiness. Phase snapshots include cumulative user/system CPU, RSS, PSS, private memory, and Linux process-I/O fields where accessible. Consumer PHP used/reserved memory comes from control observations. Broker and persistence PHP gauges are unavailable.
 
-The machine record includes PHP/SQLite/dependency versions, source revision and dirty state, per-file benchmark hashes, lock hash, CPU, storage mount, workload settings, and debug extensions. Artifact retention includes every raw sample and child error.
+Resource coverage is partial:
 
-## Later comparison
+- Snapshots bracket phases; they are not continuous active-peak measurements.
+- Work before first observation and after the last shutdown observation is missing.
+- Publisher and observer costs share a role.
+- Process I/O includes telemetry/control work and is not SQLite-only physical I/O.
+- Summed RSS can count shared mappings more than once. PSS is a different measurement.
 
-A broker comparison must use the real adapter and match durability, payloads, serialization, handler, counts, and diagnostics. Pickup differs intentionally: baseline polling versus candidate notifications. Record both configurations.
+Retention compares audited-empty points with unchanged topology and process identities. Reports show memory endpoints, ranges, and deltas against completed historical work. No forced garbage collection or restart hides growth. Internal session/watch/timer/buffer gauges are unavailable. Stable short observations do not establish leak-free operation.
 
-Use alternating paired backend order across repetitions. Keep startup separate, preserve failures, and compare individual-run variation rather than only pooled percentiles. Before a tail claim, collect at least 1000 successful samples per workload, payload size, and repetition on both backends under a declared revised budget. Re-run the baseline with that budget before candidate tuning. A failure-heavy or statistically inconclusive baseline cannot establish a speedup. Neutral or slower results do not justify weaker durability.
+Retention audits empty inventory between cycles. Full offline correlation runs once after the cohort, rather than rescanning cumulative traces after every cycle. Retention elapsed rates include between-cycle observation work and are not transport capacity measurements.
+
+There is one recording policy: all operation records use bounded buffers, resources are sampled at phase boundaries, and SQL auditing and correlation run after measurement/drain. No telemetry profiles or calibration workload remain. The historical one-pass observer check is recorded in the comparison. It does not certify zero observer effect. Material observer distortion invalidates the affected performance interpretation; removing configuration choices does not itself establish measurement neutrality.
+
+## Evidence and limits
+
+Each capture contains a manifest with the revision, Composer-lock hash, settings, result paths, and owning synchronous-mode evidence. Reports and per-run raw records remain outside Git. Failed database evidence is retained after safe owned-process cleanup.
+
+Separate conclusions cover completion, integrity, latency, idle cost, footprint, and retention. Failed baseline runs do not erase broker-only measurements or become fabricated healthy-baseline estimates.
+
+Lower-driver SQL/transaction/retry counters, traced synchronization costs, periodic resource peaks, exact WAIT registration/wake counts, and native broker lifecycle gauges are not implemented. Public exception details cannot always identify the internal SQL operation that failed. Report unavailable attribution as unknown. These measurements support characterization of the declared application and topology, not an unconditional performance win or universal production reliability claim.

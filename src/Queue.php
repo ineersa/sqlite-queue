@@ -23,8 +23,9 @@ use Ineersa\SqliteQueue\ValueObject\QueueName;
  * Queue message policy over SQLite persistence.
  *
  * Deadlines are Unix wall-clock milliseconds. Storage owns the connection and SQL.
- * Callers own client lifetime and pass an Amp cancellation for in-flight disconnects.
- * This class does not open, configure, or close storage.
+ * Callers own client lifetime and may cancel before a storage operation starts.
+ * Once storage begins, the operation finishes normally. This class does not open,
+ * configure, or close storage.
  */
 final class Queue
 {
@@ -38,7 +39,7 @@ final class Queue
     private readonly \Closure $clock;
 
     /**
-     * @param \Closure(): int|null $clock wall-clock milliseconds, sampled inside storage ownership
+     * @param \Closure(): int|null $clock wall-clock milliseconds, sampled after transaction acquisition
      */
     public function __construct(
         private readonly SqliteQueueStorage $storage,
@@ -61,48 +62,42 @@ final class Queue
         if ($delay < 0) {
             throw new \InvalidArgumentException('Delay must be nonnegative milliseconds.');
         }
-        $cancellation ??= new NullCancellation();
+        $this->assertActive($cancellation ?? new NullCancellation());
 
-        return $this->storage->exclusive(function () use ($queue, $body, $headers, $delay, $cancellation): int {
-            $this->assertActive($cancellation);
-            $availableAt = $this->deadline($delay);
-
-            return $this->storage->insert($queue->value, $body, $headers, $availableAt);
-        });
+        return $this->storage->insert(
+            $queue->value,
+            $body,
+            $headers,
+            fn (): int => $this->deadline($delay),
+        );
     }
 
     /** Immediately claim one eligible message, or return null. Never waits for future work. */
     public function receive(QueueName $queue, string $ownerId, ?Cancellation $cancellation = null): ?DeliveryDTO
     {
-        $cancellation ??= new NullCancellation();
+        $this->assertActive($cancellation ?? new NullCancellation());
+        $token = bin2hex(random_bytes(self::RESERVATION_TOKEN_BYTES));
+        $claimed = $this->storage->claim(
+            $queue->value,
+            $ownerId,
+            $this->epoch,
+            $token,
+            $this->now(...),
+            fn (int $now): int => $this->deadline($this->visibilityTimeout, $now),
+        );
+        if (null === $claimed) {
+            return null;
+        }
 
-        return $this->storage->exclusive(function () use ($queue, $ownerId, $cancellation): ?DeliveryDTO {
-            $this->assertActive($cancellation);
-            $token = bin2hex(random_bytes(self::RESERVATION_TOKEN_BYTES));
-            $claimed = $this->storage->claim(
-                $queue->value,
-                $ownerId,
-                $this->epoch,
-                $token,
-                $this->now(...),
-                fn (int $now): int => $this->deadline($this->visibilityTimeout, $now),
-            );
-            // A disconnect may have occurred while waiting for persistence.
-            $this->assertActive($cancellation);
-            if (null === $claimed) {
-                return null;
-            }
-
-            return new DeliveryDTO(
-                $claimed['id'],
-                $queue->value,
-                $claimed['body'],
-                $claimed['headers'],
-                $this->receipt($claimed['id'], $token),
-                $claimed['available_at'],
-                $claimed['reserved_until'],
-            );
-        });
+        return new DeliveryDTO(
+            $claimed['id'],
+            $queue->value,
+            $claimed['body'],
+            $claimed['headers'],
+            $this->receipt($claimed['id'], $token),
+            $claimed['available_at'],
+            $claimed['reserved_until'],
+        );
     }
 
     public function acknowledge(string $receipt, string $ownerId, ?Cancellation $cancellation = null): void
@@ -123,13 +118,9 @@ final class Queue
      */
     public function earliestEligibility(QueueName $queue, ?Cancellation $cancellation = null): ?int
     {
-        $cancellation ??= new NullCancellation();
+        $this->assertActive($cancellation ?? new NullCancellation());
 
-        return $this->storage->exclusive(function () use ($queue, $cancellation): ?int {
-            $this->assertActive($cancellation);
-
-            return $this->storage->earliestEligibility($queue->value);
-        });
+        return $this->storage->earliestEligibility($queue->value);
     }
 
     private function settle(string $receipt, string $ownerId, ?Cancellation $cancellation): void
@@ -141,28 +132,22 @@ final class Queue
         if (false === $id) {
             throw new MalformedReceiptException();
         }
-        $cancellation ??= new NullCancellation();
-        $this->storage->exclusive(function () use ($id, $parts, $ownerId, $cancellation): void {
-            $this->assertActive($cancellation);
-            $settled = $this->storage->settle(
-                $id,
-                $parts[2],
-                $ownerId,
-                $this->epoch,
-                $this->now(...),
-                function () use ($cancellation): void {
-                    $this->assertActive($cancellation);
-                },
-            );
-            match ($settled) {
-                SettlementResultEnum::Settled => null,
-                SettlementResultEnum::NoActiveReservation => throw new NoActiveReservationException(),
-                SettlementResultEnum::OwnerMismatch => throw new ReceiptOwnerMismatchException(),
-                SettlementResultEnum::EpochMismatch => throw new ReceiptEpochMismatchException(),
-                SettlementResultEnum::TokenMismatch => throw new ReceiptTokenMismatchException(),
-                SettlementResultEnum::Expired => throw new ExpiredReceiptException(),
-            };
-        });
+        $this->assertActive($cancellation ?? new NullCancellation());
+        $settled = $this->storage->settle(
+            $id,
+            $parts[2],
+            $ownerId,
+            $this->epoch,
+            $this->now(...),
+        );
+        match ($settled) {
+            SettlementResultEnum::Settled => null,
+            SettlementResultEnum::NoActiveReservation => throw new NoActiveReservationException(),
+            SettlementResultEnum::OwnerMismatch => throw new ReceiptOwnerMismatchException(),
+            SettlementResultEnum::EpochMismatch => throw new ReceiptEpochMismatchException(),
+            SettlementResultEnum::TokenMismatch => throw new ReceiptTokenMismatchException(),
+            SettlementResultEnum::Expired => throw new ExpiredReceiptException(),
+        };
     }
 
     private function receipt(int $id, string $token): string

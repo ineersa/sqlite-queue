@@ -14,6 +14,7 @@ use Ineersa\SqliteQueue\Broker\BrokerFactory;
 use Ineersa\SqliteQueue\Broker\QueueNotifier;
 use Ineersa\SqliteQueue\Client;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeProbeMessage;
+use Ineersa\SqliteQueue\Tests\Support\ControlledWorkerClock;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -30,6 +31,8 @@ use function Amp\ByteStream\buffer;
 #[RequiresOperatingSystem('Linux')]
 final class NativeConsoleProcessTest extends TestCase
 {
+    use ControlledWorkerClock;
+
     private const int SAFETY_SECONDS = 15;
     // Keep reservations live until explicit settlement, independent of subprocess scheduling.
     private const int BROKER_NOW_MILLISECONDS = 1_700_000_000_000;
@@ -222,7 +225,7 @@ final class NativeConsoleProcessTest extends TestCase
         $client = Client::connect($this->endpoint());
         try {
             $this->assertNull($client->receive('jobs'));
-            $this->now = $expiry;
+            $this->setNow($expiry);
             $delivery = $client->receive('jobs');
             $this->assertNotNull($delivery);
             $envelope = (new PhpSerializer())->decode(['body' => $delivery->body, 'headers' => json_decode($delivery->headers, true, 32, \JSON_THROW_ON_ERROR)]);
@@ -261,12 +264,20 @@ final class NativeConsoleProcessTest extends TestCase
         $this->assertSame($expected, $exit, $diagnostics);
     }
 
+    private function setNow(int $value): void
+    {
+        $this->now = $value;
+        (new Filesystem())->dumpFile($this->database().'.clock', (string) $value);
+    }
+
     private function startBroker(): void
     {
+        $database = $this->database();
         $broker = (new BrokerFactory(
-            $this->database(),
+            $database,
             $this->endpoint(),
-            clock: fn (): int => $this->now,
+            clock: $this->syncedClock(fn (): int => $this->now, $database),
+            workers: $this->workerFactory($database, fn (): int => $this->now),
         ))->create();
         $this->broker = $broker;
         $ready = new DeferredFuture();

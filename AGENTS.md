@@ -33,7 +33,7 @@ Apply these rules throughout the repository, including implementation, tooling, 
 | `vendor/bin/castor cs:fix` | Apply the configured formatting rules. |
 | `vendor/bin/castor phpstan` | Analyze implementation and tooling code. Optional `--path=bench/src` overrides configured paths. |
 | `vendor/bin/castor test` | Run all correctness tests. Optional `--filter=TaskReportsTest` selects tests. |
-| `vendor/bin/castor test:driver` | Run driver tests, with optional `--filter`. |
+| `vendor/bin/castor test:sqlite` | Run package SQLite worker and storage tests, with optional `--filter`. |
 | `vendor/bin/castor test:broker` | Run protocol, client, and broker tests, with optional `--filter`. |
 | `vendor/bin/castor test:bench` | Run benchmark correctness tests, with optional `--filter`. |
 | `vendor/bin/castor qa` | Run validation, formatting checks, PHPStan, and tests in that order. No formatting edits. |

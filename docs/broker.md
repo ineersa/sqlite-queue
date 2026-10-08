@@ -4,7 +4,7 @@ The broker supports immediate receive and bounded WAIT. The [Symfony Messenger a
 
 ## Start the foreground broker
 
-1. Run `composer install` in this checkout. Check that CLI PHP has `sqlite3`, `pcntl`, and `posix` enabled.
+1. Run `composer install` in this checkout. Check that CLI PHP has `pdo_sqlite`, `pcntl`, and `posix` enabled.
 2. Create private storage and socket directories. Keep the absolute socket path under 101 bytes.
 
    ```sh
@@ -26,7 +26,7 @@ The executable uses the package's runtime Symfony Console dependency. A no-dev i
 1. Run the foreground command under systemd, supervisord, Docker, PM2, or another external supervisor. Do not daemonize it or put it in the background inside the managed command.
 2. Configure restart after failure and wait for the `ready` event before admitting clients. The broker exits nonzero on fatal storage or worker failure instead of replacing SQLite connections inside the running process.
 3. Send SIGTERM for graceful shutdown. Allow more than the broker's five-second cleanup budget before forced termination.
-4. Configure the supervisor to clean up the whole process tree, including the SQLite worker and any Amp shell launcher, before starting a replacement broker.
+4. Configure the supervisor to clean up the whole process tree, including the PDO SQLite worker and any Amp shell launcher, before starting a replacement broker.
 5. Make client applications reconnect explicitly after failure. Do not replay unconfirmed operations automatically or reuse receipts from an old connection.
 
 After an abrupt exit, follow the endpoint verification instructions in [Stop or restart](#stop-or-restart). Do not add an unconditional socket deletion to the supervisor's startup command.
@@ -97,10 +97,33 @@ Client methods accept an optional Amp `Cancellation`. Cancellation during an exc
 
 Send SIGTERM or SIGINT, or press Ctrl-C in the foreground terminal. Wait for process exit before restarting. Normal stop removes the owned socket but preserves the database. Symfony FlockStore lock sidecars stay on disk under the private resource directories, which preserves the lock namespace.
 
-Shutdown shares one five-second cleanup budget across client draining, storage close, and SQLite worker teardown. If that budget expires, the broker attempts to terminate its SQLite worker. It removes only its own socket and then releases the database and endpoint locks.
+Startup has a 15-second budget covering worker spawn and readiness. A dispatched storage exchange has a 10-second parent deadline. Shutdown shares one five-second cleanup budget across client draining, worker close, and child teardown. If that budget expires, the broker attempts to terminate its SQLite worker. It removes only its own socket and then releases the database and endpoint locks.
 
 The cleanup budget is not an exact process-exit deadline. Signal delivery and process reaping depend on the operating system. A stalled event loop or a stopped child or shell launcher can prevent cleanup from finishing. Configure the supervisor to terminate and reap the whole process tree after its grace period.
 
 If an endpoint remains after an abrupt exit, do not delete it just because a connection attempt fails. Verify that no broker or other listener owns it before removal, or choose another endpoint. Startup refuses existing sockets, regular files, and symlinks.
 
 See the [protocol reference](broker-protocol.md) for framing, deadlines, errors, and ownership requirements.
+
+## WAL synchronous mode
+
+Both broker commands accept `--synchronous=normal|full`. Only these two modes are supported. The default is `normal`. For the bundle command, precedence is CLI > `sqlite_queue.synchronous` > `normal`. The standalone command does not load bundle configuration.
+
+```sh
+vendor/bin/sqlite-queue broker --database=/private/queue.db --endpoint=/private/queue.sock --synchronous=full
+```
+
+```yaml
+sqlite_queue:
+    synchronous: full
+```
+
+PHP callers use the package enum:
+
+```php
+use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
+
+$broker = (new BrokerFactory($database, $endpoint, synchronous: SqliteSynchronousMode::Full))->create();
+```
+
+NORMAL preserves commits across process crashes, but an OS crash or power failure can lose recent publications or ACKs. FULL provides stronger commit durability if storage honors synchronization. See [storage and durability](contracts.md#storage-and-durability).

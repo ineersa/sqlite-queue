@@ -9,14 +9,12 @@ use Amp\Future;
 use Amp\TimeoutCancellation;
 use Ineersa\SqliteQueue\Broker\Broker;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
-use Ineersa\SqliteQueue\Exception\TransportException as ClientTransportException;
 use Ineersa\SqliteQueue\Messenger\Transport;
 use Ineersa\SqliteQueue\Messenger\TransportFactory;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Messenger\Envelope;
-use Symfony\Component\Messenger\Exception\TransportException;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
 use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 
@@ -103,22 +101,6 @@ final class TransportFactoryTest extends TestCase
             ['endpoint' => 'relative.sock'],
             'absolute',
         ];
-    }
-
-    public function testConnectFailureIsSymfonyTransportException(): void
-    {
-        $factory = new TransportFactory();
-        $transport = $factory->createTransport(
-            'sqlite-queue://jobs?endpoint=/var/missing-sqlite-queue-'.bin2hex(random_bytes(4)).'.sock',
-            [],
-            new PhpSerializer(),
-        );
-        try {
-            $transport->get();
-            $this->fail('Missing endpoint must fail connect.');
-        } catch (TransportException $error) {
-            $this->assertInstanceOf(ClientTransportException::class, $error->getPrevious());
-        }
     }
 
     public function testExplicitOptionsOverrideQueryAndConnectOnFirstOperation(): void

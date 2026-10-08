@@ -8,6 +8,8 @@ use Amp\DeferredCancellation;
 use Ineersa\SqliteQueue\Broker\BrokerEventEnum;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
 use Ineersa\SqliteQueue\Queue;
+use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
+use Ineersa\SqliteQueue\Sqlite\SqliteWorkerContextFactory;
 use Revolt\EventLoop;
 use Symfony\Component\Clock\Clock;
 use Symfony\Component\Clock\ClockInterface;
@@ -39,6 +41,8 @@ final class BrokerCommand extends BaseCommand
     public function __construct(
         private readonly int $redeliverTimeoutSeconds = self::DEFAULT_REDELIVER_TIMEOUT_SECONDS,
         private readonly ClockInterface $clock = new Clock(),
+        private readonly SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal,
+        private readonly SqliteWorkerContextFactory $workers = new SqliteWorkerContextFactory(),
     ) {
         if ($redeliverTimeoutSeconds <= 0) {
             throw new \InvalidArgumentException('Redelivery timeout must be positive seconds.');
@@ -55,6 +59,7 @@ final class BrokerCommand extends BaseCommand
             ->addOption('database', null, InputOption::VALUE_REQUIRED, 'Absolute path to the private queue database file.')
             ->addOption('endpoint', null, InputOption::VALUE_REQUIRED, 'Absolute path to the private Unix socket file.')
             ->addOption('redeliver-timeout', null, InputOption::VALUE_REQUIRED, 'Reservation redelivery timeout in seconds.', (string) $this->redeliverTimeoutSeconds)
+            ->addOption('synchronous', null, InputOption::VALUE_REQUIRED, 'SQLite WAL synchronous mode: normal or full.', $this->synchronous->value)
             ->setHelp('Readiness, framing bounds, lifetime locks, failure handling, and client recovery are documented in docs/broker-protocol.md.');
     }
 
@@ -63,6 +68,14 @@ final class BrokerCommand extends BaseCommand
         $errors = $output instanceof ConsoleOutputInterface ? $output->getErrorOutput() : $output;
         $watchers = [];
         try {
+            $synchronousValue = $input->getOption('synchronous');
+            if (!\is_string($synchronousValue)) {
+                throw new \InvalidArgumentException('--synchronous must be normal or full.');
+            }
+            $synchronous = SqliteSynchronousMode::tryFrom($synchronousValue);
+            if (null === $synchronous) {
+                throw new \InvalidArgumentException('--synchronous must be normal or full.');
+            }
             $database = $input->getOption('database');
             $endpoint = $input->getOption('endpoint');
             $redeliverTimeoutSeconds = filter_var($input->getOption('redeliver-timeout'), \FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
@@ -97,6 +110,8 @@ final class BrokerCommand extends BaseCommand
                 visibilityTimeout: $redeliverTimeoutSeconds * 1000,
                 clock: fn (): int => $this->nowMilliseconds(),
                 cancellation: $shutdown->getCancellation(),
+                synchronous: $synchronous,
+                workers: $this->workers,
             ))->create();
             $code = $broker->run(function (array $event) use ($output): void {
                 $this->write($event, $output);

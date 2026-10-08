@@ -6,78 +6,106 @@ namespace Ineersa\SqliteQueue\Sqlite;
 
 use Amp\Cancellation;
 use Amp\DeferredCancellation;
-use Amp\Parallel\Context\ContextFactory;
-use Amp\Parallel\Context\ProcessContext;
 use Amp\Parallel\Context\ProcessContextFactory;
+use Amp\TimeoutCancellation;
+use Ineersa\SqliteQueue\Sqlite\Exception\StorageFailureException;
 
 use function Amp\async;
 
 /**
- * Starts the vendor SQLite worker and retains a handle to that same process.
+ * Starts exactly one package-owned PDO worker and returns its parent proxy.
  *
- * Vendor SqliteConnector calls this ContextFactory. The factory delegates to Amp's
- * ProcessContextFactory and keeps SqliteWorkerHandle for the identical worker the driver
- * starts. The driver alone joins that context; the handle supplies independent observation
- * and termination because the locked driver's idle graceful close has no timeout, marks the
- * connection closed before awaiting, and cannot be interrupted by repeating close().
- * Temporary integration workaround until the driver offers a bounded close/abort API; not a
- * replacement SQL driver.
- *
- * The connector owns when start() runs; worker() exposes the single handle it created.
+ * Owns failed-startup cleanup. The caller supplies one monotonic startup budget that
+ * already covers process spawn, initialization and readiness.
  */
-final class SqliteWorkerContextFactory implements ContextFactory
+final class SqliteWorkerContextFactory
 {
+    private const int FAILED_STARTUP_RELEASE_SECONDS = 5;
+
     /** @var list<SqliteWorkerHandle> */
     private array $created = [];
 
     /**
-     * The signature is fixed by {@see ContextFactory}: the connector passes either a plain script
-     * path or a non-empty `[path, ...arguments]` list, and a cancellation is optional in the
-     * interface contract. The union and the nullable parameter are API requirements, not local
-     * choices, so neither may be narrowed here.
-     *
-     * @param string|non-empty-list<string> $script
-     *
-     * @return ProcessContext<mixed, mixed, mixed>
+     * @param string|non-empty-list<string> $script production worker.php, or a test bootstrap with Amp arguments
      */
-    #[\Override]
-    public function start(string|array $script, ?Cancellation $cancellation = null): ProcessContext
-    {
-        // The child inherits the broker's environment. Amp replaces the entire environment when
-        // given a non-empty array, which would drop what a PHP child needs to start correctly:
-        // TMPDIR, and the configuration paths PHPRC and PHP_INI_SCAN_DIR that load shared
-        // extensions such as sqlite3.
-        $context = (new ProcessContextFactory())->start($script, $cancellation);
-        // Both pipe reads share one token, so the handle can stop them as a unit. Cancelling a read
-        // releases the readability watcher it holds, and a pending read would otherwise keep the
-        // event loop referenced forever when the pipes never reach EOF.
+    public function __construct(
+        private readonly string|array $script = __DIR__.'/worker.php',
+    ) {
+    }
+
+    public function create(
+        string $database,
+        int $visibilityTimeout,
+        SqliteSynchronousMode $synchronous,
+        Cancellation $budget,
+    ): SqliteQueueWorker {
+        if ($visibilityTimeout <= 0) {
+            throw new \InvalidArgumentException('Visibility timeout must be positive milliseconds.');
+        }
+        if ('' === $database) {
+            throw new \InvalidArgumentException('Worker database path must be non-empty.');
+        }
+
+        // Inherit the broker environment. A non-empty Amp environment array replaces it.
+        $context = (new ProcessContextFactory())->start($this->script, $budget);
         $drainCancellation = new DeferredCancellation();
         $drains = [];
-        // Drain without logging: worker diagnostics may contain SQL or data.
         foreach ([$context->getStdout(), $context->getStderr()] as $stream) {
             $drains[] = async(static function () use ($stream, $drainCancellation): void {
                 while (null !== $stream->read($drainCancellation->getCancellation())) {
                 }
             });
         }
-        $this->created[] = new SqliteWorkerHandle($context, $drains, $drainCancellation);
+        $handle = new SqliteWorkerHandle($context, $drains, $drainCancellation);
+        $this->created[] = $handle;
+        $exchange = async(static function () use ($context, $database, $visibilityTimeout, $synchronous): mixed {
+            $context->send([
+                'id' => 1,
+                'op' => SqliteWorkerOperationEnum::Init->value,
+                'data' => [
+                    'database' => $database,
+                    'visibility_timeout' => $visibilityTimeout,
+                    'synchronous' => $synchronous->value,
+                ],
+            ]);
 
-        return $context;
-    }
+            return $context->receive();
+        });
+        try {
+            $response = $exchange->await($budget);
+            if (!\is_array($response)) {
+                throw new StorageFailureException('Worker initialization response must be an array.');
+            }
+            if (1 !== ($response['id'] ?? null)) {
+                throw new StorageFailureException('Worker initialization response id must be 1.');
+            }
+            if (SqliteWorkerOperationEnum::Init->value !== ($response['op'] ?? null)) {
+                throw new StorageFailureException('Worker initialization response operation must be init.');
+            }
+            if (SqliteWorkerStatusEnum::Failure->value === ($response['status'] ?? null)) {
+                throw new StorageFailureException('Worker initialization failed: '.SqliteWorkerDiagnostic::failure($response['error'] ?? null));
+            }
+            if (SqliteWorkerStatusEnum::Ok->value !== ($response['status'] ?? null)) {
+                throw new StorageFailureException('Worker initialization response status must be ok or failure.');
+            }
+            if (!\is_array($response['result'] ?? null)) {
+                throw new StorageFailureException('Worker initialization configuration must be an array.');
+            }
+            /** @var array{journal_mode: string, synchronous: string, busy_timeout: int, wal_autocheckpoint: int, sqlite_version: string} $configuration */
+            $configuration = $this->validatedConfiguration($response['result'], $synchronous);
 
-    public function worker(): SqliteWorkerHandle
-    {
-        // The connector starts exactly one SQLite worker per connection.
-        if (1 !== \count($this->created)) {
-            throw new \LogicException('The connector must start exactly one SQLite worker per connection.');
+            return new SqliteQueueWorker($handle, $synchronous, $configuration);
+        } catch (\Throwable $error) {
+            $exchange->ignore();
+            try {
+                $handle->close(new TimeoutCancellation(self::FAILED_STARTUP_RELEASE_SECONDS));
+            } catch (\Throwable) {
+            }
+            throw $error;
         }
-
-        return $this->created[0];
     }
 
     /**
-     * Every handle the connector has started through this factory, oldest first.
-     *
      * @return list<SqliteWorkerHandle>
      */
     public function created(): array
@@ -85,13 +113,6 @@ final class SqliteWorkerContextFactory implements ContextFactory
         return $this->created;
     }
 
-    /**
-     * Kill every spawned child without joining any of them.
-     *
-     * The driver alone joins its contexts; this only guarantees no child survives a failed
-     * startup, even when connect() fails after spawning the worker but before the caller
-     * could observe the handle.
-     */
     public function forceStopAll(): void
     {
         $failure = null;
@@ -105,5 +126,42 @@ final class SqliteWorkerContextFactory implements ContextFactory
         if (null !== $failure) {
             throw $failure;
         }
+    }
+
+    /**
+     * @param array<array-key, mixed> $result
+     *
+     * @return array{journal_mode: string, synchronous: string, busy_timeout: int, wal_autocheckpoint: int, sqlite_version: string}
+     */
+    private function validatedConfiguration(array $result, SqliteSynchronousMode $synchronous): array
+    {
+        foreach (['journal_mode', 'synchronous', 'busy_timeout', 'wal_autocheckpoint', 'sqlite_version'] as $field) {
+            if (!\array_key_exists($field, $result)) {
+                throw new StorageFailureException('Worker configuration readback is incomplete.');
+            }
+        }
+        if (!\is_string($result['journal_mode']) || 'wal' !== strtolower($result['journal_mode'])) {
+            throw new StorageFailureException('Worker configuration must report WAL journal mode.');
+        }
+        if (!\is_string($result['synchronous']) || $result['synchronous'] !== $synchronous->value) {
+            throw new StorageFailureException('Worker configuration synchronous mode mismatch.');
+        }
+        if (!\is_int($result['busy_timeout']) || $result['busy_timeout'] < 0) {
+            throw new StorageFailureException('Worker configuration busy_timeout is invalid.');
+        }
+        if (!\is_int($result['wal_autocheckpoint']) || $result['wal_autocheckpoint'] < 0) {
+            throw new StorageFailureException('Worker configuration wal_autocheckpoint is invalid.');
+        }
+        if (!\is_string($result['sqlite_version']) || '' === $result['sqlite_version']) {
+            throw new StorageFailureException('Worker configuration sqlite_version is invalid.');
+        }
+
+        return [
+            'journal_mode' => $result['journal_mode'],
+            'synchronous' => $result['synchronous'],
+            'busy_timeout' => $result['busy_timeout'],
+            'wal_autocheckpoint' => $result['wal_autocheckpoint'],
+            'sqlite_version' => $result['sqlite_version'],
+        ];
     }
 }

@@ -18,6 +18,7 @@ use Ineersa\SqliteQueue\Messenger\Stamp\DeliveryReceiptStamp;
 use Ineersa\SqliteQueue\Messenger\Transport;
 use Ineersa\SqliteQueue\Protocol\Frame;
 use Ineersa\SqliteQueue\Protocol\Limits;
+use Ineersa\SqliteQueue\Tests\Support\ControlledWorkerClock;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use PHPUnit\Framework\TestCase;
@@ -37,6 +38,8 @@ use function Amp\Socket\listen;
 
 final class TransportTest extends TestCase
 {
+    use ControlledWorkerClock;
+
     private const int PROBE_SAFETY_SECONDS = 5;
 
     private ?IsolatedDatabase $database = null;
@@ -132,9 +135,9 @@ final class TransportTest extends TestCase
             $this->assertNull($sent->last(DeliveryReceiptStamp::class));
             $this->assertSame([], iterator_to_array($transport->get()));
 
-            $this->now += 249;
+            $this->setNow($this->now + 249);
             $this->assertSame([], iterator_to_array($transport->get()), 'Subsecond delay must not truncate to an earlier second.');
-            ++$this->now;
+            $this->setNow($this->now + 1);
             $received = iterator_to_array($transport->get());
             $this->assertCount(1, $received);
             $delivery = $received[0];
@@ -318,7 +321,7 @@ final class TransportTest extends TestCase
             $received = iterator_to_array($transport->get());
             $this->assertCount(1, $received);
 
-            $this->now += 50;
+            $this->setNow($this->now + 50);
             $other = $this->transport();
             $redelivery = iterator_to_array($other->get());
             $this->assertCount(1, $redelivery);
@@ -619,6 +622,13 @@ final class TransportTest extends TestCase
         return $client;
     }
 
+    private function setNow(int $value): void
+    {
+        $this->now = $value;
+        $database = $this->database ?? throw new \LogicException('Missing test database.');
+        (new \Symfony\Component\Filesystem\Filesystem())->dumpFile($database->path().'.clock', (string) $value);
+    }
+
     private function startBroker(int $visibilityTimeout = 5_000): void
     {
         $database = $this->database ?? throw new \LogicException('Missing test database.');
@@ -627,7 +637,8 @@ final class TransportTest extends TestCase
             $database->path(),
             $this->endpoint,
             $visibilityTimeout,
-            clock: fn (): int => $this->now,
+            clock: $this->syncedClock(fn (): int => $this->now, $database->path()),
+            workers: $this->workerFactory($database->path(), fn (): int => $this->now),
         ))->create();
         $ready = new DeferredFuture();
         $this->brokerFuture = async(fn (): int => $this->broker->run(static function (array $event) use ($ready): void {

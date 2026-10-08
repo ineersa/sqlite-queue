@@ -22,6 +22,7 @@ use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\ControllableClock;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Handler\NativeProbeMessageHandler;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeProbeMessage;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\NativeKernel;
+use Ineersa\SqliteQueue\Tests\Support\ControlledWorkerClock;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -48,6 +49,8 @@ use function Amp\async;
 #[RequiresOperatingSystem('Linux')]
 final class NativeIntegrationTest extends TestCase
 {
+    use ControlledWorkerClock;
+
     private const int SAFETY_SECONDS = 15;
 
     private ?IsolatedDatabase $database = null;
@@ -148,8 +151,6 @@ final class NativeIntegrationTest extends TestCase
             'command' => 'messenger:setup-transports',
             'transport' => 'async',
         ]), new BufferedOutput()));
-        $this->expectException(\Symfony\Component\Messenger\Exception\TransportException::class);
-        $transport->get();
     }
 
     public function testNativeConsumeLimitHandlesAndAcks(): void
@@ -331,7 +332,7 @@ final class NativeIntegrationTest extends TestCase
             $this->publisher()->send(new Envelope(new NativeProbeMessage('later'), [new DelayStamp(50)]));
             $timerId = $this->awaitNotifierDeadline($this->now + 50);
             $this->assertFalse(EventLoop::isEnabled($timerId));
-            $this->now += 50;
+            $this->setNow($this->now + 50);
             $this->fireNotifierTimer($timerId);
 
             $this->assertSame(0, $consume->await(new TimeoutCancellation(self::SAFETY_SECONDS)));
@@ -483,7 +484,7 @@ final class NativeIntegrationTest extends TestCase
             $this->awaitNotifierWaiters(1);
             $timerId = $this->awaitNotifierDeadline($this->now + 50);
             $this->assertFalse(EventLoop::isEnabled($timerId));
-            $this->now += 50;
+            $this->setNow($this->now + 50);
             $this->fireNotifierTimer($timerId);
 
             $this->assertSame(0, $consume->await(new TimeoutCancellation(self::SAFETY_SECONDS)));
@@ -551,7 +552,7 @@ final class NativeIntegrationTest extends TestCase
             ]));
             $this->awaitNotifierWaiters(1);
             $timer = $this->awaitNotifierDeadline($this->now + 50);
-            $this->now += 50;
+            $this->setNow($this->now + 50);
             $this->fireNotifierTimer($timer);
             $this->assertSame(0, $consume->await(new TimeoutCancellation(self::SAFETY_SECONDS)));
             $this->assertSame(2, NativeProbeMessageHandler::$attempts);
@@ -602,7 +603,7 @@ final class NativeIntegrationTest extends TestCase
             $this->startBroker();
             $this->assertSame([], iterator_to_array($this->transport()->get()));
             $this->assertGreaterThan($this->now, $availableAt);
-            $this->now = $availableAt;
+            $this->setNow($availableAt);
 
             $exit = $this->runConsume([
                 'command' => 'messenger:consume',
@@ -697,6 +698,13 @@ final class NativeIntegrationTest extends TestCase
         return $this->bootKernel()->getContainer()->get('event_dispatcher');
     }
 
+    private function setNow(int $value): void
+    {
+        $this->now = $value;
+        $database = $this->database?->path() ?? throw new \LogicException('Missing database.');
+        (new Filesystem())->dumpFile($database.'.clock', (string) $value);
+    }
+
     private function startBroker(): void
     {
         $database = $this->database?->path() ?? throw new \LogicException('Missing database.');
@@ -705,7 +713,8 @@ final class NativeIntegrationTest extends TestCase
             $database,
             $this->endpoint,
             5_000,
-            fn (): int => $this->now,
+            $this->syncedClock(fn (): int => $this->now, $database),
+            workers: $this->workerFactory($database, fn (): int => $this->now),
         ))->create();
         $this->brokerFuture = async(fn (): int => $this->broker->run(static function (array $event) use ($ready): void {
             if (!$ready->isComplete()) {

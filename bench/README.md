@@ -1,27 +1,39 @@
-# Run the SQLite baseline
+# Run the Messenger benchmark
 
-Install development dependencies with `composer install`. Use PHP 8.5 on Linux with `/proc`, `getconf`, `ext-pdo_sqlite`, `ext-posix`, and `ext-pcntl` available.
+The benchmark publishes through configured Symfony buses and starts stock `messenger:consume`. Each invocation compares Doctrine and the broker once, using the same WAL synchronous mode. NORMAL is the default; FULL is available explicitly.
 
-Run all six workloads from the checkout:
+## Check the wiring
 
-```sh
-	php bin/benchmark run
-```
-
-Do not run other benchmarks or builds at the same time. The command creates a private, unique directory under `var/bench/` and prints its path. It uses fresh file-backed databases on that filesystem, never a database supplied through environment variables. It removes its database files after each repetition and retains evidence files.
-
-Read `report.md` for per-run percentiles. Read `summary.json` for configuration, versions, integrity, resources, throughput, and individual-run variation. Each repetition has `config.json`, `result.json`, child logs, and raw `samples/*.jsonl` files. Keep the whole directory to reproduce the analysis.
-
-Exit code 0 means every scheduled baseline repetition completed without accounting errors. Exit code 1 means at least one repetition failed or was interrupted. Both outcomes describe the Doctrine baseline only, not a broker comparison.
-
-For a short execution check, use:
+Install dependencies with `composer install`, then run:
 
 ```sh
-	php bin/benchmark run --smoke
+	XDEBUG_MODE=off vendor/bin/castor bench --smoke --workload=concurrent
 ```
 
-Smoke uses four messages per publisher or prefill queue and one repetition. Do not use smoke results as performance evidence. To run one workload, add `--workload=idle`, or another name from [the method](../docs/benchmark-method.md).
+Smoke verifies wiring, payloads, accounting, and cleanup. It is not performance evidence.
 
-Use `php bin/benchmark run --help` for options. Performance workloads are separate from correctness tests. See [the method](../docs/benchmark-method.md) for timing definitions and [the recorded baseline](../docs/benchmark-baseline.md) for results and comparison limits.
+## Measure a workload
 
-On SIGINT or SIGTERM, the coordinator stops its children and writes the available results. Unexecuted repetitions remain counted as missing. A forced kill of the coordinator cannot provide completed cleanup evidence.
+The available workloads are `roundtrip`, `concurrent`, `application`, `idle`, and `retention`. Controls are `--workload`, `--smoke`, `--duration`, `--synchronous`, and `--polling-ms`.
+
+`--polling-ms` sets Doctrine's idle poll interval in integer milliseconds, from 1 to 1000. The default is 50 ms. Use 1000 for Symfony's one-second polling comparison. Broker consumers use notification WAIT in both cases. Each capture records the selected interval.
+
+```sh
+	XDEBUG_MODE=off vendor/bin/castor bench --workload=roundtrip --duration=60 --synchronous=normal
+	XDEBUG_MODE=off vendor/bin/castor bench --workload=roundtrip --duration=60 --synchronous=full
+	XDEBUG_MODE=off vendor/bin/castor bench --workload=concurrent --synchronous=normal
+	XDEBUG_MODE=off vendor/bin/castor bench --workload=concurrent --synchronous=normal --polling-ms=1000
+	XDEBUG_MODE=off vendor/bin/castor bench --workload=application --duration=60
+	XDEBUG_MODE=off vendor/bin/castor bench --workload=idle --duration=60
+	XDEBUG_MODE=off vendor/bin/castor bench --workload=retention
+```
+
+Time-based workloads default to 60 seconds per backend, about two minutes plus setup. Concurrent uses a fixed 3000-message cohort. Retention uses twenty cycles of one hundred messages. Smoke substitutes explicitly small cohorts.
+
+Commit the source before publishing measurements so the recorded revision identifies the code. Run one command at a time without competing builds or benchmarks. Do not retry failed comparisons until green.
+
+## Inspect results
+
+Each command prints its capture directory under `var/bench/`. Read `report.md`, `summary.json`, and `manifest.json`, then the per-backend records. Raw captures and `bench/results/` are ignored by Git. Databases and failure evidence remain after owned processes stop.
+
+The [method](../docs/benchmark-method.md) defines the metrics and limits. NORMAL can lose recent commits after machine failure. Resource accounting uses phase snapshots, not continuous peaks. A stable short retention run does not prove leak-free operation.

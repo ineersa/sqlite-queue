@@ -6,12 +6,11 @@
     "bin": ["bin/sqlite-queue"],
     "require": {
         "php": "^8.5",
-        "ext-sqlite3": "*",
+        "ext-pdo_sqlite": "*",
         "amphp/amp": "^3.1",
         "amphp/parallel": "^2.3",
         "amphp/socket": "^2.4",
         "amphp/sync": "^2.3",
-        "fabpot/amphp-sqlite3": "^1.0",
         "revolt/event-loop": "^1.0",
         "symfony/clock": "^8.0",
         "symfony/console": "^8.0",
@@ -21,8 +20,8 @@
     },
     "require-dev": {
         "ext-pcntl": "*",
-        "ext-pdo_sqlite": "*",
         "ext-posix": "*",
+        "ext-sqlite3": "*",
         "doctrine/dbal": "^4.3",
         "friendsofphp/php-cs-fixer": "^3.95",
         "jolicode/castor": "^1.0",

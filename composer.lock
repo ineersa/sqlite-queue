@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "e27b0c134fd8885e8502ac5d11f72787",
+    "content-hash": "75e14190586b0c244b022ecf68837078",
     "packages": [
         {
             "name": "amphp/amp",
@@ -749,116 +749,6 @@
             "time": "2026-08-22T18:13:20+00:00"
         },
         {
-            "name": "amphp/sql",
-            "version": "v2.1.1",
-            "source": {
-                "type": "git",
-                "url": "https://github.com/amphp/sql.git",
-                "reference": "258bafe5ecf8a0491d86681f2a2af1dee2933a69"
-            },
-            "dist": {
-                "type": "zip",
-                "url": "https://api.github.com/repos/amphp/sql/zipball/258bafe5ecf8a0491d86681f2a2af1dee2933a69",
-                "reference": "258bafe5ecf8a0491d86681f2a2af1dee2933a69",
-                "shasum": ""
-            },
-            "require": {
-                "amphp/amp": "^3",
-                "php": ">=8.1"
-            },
-            "require-dev": {
-                "amphp/php-cs-fixer-config": "^2",
-                "phpunit/phpunit": "^9",
-                "psalm/phar": "6.15.1"
-            },
-            "type": "library",
-            "autoload": {
-                "psr-4": {
-                    "Amp\\Sql\\": "src"
-                }
-            },
-            "notification-url": "https://packagist.org/downloads/",
-            "license": [
-                "MIT"
-            ],
-            "description": "Asynchronous SQL client for Amp.",
-            "homepage": "https://amphp.org",
-            "keywords": [
-                "async",
-                "asynchronous",
-                "database",
-                "db",
-                "sql"
-            ],
-            "support": {
-                "issues": "https://github.com/amphp/sql/issues",
-                "source": "https://github.com/amphp/sql/tree/v2.1.1"
-            },
-            "funding": [
-                {
-                    "url": "https://github.com/amphp",
-                    "type": "github"
-                }
-            ],
-            "time": "2026-02-25T04:44:15+00:00"
-        },
-        {
-            "name": "amphp/sql-common",
-            "version": "v2.0.4",
-            "source": {
-                "type": "git",
-                "url": "https://github.com/amphp/sql-common.git",
-                "reference": "735da17ef0a66e7139c9f7584af5c3f9827f83c0"
-            },
-            "dist": {
-                "type": "zip",
-                "url": "https://api.github.com/repos/amphp/sql-common/zipball/735da17ef0a66e7139c9f7584af5c3f9827f83c0",
-                "reference": "735da17ef0a66e7139c9f7584af5c3f9827f83c0",
-                "shasum": ""
-            },
-            "require": {
-                "amphp/amp": "^3",
-                "amphp/sql": "^2",
-                "php": ">=8.1"
-            },
-            "require-dev": {
-                "amphp/php-cs-fixer-config": "^2",
-                "amphp/phpunit-util": "^3",
-                "phpunit/phpunit": "^9",
-                "psalm/phar": "5.23"
-            },
-            "type": "library",
-            "autoload": {
-                "psr-4": {
-                    "Amp\\Sql\\Common\\": "src"
-                }
-            },
-            "notification-url": "https://packagist.org/downloads/",
-            "license": [
-                "MIT"
-            ],
-            "description": "Common classes for non-blocking SQL implementations.",
-            "homepage": "https://amphp.org",
-            "keywords": [
-                "async",
-                "asynchronous",
-                "database",
-                "db",
-                "sql"
-            ],
-            "support": {
-                "issues": "https://github.com/amphp/sql-common/issues",
-                "source": "https://github.com/amphp/sql-common/tree/v2.0.4"
-            },
-            "funding": [
-                {
-                    "url": "https://github.com/amphp",
-                    "type": "github"
-                }
-            ],
-            "time": "2025-12-11T20:05:29+00:00"
-        },
-        {
             "name": "amphp/sync",
             "version": "v2.3.0",
             "source": {
@@ -976,78 +866,6 @@
                 "source": "https://github.com/DaveRandom/LibDNS/tree/v2.1.0"
             },
             "time": "2024-04-12T12:12:48+00:00"
-        },
-        {
-            "name": "fabpot/amphp-sqlite3",
-            "version": "v1.0.0",
-            "source": {
-                "type": "git",
-                "url": "https://github.com/fabpot/amp-sqlite3.git",
-                "reference": "1ee168273e29af037a5c4576349ff89e3a53b5fd"
-            },
-            "dist": {
-                "type": "zip",
-                "url": "https://api.github.com/repos/fabpot/amp-sqlite3/zipball/1ee168273e29af037a5c4576349ff89e3a53b5fd",
-                "reference": "1ee168273e29af037a5c4576349ff89e3a53b5fd",
-                "shasum": ""
-            },
-            "require": {
-                "amphp/amp": "^3.1.1",
-                "amphp/byte-stream": "^2",
-                "amphp/parallel": "^2",
-                "amphp/sql": "^2.0.1",
-                "amphp/sql-common": "^2.0.4",
-                "amphp/sync": "^2",
-                "ext-sqlite3": "*",
-                "php": ">=8.4",
-                "revolt/event-loop": "^1.0.8"
-            },
-            "conflict": {
-                "amphp/dns": "<2.1.2",
-                "amphp/process": "<2.0.3",
-                "amphp/socket": "<2.3.1"
-            },
-            "require-dev": {
-                "amphp/php-cs-fixer-config": "^2",
-                "phpstan/phpstan": "^2.1",
-                "phpunit/phpunit": "^13.2"
-            },
-            "type": "library",
-            "autoload": {
-                "psr-4": {
-                    "Fabpot\\Amp\\Sqlite\\": "src"
-                }
-            },
-            "notification-url": "https://packagist.org/downloads/",
-            "license": [
-                "MIT"
-            ],
-            "authors": [
-                {
-                    "name": "Fabien Potencier",
-                    "email": "fabien@potencier.org"
-                }
-            ],
-            "description": "Asynchronous SQLite client for PHP based on Amp.",
-            "homepage": "https://github.com/fabpot/amp-sqlite3",
-            "keywords": [
-                "async",
-                "asynchronous",
-                "database",
-                "db",
-                "sqlite"
-            ],
-            "support": {
-                "issues": "https://github.com/fabpot/amp-sqlite3/issues",
-                "source": "https://github.com/fabpot/amp-sqlite3/tree/v1.0.0"
-            },
-            "funding": [
-                {
-                    "url": "https://github.com/fabpot",
-                    "type": "github"
-                }
-            ],
-            "time": "2026-08-18T19:14:45+00:00"
         },
         {
             "name": "kelunik/certificate",
@@ -10011,12 +9829,12 @@
     "prefer-lowest": false,
     "platform": {
         "php": "^8.5",
-        "ext-sqlite3": "*"
+        "ext-pdo_sqlite": "*"
     },
     "platform-dev": {
         "ext-pcntl": "*",
-        "ext-pdo_sqlite": "*",
-        "ext-posix": "*"
+        "ext-posix": "*",
+        "ext-sqlite3": "*"
     },
     "plugin-api-version": "2.6.0"
 }

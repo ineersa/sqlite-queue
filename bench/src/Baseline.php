@@ -6,9 +6,9 @@ namespace Ineersa\SqliteQueue\Bench;
 
 use Doctrine\DBAL\Connection as DbalConnection;
 use Doctrine\DBAL\DriverManager;
+use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 use Symfony\Component\Messenger\Bridge\Doctrine\Transport\Connection as DoctrineTransportConnection;
 use Symfony\Component\Messenger\Bridge\Doctrine\Transport\DoctrineTransport;
-use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
 
 /**
@@ -20,17 +20,18 @@ use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
  */
 final class Baseline
 {
-    public static function connect(string $databasePath): DbalConnection
+    public static function connect(string $databasePath, SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal): DbalConnection
     {
         $connection = DriverManager::getConnection([
             'driver' => 'pdo_sqlite',
             'path' => $databasePath,
+            'driverOptions' => [\Pdo\Sqlite::ATTR_TRANSACTION_MODE => \Pdo\Sqlite::TRANSACTION_MODE_IMMEDIATE],
         ]);
 
         // WAL is persistent per database file; synchronous and busy_timeout are per connection
         // and are applied on every connection this benchmark opens.
         $connection->executeStatement('PRAGMA journal_mode='.Config::EXPECTED_JOURNAL_MODE);
-        $connection->executeStatement('PRAGMA synchronous=FULL');
+        $connection->executeStatement('PRAGMA synchronous='.$synchronous->value);
         $connection->executeStatement('PRAGMA busy_timeout='.Config::BUSY_TIMEOUT_MS);
         $connection->executeStatement('PRAGMA wal_autocheckpoint=1000');
 
@@ -38,14 +39,24 @@ final class Baseline
     }
 
     /**
-     * @return array{journal_mode: string, synchronous: int, busy_timeout: int, wal_autocheckpoint: int, database: string, file_backed: bool}
+     * @return array{journal_mode: string, synchronous: int, busy_timeout: int, wal_autocheckpoint: int, database: string, file_backed: bool, transaction_mode: string, native_transaction_mode: int}
      */
     public static function durability(DbalConnection $connection): array
     {
         $parameters = $connection->getParams();
         $database = (string) ($parameters['path'] ?? ':memory:');
+        $native = $connection->getNativeConnection();
+        if (!$native instanceof \Pdo\Sqlite) {
+            throw new \RuntimeException('Benchmark baseline requires native PDO SQLite.');
+        }
+        $mode = $native->getAttribute(\Pdo\Sqlite::ATTR_TRANSACTION_MODE);
+        if (\Pdo\Sqlite::TRANSACTION_MODE_IMMEDIATE !== $mode) {
+            throw new \RuntimeException('Benchmark baseline requires immediate transactions.');
+        }
 
         return [
+            'transaction_mode' => 'immediate',
+            'native_transaction_mode' => $mode,
             'journal_mode' => strtolower((string) $connection->executeQuery('PRAGMA journal_mode')->fetchOne()),
             'synchronous' => (int) $connection->executeQuery('PRAGMA synchronous')->fetchOne(),
             'busy_timeout' => (int) $connection->executeQuery('PRAGMA busy_timeout')->fetchOne(),
@@ -58,17 +69,22 @@ final class Baseline
     /**
      * @param array{journal_mode: string, synchronous: int, file_backed: bool} $durability
      */
-    public static function isDurabilityEquivalent(array $durability): bool
+    public static function isDurabilityEquivalent(array $durability, SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal): bool
     {
         return Config::EXPECTED_JOURNAL_MODE === $durability['journal_mode']
-            && Config::EXPECTED_SYNCHRONOUS === $durability['synchronous']
+            && self::synchronousValue($synchronous) === $durability['synchronous']
             && true === $durability['file_backed'];
+    }
+
+    public static function synchronousValue(SqliteSynchronousMode $mode): int
+    {
+        return SqliteSynchronousMode::Normal === $mode ? 1 : 2; // SQLite PRAGMA protocol values.
     }
 
     public static function transport(
         DbalConnection $connection,
         string $queue,
-        ?SerializerInterface $serializer = null,
+        SerializerInterface $serializer,
     ): DoctrineTransport {
         $transportConnection = new DoctrineTransportConnection([
             'table_name' => Config::MESSENGER_TABLE,
@@ -77,78 +93,6 @@ final class Baseline
             'auto_setup' => true,
         ], $connection);
 
-        return new DoctrineTransport($transportConnection, $serializer ?? new PhpSerializer());
-    }
-
-    /**
-     * @return array<string, int> pending rows per queue
-     */
-    public static function inventory(DbalConnection $connection): array
-    {
-        if (!self::tableExists($connection)) {
-            return [];
-        }
-
-        $inventory = [];
-        /** @var array<string, mixed> $row */
-        foreach ($connection->executeQuery(\sprintf(
-            'SELECT queue_name, COUNT(*) AS pending FROM %s GROUP BY queue_name ORDER BY queue_name',
-            Config::MESSENGER_TABLE,
-        ))->fetchAllAssociative() as $row) {
-            $inventory[(string) $row['queue_name']] = (int) $row['pending'];
-        }
-
-        return $inventory;
-    }
-
-    public static function tableExists(DbalConnection $connection): bool
-    {
-        $count = $connection->executeQuery(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
-            [Config::MESSENGER_TABLE],
-        )->fetchOne();
-
-        return (int) $count > 0;
-    }
-
-    /**
-     * Records the checkpoint result, which also bounds the size of the kept artifacts.
-     *
-     * @return array{busy: int, log: int, checkpointed: int}
-     */
-    public static function checkpoint(DbalConnection $connection): array
-    {
-        /** @var array<string, mixed>|false $row */
-        $row = $connection->executeQuery('PRAGMA wal_checkpoint(TRUNCATE)')->fetchAssociative();
-
-        if (!\is_array($row)) {
-            return ['busy' => -1, 'log' => -1, 'checkpointed' => -1];
-        }
-
-        return [
-            'busy' => (int) $row['busy'],
-            'log' => (int) $row['log'],
-            'checkpointed' => (int) $row['checkpointed'],
-        ];
-    }
-
-    /**
-     * Row count of a message id, read from a second connection.
-     *
-     * The publisher calls this after a send returned to prove the row is already durable on
-     * another connection, which is what commit-before-confirmation means in practice.
-     */
-    public static function rowExists(DbalConnection $connection, string $messageId): bool
-    {
-        if (!self::tableExists($connection)) {
-            return false;
-        }
-
-        $count = $connection->executeQuery(
-            \sprintf('SELECT COUNT(*) FROM %s WHERE id = ?', Config::MESSENGER_TABLE),
-            [$messageId],
-        )->fetchOne();
-
-        return (int) $count > 0;
+        return new DoctrineTransport($transportConnection, $serializer);
     }
 }

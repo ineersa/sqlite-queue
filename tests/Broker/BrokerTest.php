@@ -22,6 +22,7 @@ use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Tests\Broker\Fixtures\GatingServerSocket;
 use Ineersa\SqliteQueue\Tests\Broker\Fixtures\WriteGate;
+use Ineersa\SqliteQueue\Tests\Support\ControlledWorkerClock;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -35,8 +36,12 @@ use function Amp\Socket\connect;
 
 final class BrokerTest extends TestCase
 {
+    use ControlledWorkerClock;
+
     /** Harness safety timeout, not a correctness threshold. */
     private const int SHUTDOWN_BOUND_SECONDS = 10;
+    private const int HANDSHAKE_READ_TIMEOUT_SECONDS = 5;
+    private const int FRAME_READ_TIMEOUT_SECONDS = 30;
     private ?IsolatedDatabase $database = null;
     private ?Broker $broker = null;
     /** @var Future<int>|null */
@@ -76,6 +81,61 @@ final class BrokerTest extends TestCase
         }
 
         parent::tearDown();
+    }
+
+    public function testIdleReceiptOwnerHasNoFrameDeadlineAndCanStillAcknowledge(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker(clock: fn (): int => $this->now);
+            $client = $this->connectClient();
+            $client->send('jobs', 'held during a handler');
+            $delivery = $client->receive('jobs');
+            $this->assertNotNull($delivery);
+            $this->turn();
+            $this->assertSame([], $this->readTimeoutTimers(self::FRAME_READ_TIMEOUT_SECONDS), 'An idle receipt owner must not have a frame deadline.');
+            $client->acknowledge($delivery->receipt);
+            $this->assertNull($client->receive('jobs'));
+            $client->send('jobs', 'same publisher session');
+        });
+    }
+
+    public static function incompleteRequests(): iterable
+    {
+        yield 'handshake has no first byte' => [false, 0, self::HANDSHAKE_READ_TIMEOUT_SECONDS];
+        yield 'first prefix byte starts deadline' => [true, 1, self::FRAME_READ_TIMEOUT_SECONDS];
+        yield 'full prefix without control starts deadline' => [true, Limits::LENGTH_PREFIX_BYTES, self::FRAME_READ_TIMEOUT_SECONDS];
+        yield 'payload remains bounded' => [true, -1, self::FRAME_READ_TIMEOUT_SECONDS];
+    }
+
+    #[DataProvider('incompleteRequests')]
+    public function testIncompleteRequestsRetainTheirReadDeadline(bool $established, int $bytes, int $seconds): void
+    {
+        $this->runAsync(function () use ($established, $bytes, $seconds): void {
+            $this->startBroker();
+            $peer = $this->rawPeer();
+            if ($established) {
+                Frame::write($peer, (new Frame(['v' => Frame::VERSION, 'id' => 0, 'op' => 'hello']))->encode(), new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS));
+                $this->assertNotNull(Frame::read($peer, new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS)));
+                $this->turn();
+                $this->assertSame([], $this->readTimeoutTimers(self::FRAME_READ_TIMEOUT_SECONDS));
+                $frame = (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'send', 'queue' => 'jobs'], 'payload'))->encode();
+                $peer->write(substr($frame, 0, $bytes));
+            }
+            $deadline = microtime(true) + self::SHUTDOWN_BOUND_SECONDS;
+            do {
+                $timers = $this->readTimeoutTimers($seconds);
+                if ([] !== $timers) {
+                    break;
+                }
+                $this->turn();
+            } while (microtime(true) < $deadline);
+            $this->assertCount(1, $timers);
+            $timer = array_key_first($timers);
+            EventLoop::disable($timer);
+            $this->fireNotifierTimer($timer);
+            $this->assertNull(Frame::read($peer, new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS)));
+            $this->connectClient()->send('jobs', 'unrelated client remains usable');
+        });
     }
 
     public function testConnectionLimitRejectsExtraClientAndKeepsAdmittedClientsWorking(): void
@@ -178,7 +238,7 @@ final class BrokerTest extends TestCase
             $replacement = $this->connectClient();
             if ($claim) {
                 $this->assertNull($replacement->receive('jobs'));
-                $this->now = $expiry;
+                $this->setNow((int) $expiry);
             }
             $delivery = $replacement->receive('jobs');
             $this->assertSame('payload', $delivery->body);
@@ -226,12 +286,12 @@ final class BrokerTest extends TestCase
             $id = $owner->send('jobs', 'payload', delay: 100);
             $this->assertNull($owner->receive('jobs'), 'A delayed message must not be claimable before its deadline.');
 
-            $this->now = $start + 25;
+            $this->setNow($start + 25);
             $this->assertNull($owner->receive('jobs'), 'A restarted broker must still observe the persisted deadline.');
             $this->restartBroker(50, fn (): int => $this->now);
             $owner = $this->connectClient();
 
-            $this->now = $start + 100;
+            $this->setNow($start + 100);
             $delivery = $owner->receive('jobs');
             $this->assertNotNull($delivery);
             $this->assertSame($id, $delivery->id);
@@ -246,7 +306,7 @@ final class BrokerTest extends TestCase
             }
 
             $owner->close();
-            $this->now = $delivery->reservedUntil;
+            $this->setNow($delivery->reservedUntil);
             $redelivered = $other->receive('jobs');
             $this->assertNotNull($redelivered);
             $this->assertSame('payload', $redelivered->body);
@@ -297,7 +357,7 @@ final class BrokerTest extends TestCase
                     $receipt = $id.':'.('0' === $token[0] ? '1' : '0').substr($token, 1);
                     break;
                 case ErrorCode::ExpiredReceipt:
-                    $this->now = $delivery->reservedUntil;
+                    $this->setNow($delivery->reservedUntil);
                     break;
                 default:
                     $this->fail('Expected a receipt error code.');
@@ -322,27 +382,19 @@ final class BrokerTest extends TestCase
     public function testShutdownDuringClaimDoesNotTreatContextCancellationAsStorageFailure(): void
     {
         $this->runAsync(function (): void {
-            $entered = new DeferredFuture();
-            $release = new DeferredFuture();
-            $armed = false;
-            $this->startBroker(50, function () use ($entered, $release, &$armed): int {
-                if ($armed) {
-                    $armed = false;
-                    $entered->complete();
-                    $release->getFuture()->await(new TimeoutCancellation(10));
-                }
-
-                return $this->now;
-            });
+            // Claim clocks live in the worker. Gate the oversized reply after commit so shutdown
+            // observes a dispatched claim without a parent-side mid-transaction pause.
+            $gate = new WriteGate();
+            $this->startBrokerWithGatedServer($gate, Frame::MAX_PAYLOAD);
             $client = $this->connectClient();
-            $client->send('jobs', 'reserved');
-            $armed = true;
+            $payload = str_repeat('r', Frame::MAX_PAYLOAD);
+            $client->send('jobs', $payload);
             $receiving = async(static fn () => $client->receive('jobs'));
             try {
-                $entered->getFuture()->await(new TimeoutCancellation(10));
+                $gate->entered()->await(new TimeoutCancellation(10));
                 $this->broker->stop();
             } finally {
-                $release->complete();
+                $gate->release();
             }
             try {
                 $receiving->await(new TimeoutCancellation(10));
@@ -352,7 +404,7 @@ final class BrokerTest extends TestCase
             }
             $database = new \SQLite3($this->database->path());
             try {
-                $this->assertSame($this->now + 50, $database->querySingle('SELECT reserved_until FROM queue_messages'));
+                $this->assertSame($this->now + Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS, $database->querySingle('SELECT reserved_until FROM queue_messages'));
             } finally {
                 $database->close();
             }
@@ -402,7 +454,7 @@ final class BrokerTest extends TestCase
             $client->send('jobs', 'later', delay: 100);
             $waiting = async(static fn (): bool => $client->wait('jobs', 5_000));
             $timerId = $this->awaitNotifierDeadline($this->now + 100);
-            $this->now += 100;
+            $this->setNow($this->now + 100);
             $this->fireNotifierTimer($timerId);
             $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
             $delivery = $client->receive('jobs');
@@ -414,7 +466,7 @@ final class BrokerTest extends TestCase
             $this->assertNotNull($reserved);
             $waiting = async(static fn (): bool => $client->wait('jobs', 5_000));
             $timerId = $this->awaitNotifierDeadline($reserved->reservedUntil);
-            $this->now = $reserved->reservedUntil;
+            $this->setNow($reserved->reservedUntil);
             $this->fireNotifierTimer($timerId);
             $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
             $redelivery = $client->receive('jobs');
@@ -438,7 +490,7 @@ final class BrokerTest extends TestCase
             $this->awaitNotifierWaiters(2);
             $publisher->send('jobs', 'earlier', delay: 50);
             $timerId = $this->awaitNotifierDeadline($this->now + 50);
-            $this->now += 50;
+            $this->setNow($this->now + 50);
             $this->fireNotifierTimer($timerId);
             $this->assertTrue($waitingJobs->await(new TimeoutCancellation(5)));
             $this->assertFalse($waitingOther->isComplete());
@@ -752,7 +804,7 @@ final class BrokerTest extends TestCase
             $this->endpoint = $database->path('queue.sock');
             $during = null;
             $failure = new \RuntimeException('Readiness callback failure sentinel.');
-            $broker = (new BrokerFactory($database->path(), $this->endpoint, 5000, fn (): int => $this->now))->create();
+            $broker = (new BrokerFactory($database->path(), $this->endpoint, 5000, $this->syncedClock(fn (): int => $this->now, $database->path()), workers: $this->workerFactory($database->path(), fn (): int => $this->now)))->create();
             $future = async(static function () use ($broker, &$during, $failure): int {
                 return $broker->run(static function (array $event) use (&$during, $failure): void {
                     $during = ProcessTree::ownedBy((int) getmypid());
@@ -798,7 +850,7 @@ final class BrokerTest extends TestCase
         $this->runAsync(function (): void {
             $database = $this->database ?? throw new \LogicException('Missing test database.');
             $this->endpoint = $database->path('queue.sock');
-            $broker = (new BrokerFactory($database->path(), $this->endpoint, 5000, fn (): int => $this->now))->create();
+            $broker = (new BrokerFactory($database->path(), $this->endpoint, 5000, $this->syncedClock(fn (): int => $this->now, $database->path()), workers: $this->workerFactory($database->path(), fn (): int => $this->now)))->create();
             $ready = new DeferredFuture();
             $brokerFuture = async(static function () use ($broker, $ready): int {
                 return $broker->run(static function (array $event) use ($ready): void {
@@ -828,15 +880,16 @@ final class BrokerTest extends TestCase
                 $timer = $this->shutdownTimerId($broker);
                 $this->assertNotNull($timer);
                 EventLoop::cancel($timer);
-                $storage = (new \ReflectionProperty($broker, 'storage'))->getValue($broker);
-                $connection = (new \ReflectionProperty($storage, 'connection'))->getValue($storage);
                 $safety = new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS);
-                while (!$connection->isClosed()) {
+                $proxy = (new \ReflectionProperty($broker, 'worker'))->getValue($broker);
+                $this->assertInstanceOf(\Ineersa\SqliteQueue\Sqlite\SqliteQueueWorker::class, $proxy);
+                // Close is in flight against a stopped launcher; wait one turn then escalate.
+                while (!$brokerFuture->isComplete() && !(new \ReflectionProperty($proxy, 'closing'))->getValue($proxy)) {
                     \Amp\delay(0, cancellation: $safety);
                 }
                 $this->assertFalse($brokerFuture->isComplete(), 'Driver close must still await the stopped launcher.');
                 $deadline = (new \ReflectionProperty($broker, 'deadline'))->getValue($broker);
-                $handle = (new \ReflectionProperty($broker, 'worker'))->getValue($broker);
+                $handle = $proxy->handle();
                 (new \ReflectionMethod($broker, 'releaseBudgetAfter'))->invoke($broker, $deadline, $handle->forceStop(...));
                 $outcome = $brokerFuture->catch(static fn (\Throwable $error): string => $error::class);
                 $settled = $outcome->await($safety);
@@ -844,6 +897,11 @@ final class BrokerTest extends TestCase
                 $this->assertSame(CancelledException::class, $settled, 'The shared budget must cancel the blocked shutdown.');
                 $this->assertFileDoesNotExist($this->endpoint, 'Shutdown must release the endpoint while the launcher is stopped.');
                 $this->assertFileExists($database->path(), 'Shutdown must preserve confirmed data.');
+                // SIGKILL is asynchronous. Observe process exit instead of assuming the kernel
+                // has scheduled the worker before the cancelled shutdown future settles.
+                while ([] !== ProcessTree::ownedBy((int) getmypid())['workers']) {
+                    \Amp\delay(0, cancellation: $safety);
+                }
                 $this->assertSame([], ProcessTree::ownedBy((int) getmypid())['workers'], 'The force-stopped worker must not survive the shutdown.');
                 $this->assertSame('T', $this->processState($launcher), 'The broker does not own the launcher, so this test must reap it.');
             } finally {
@@ -949,10 +1007,11 @@ final class BrokerTest extends TestCase
             $peer = $this->rawPeer();
             $peer->write((new Frame(['v' => 1, 'id' => 0, 'op' => 'hello']))->encode());
             $this->assertNotNull(Frame::read($peer, new TimeoutCancellation(10)));
-            $storage = (new \ReflectionProperty(Broker::class, 'storage'))->getValue($broker);
-            $this->assertInstanceOf(\Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage::class, $storage);
+            $worker = (new \ReflectionProperty(Broker::class, 'worker'))->getValue($broker);
+            $this->assertInstanceOf(\Ineersa\SqliteQueue\Sqlite\SqliteQueueWorker::class, $worker);
             // Fail the next storage operation without racing the independent worker-death monitor.
-            (new \ReflectionProperty($storage, 'closed'))->setValue($storage, true);
+            (new \ReflectionProperty($worker, 'failed'))->setValue($worker, true);
+            (new \ReflectionProperty($worker, 'closing'))->setValue($worker, true);
 
             $peer->write((new Frame(['v' => 1, 'id' => 1, 'op' => 'send', 'queue' => 'jobs', 'delay' => 0], 'must fail'))->encode());
             $this->assertNull(Frame::read($peer, new TimeoutCancellation(10)), 'Fatal storage failure must close without writing an error frame.');
@@ -1093,7 +1152,33 @@ final class BrokerTest extends TestCase
         $this->fail('Waiter timeout timer was not armed.');
     }
 
+    /** @return array<string, TimerCallback> */
+    private function readTimeoutTimers(int $seconds): array
+    {
+        $result = [];
+        foreach ($this->loopCallbacks() as $id => $callback) {
+            if (!$callback instanceof TimerCallback || $callback->interval !== (float) $seconds || !EventLoop::isEnabled($id)) {
+                continue;
+            }
+            if ((new \ReflectionFunction($callback->closure))->getFileName() === (new \ReflectionClass(TimeoutCancellation::class))->getFileName()) {
+                $result[$id] = $callback;
+            }
+        }
+
+        return $result;
+    }
+
     private function fireNotifierTimer(string $timerId): void
+    {
+        $callback = $this->loopCallbacks()[$timerId] ?? null;
+        $this->assertInstanceOf(TimerCallback::class, $callback);
+        EventLoop::cancel($timerId);
+        ($callback->closure)($timerId);
+        $this->turn();
+    }
+
+    /** @return array<string, object> */
+    private function loopCallbacks(): array
     {
         $driver = EventLoop::getDriver();
         $callbacks = null;
@@ -1106,11 +1191,8 @@ final class BrokerTest extends TestCase
             $reflection = $reflection->getParentClass() ?: null;
         }
         $this->assertIsArray($callbacks);
-        $callback = $callbacks[$timerId] ?? null;
-        $this->assertInstanceOf(TimerCallback::class, $callback);
-        EventLoop::cancel($timerId);
-        ($callback->closure)($timerId);
-        $this->turn();
+
+        return $callbacks;
     }
 
     private function turn(): void
@@ -1126,11 +1208,24 @@ final class BrokerTest extends TestCase
         }
     }
 
+    private function setNow(int $value): void
+    {
+        $this->now = $value;
+        $database = $this->database ?? throw new \LogicException('Missing test database.');
+        (new \Symfony\Component\Filesystem\Filesystem())->dumpFile($database->path().'.clock', (string) $value);
+    }
+
     private function startBroker(int $visibilityTimeout = 5000, ?\Closure $clock = null): void
     {
         $database = $this->database ?? throw new \LogicException('Missing test database.');
         $this->endpoint = $database->path('queue.sock');
-        $this->broker = (new BrokerFactory($database->path(), $this->endpoint, $visibilityTimeout, $clock))->create();
+        $this->broker = (new BrokerFactory(
+            $database->path(),
+            $this->endpoint,
+            $visibilityTimeout,
+            $this->syncedClock($clock, $database->path()),
+            workers: $this->workerFactory($database->path(), $clock),
+        ))->create();
         $ready = new DeferredFuture();
         $this->brokerFuture = async(fn (): int => $this->broker->run(static function (array $event) use ($ready): void {
             $ready->complete($event);
@@ -1147,7 +1242,12 @@ final class BrokerTest extends TestCase
     {
         $database = $this->database ?? throw new \LogicException('Missing test database.');
         $this->endpoint = $database->path('queue.sock');
-        $original = (new BrokerFactory($database->path(), $this->endpoint, clock: fn (): int => $this->now))->create();
+        $original = (new BrokerFactory(
+            $database->path(),
+            $this->endpoint,
+            clock: $this->syncedClock(fn (): int => $this->now, $database->path()),
+            workers: $this->workerFactory($database->path(), fn (): int => $this->now),
+        ))->create();
         $constructor = (new \ReflectionClass(Broker::class))->getConstructor() ?? throw new \LogicException('Missing Broker constructor.');
         $arguments = [];
         foreach ($constructor->getParameters() as $parameter) {
