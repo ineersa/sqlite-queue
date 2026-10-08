@@ -20,6 +20,8 @@ final class SqliteWorkerRequestEntry
     public bool $responseComplete = false;
     public bool $removed = false;
     public bool $inFlightCharged = false;
+    public bool $admissionHeld = false;
+    public bool $callerConsumed = false;
     public ?string $timeoutId = null;
     public ?string $cancellationId = null;
     public ?Cancellation $cancellation = null;

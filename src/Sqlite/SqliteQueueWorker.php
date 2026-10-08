@@ -56,8 +56,8 @@ final class SqliteQueueWorker
     private ?DeferredFuture $capacityAvailable = null;
     /** @var DeferredFuture<null>|null */
     private ?DeferredFuture $writerSignal = null;
-    /** @var Future<void>|null */
-    private ?Future $reader = null;
+    /** @var Future<void> */
+    private Future $reader;
     /** @var Future<void>|null */
     private ?Future $shutdown = null;
     private ?StorageFailureException $failure = null;
@@ -261,7 +261,6 @@ final class SqliteQueueWorker
             $this->reserveAdmission($payloadBytes);
         }
         $entry = new SqliteWorkerRequestEntry($operation, $data, $payloadBytes, $lifecycle, $expectedQueue);
-        $admitted = !$lifecycle;
         try {
             if ($lifecycle) {
                 if (null !== $this->pendingClose) {
@@ -270,6 +269,7 @@ final class SqliteQueueWorker
                 $this->pendingClose = $entry;
                 $this->closeRequested = true;
             } else {
+                $entry->admissionHeld = true;
                 $this->queue[] = $entry;
             }
             $entry->cancellation = $cancellation;
@@ -288,10 +288,8 @@ final class SqliteQueueWorker
             throw $error;
         } finally {
             $this->unsubscribeCancellation($entry);
-            if ($admitted && !$entry->removed) {
-                $this->releaseAdmission($payloadBytes);
-            }
-            $entry->data = null;
+            $entry->callerConsumed = true;
+            $this->releaseAdmissionIfReady($entry);
         }
     }
 
@@ -319,12 +317,8 @@ final class SqliteQueueWorker
                     }
                     $this->writerSignal ??= new DeferredFuture();
                     $signal = $this->writerSignal->getFuture();
-                    $this->writerRunning = false;
-                    try {
-                        $signal->await();
-                    } finally {
-                        $this->writerRunning = true;
-                    }
+                    // Stay marked running while suspended so wakeWriter only completes this signal.
+                    $signal->await();
                     continue;
                 }
                 $this->dispatchEntry($entry);
@@ -390,9 +384,10 @@ final class SqliteQueueWorker
                     $entry,
                     new ClientContextClosedException('The client connection lifetime was cancelled.', previous: $error),
                 );
-                if (!$entry->lifecycle && !$entry->removed) {
+                $entry->removed = true;
+                if ($entry->admissionHeld) {
+                    $entry->admissionHeld = false;
                     $this->releaseAdmission($entry->payloadBytes);
-                    $entry->removed = true;
                 }
 
                 return;
@@ -422,18 +417,24 @@ final class SqliteQueueWorker
         try {
             $this->handle->context()->send($payload);
         } catch (\Throwable $error) {
+            unset($payload);
             $entry->writeComplete = true;
             $this->releaseInFlightFor($entry);
             $this->clearTimeout($entry);
-            unset($this->dispatched[$id]);
+            $this->releaseAdmissionIfReady($entry);
+            if ($entry->responseComplete) {
+                unset($this->dispatched[$id]);
+            }
             throw $this->failLane('Worker exchange failed.', $error);
         }
+        unset($payload);
         $entry->writeComplete = true;
         if ($entry->responseComplete) {
             $this->releaseInFlightFor($entry);
             $this->clearTimeout($entry);
             unset($this->dispatched[$id]);
         }
+        $this->releaseAdmissionIfReady($entry);
         $this->wakeWriter();
     }
 
@@ -519,6 +520,7 @@ final class SqliteQueueWorker
             $this->releaseInFlightFor($entry);
             $this->clearTimeout($entry);
             unset($this->dispatched[$id]);
+            $this->releaseAdmissionIfReady($entry);
         }
     }
 
@@ -552,7 +554,8 @@ final class SqliteQueueWorker
             }
         }
         $entry->removed = true;
-        if (!$entry->lifecycle) {
+        if ($entry->admissionHeld) {
+            $entry->admissionHeld = false;
             $this->releaseAdmission($entry->payloadBytes);
         }
         $this->completeEntry($entry, new ClientContextClosedException('The client connection lifetime was cancelled.'));
@@ -569,7 +572,8 @@ final class SqliteQueueWorker
             }
             $entry->removed = true;
             $this->unsubscribeCancellation($entry);
-            if (!$entry->lifecycle) {
+            if ($entry->admissionHeld) {
+                $entry->admissionHeld = false;
                 $this->releaseAdmission($entry->payloadBytes);
             }
             $this->completeEntry($entry, $error);
@@ -607,6 +611,8 @@ final class SqliteQueueWorker
         $this->writerSignal = null;
         if (null !== $signal && !$signal->isComplete()) {
             $signal->complete(null);
+
+            return;
         }
         if (!$this->writerRunning
             && SqliteWorkerLifecycleEnum::Closed !== $this->lifecycle
@@ -721,6 +727,15 @@ final class SqliteQueueWorker
         if ($this->hasProbeCapacity()) {
             $this->signalCapacity(null);
         }
+    }
+
+    private function releaseAdmissionIfReady(SqliteWorkerRequestEntry $entry): void
+    {
+        if (!$entry->admissionHeld || !$entry->callerConsumed || !$entry->writeComplete) {
+            return;
+        }
+        $entry->admissionHeld = false;
+        $this->releaseAdmission($entry->payloadBytes);
     }
 
     private function hasProbeCapacity(): bool
@@ -862,6 +877,7 @@ final class SqliteQueueWorker
             if ($entry->writeComplete) {
                 $this->releaseInFlightFor($entry);
                 $this->clearTimeout($entry);
+                $this->releaseAdmissionIfReady($entry);
             }
         }
         $this->dispatched = [];
