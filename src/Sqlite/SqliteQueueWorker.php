@@ -195,6 +195,11 @@ final class SqliteQueueWorker
 
     private function shutdownWorker(Cancellation $budget): void
     {
+        // Shutdown owns this subscription until cleanup ends. Unlike client cancellation,
+        // its budget must still terminate the lane after Close has been dispatched.
+        $subscription = $budget->subscribe(function (): void {
+            $this->failLane('Worker shutdown budget expired.');
+        });
         try {
             if (null === $this->failure) {
                 try {
@@ -219,6 +224,7 @@ final class SqliteQueueWorker
                 }
             }
         } finally {
+            $budget->unsubscribe($subscription);
             $this->lifecycle = SqliteWorkerLifecycleEnum::Closed;
             $this->markFailed($this->failure ?? new StorageFailureException('Queue storage is closed.'));
             $this->signalCapacity(new StorageFailureException('Queue storage is closed.'));
