@@ -6,7 +6,11 @@ The broker keeps sockets, WAIT, and process supervision asynchronous in the pare
 
 `SqliteWorkerContextFactory` starts exactly one package-owned worker. The child opens the database, configures WAL and the selected synchronous mode, prepares the fixed statements, and constructs queue policy with a fresh epoch.
 
-The parent proxy admits at most one in-flight exchange. Caller cancellation can stop work before dispatch. After the channel send begins, the worker finishes the operation and the parent consumes the terminal result. Domain receipt failures remain ordinary responses. Storage, IPC, timeout, and malformed-reply failures fail the storage lane and stop the broker. The broker does not replace the worker behind live sessions.
+This experimental parent proxy pipelines up to four operations through one FIFO writer and one independent response reader. The child still executes each operation and transaction sequentially. It never waits to fill a batch.
+
+The in-flight payload budget is twice the maximum message payload. Total admission is limited to 128 operations and 64 maximum payloads, including queued work and retained completions. Sends reserve their actual payload size; claims reserve the maximum possible reply. Credits remain charged until the result is consumed and the sender releases its data.
+
+Caller cancellation removes queued work without consuming a wire ID. After the channel send begins, the worker finishes the operation and the parent consumes its terminal result. Domain receipt failures affect only that request. Storage, IPC, timeout, and malformed-reply failures fail the lane and stop the broker. Several dispatched operations can have unknown outcomes after one channel failure. Known terminal results remain known. The broker does not replace the worker or replay operations.
 
 Readiness reports the worker PID as `persistence_pid` and the effective synchronous mode from the owning child connection. The parent does not open a second SQLite connection for configuration evidence.
 
@@ -18,9 +22,9 @@ Readiness reports the worker PID as `persistence_pid` and the effective synchron
 | Dispatched exchange | 10 seconds | Immediately before channel send |
 | Shutdown | 5 seconds total | At the first stop request |
 
-SQLite `busy_timeout` remains 5,000 milliseconds. An exchange timeout marks the outcome unknown, fails the lane, terminates the worker, and releases waiting callers. The broker does not reuse the channel or replay the operation.
+SQLite `busy_timeout` remains 5,000 milliseconds. Each dispatched request has its own exchange deadline, including time behind earlier requests in the child. Other replies do not extend it. A timeout fails the lane, terminates the worker, and releases waiting callers. It does not retract an already validated response.
 
-Shutdown shares one budget across client drain, the close exchange, and child teardown. Graceful close joins the Amp process context once. Forced termination uses `ProcessContext::close()` and tolerates the expected missing-result failure. Amp owns process-exit tracking. Pipe EOF alone is not proof of reaping.
+Shutdown stops admission, removes queued work, and drains dispatched operations before sending one Close through the same writer and reader. It shares one budget across client drain, close, and child teardown. Graceful close joins the Amp process context once. Forced termination uses `ProcessContext::close()` and tolerates the expected missing-result failure. Amp owns process-exit tracking. Pipe EOF alone is not proof of reaping.
 
 ## Durability
 
@@ -33,4 +37,4 @@ Use `--synchronous=normal|full`, bundle `sqlite_queue.synchronous`, or `Sqlite\S
 
 ## Embedding
 
-Applications should use the broker and client. Local `Queue` and `SqliteQueueStorage` remain package-owned policy and PDO storage for the worker. They are not a second public network API. Existing databases need no schema migration. Claim still uses select, conditional update, and payload read in one immediate transaction; the worker does not use data-changing `RETURNING`.
+Applications should use the broker and client. Local `Queue` and `SqliteQueueStorage` remain package-owned policy and PDO storage for the worker. They are not a second public network API. Existing databases need no schema migration. Claim selects the payload and conditionally reserves that row in one immediate transaction; the worker does not use data-changing `RETURNING`.
