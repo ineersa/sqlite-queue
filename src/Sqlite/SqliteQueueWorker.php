@@ -9,10 +9,6 @@ use Amp\CancelledException;
 use Amp\DeferredFuture;
 use Amp\Future;
 use Amp\NullCancellation;
-use Amp\Sync\LocalMutex;
-use Amp\Sync\Lock;
-use Amp\TimeoutCancellation;
-use Amp\TimeoutException;
 use Ineersa\SqliteQueue\DTO\DeliveryDTO;
 use Ineersa\SqliteQueue\Exception\ClientContextClosedException;
 use Ineersa\SqliteQueue\Exception\InvalidReceiptException;
@@ -21,14 +17,16 @@ use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Sqlite\Exception\StorageCapacityException;
 use Ineersa\SqliteQueue\Sqlite\Exception\StorageFailureException;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
+use Revolt\EventLoop;
 
 use function Amp\async;
 
 /**
  * Parent proxy for one persistent PDO worker.
  *
- * Caller cancellation can prevent dispatch. After channel send begins, the terminal
- * reply is always consumed or the lane fails closed.
+ * Admits requests into a bounded FIFO. One writer sends without waiting for replies.
+ * One reader validates ordered replies. Caller cancellation can remove queued work;
+ * after send begins, the terminal reply is consumed or the lane fails closed.
  */
 final class SqliteQueueWorker
 {
@@ -36,22 +34,34 @@ final class SqliteQueueWorker
     private const int MAX_ELIGIBILITY_PROBES = Limits::MAX_CONNECTIONS;
     private const int MAX_ADMITTED_OPERATIONS = Limits::MAX_CONNECTIONS + self::MAX_ELIGIBILITY_PROBES;
     private const int MAX_ADMITTED_PAYLOAD_BYTES = Limits::MAX_CONNECTIONS * Limits::MAX_PAYLOAD;
+    private const int MAX_IN_FLIGHT_OPERATIONS = 4;
+    private const int MAX_IN_FLIGHT_PAYLOAD_BYTES = 2 * Limits::MAX_PAYLOAD;
 
-    private readonly LocalMutex $exchange;
+    private SqliteWorkerLifecycleEnum $lifecycle = SqliteWorkerLifecycleEnum::Open;
     private int $nextRequestId = 2;
+    private int $nextExpectedResponseId = 2;
     private int $admittedOperations = 0;
     private int $admittedPayloadBytes = 0;
-    private bool $closing = false;
-    private bool $failed = false;
-    private bool $closed = false;
+    private int $inFlightOperations = 0;
+    private int $inFlightPayloadBytes = 0;
+    private bool $writerRunning = false;
+    private bool $closeRequested = false;
+    private bool $closeSent = false;
+    private bool $readerStopped = false;
+    /** @var list<SqliteWorkerRequestEntry> */
+    private array $queue = [];
+    /** @var array<int, SqliteWorkerRequestEntry> */
+    private array $dispatched = [];
     /** @var DeferredFuture<null>|null */
     private ?DeferredFuture $capacityAvailable = null;
-    /**
-     * Absent until close is requested; repeated callers share one shutdown.
-     *
-     * @var Future<void>|null
-     */
+    /** @var DeferredFuture<null>|null */
+    private ?DeferredFuture $writerSignal = null;
+    /** @var Future<void>|null */
+    private ?Future $reader = null;
+    /** @var Future<void>|null */
     private ?Future $shutdown = null;
+    private ?StorageFailureException $failure = null;
+    private ?SqliteWorkerRequestEntry $pendingClose = null;
 
     /**
      * @param array{journal_mode: string, synchronous: string, busy_timeout: int, wal_autocheckpoint: int, sqlite_version: string} $configuration
@@ -61,7 +71,8 @@ final class SqliteQueueWorker
         private readonly SqliteSynchronousMode $synchronous,
         private readonly array $configuration,
     ) {
-        $this->exchange = new LocalMutex();
+        $this->reader = async($this->readLoop(...));
+        $this->reader->ignore();
     }
 
     public function handle(): SqliteWorkerHandle
@@ -115,7 +126,7 @@ final class SqliteQueueWorker
                 'queue' => $queue->value,
                 'owner_id' => $ownerId,
             ],
-            0,
+            Limits::MAX_PAYLOAD,
             $cancellation ?? new NullCancellation(),
             expectedQueue: $queue->value,
         );
@@ -150,7 +161,7 @@ final class SqliteQueueWorker
     /** Wait until a zero-payload eligibility probe can be admitted or the token cancels. */
     public function awaitCapacity(Cancellation $cancellation): void
     {
-        if ($this->closed || $this->failed) {
+        if (SqliteWorkerLifecycleEnum::Open !== $this->lifecycle) {
             throw new StorageFailureException('Queue storage is closed.');
         }
         if ($this->hasProbeCapacity()) {
@@ -163,7 +174,13 @@ final class SqliteQueueWorker
     /** Mark the proxy closing so queued work cannot dispatch later. */
     public function beginClose(): void
     {
-        $this->closing = true;
+        if (SqliteWorkerLifecycleEnum::Open !== $this->lifecycle) {
+            return;
+        }
+        $this->lifecycle = SqliteWorkerLifecycleEnum::Closing;
+        $this->closeRequested = true;
+        $this->failQueued(new StorageFailureException('Queue storage is closing.'));
+        $this->wakeWriter();
     }
 
     public function close(Cancellation $budget): void
@@ -179,14 +196,20 @@ final class SqliteQueueWorker
     private function shutdownWorker(Cancellation $budget): void
     {
         try {
-            if (!$this->failed) {
+            if (null === $this->failure) {
                 try {
-                    $this->exchange(SqliteWorkerOperationEnum::Close, [], 0, $budget, allowWhileClosing: true);
+                    $this->exchange(
+                        SqliteWorkerOperationEnum::Close,
+                        [],
+                        0,
+                        $budget,
+                        lifecycle: true,
+                    );
                 } catch (\Throwable) {
-                    $this->failed = true;
+                    $this->markFailed(new StorageFailureException('Worker close exchange failed.'));
                 }
             }
-            if ($this->failed) {
+            if (null !== $this->failure) {
                 $this->handle->close($budget);
             } else {
                 try {
@@ -196,9 +219,10 @@ final class SqliteQueueWorker
                 }
             }
         } finally {
-            $this->closed = true;
-            $this->failed = true;
+            $this->lifecycle = SqliteWorkerLifecycleEnum::Closed;
+            $this->markFailed($this->failure ?? new StorageFailureException('Queue storage is closed.'));
             $this->signalCapacity(new StorageFailureException('Queue storage is closed.'));
+            $this->wakeWriter();
         }
     }
 
@@ -228,97 +252,226 @@ final class SqliteQueueWorker
         array $data,
         int $payloadBytes,
         Cancellation $cancellation,
-        bool $allowWhileClosing = false,
+        bool $lifecycle = false,
         ?string $expectedQueue = null,
     ): mixed {
-        $this->assertOpen($allowWhileClosing);
+        $this->assertOpen($lifecycle);
         $this->assertActive($cancellation);
-        // One shared close exchange waits for the lane even when normal admission is full.
-        $admitted = !$allowWhileClosing;
-        if ($admitted) {
+        if (!$lifecycle) {
             $this->reserveAdmission($payloadBytes);
         }
-        $lock = null;
-        $dispatched = false;
+        $entry = new SqliteWorkerRequestEntry($operation, $data, $payloadBytes, $lifecycle, $expectedQueue);
+        $admitted = !$lifecycle;
         try {
-            $acquire = async($this->exchange->acquire(...));
-            try {
-                $lock = $acquire->await($cancellation);
-            } catch (CancelledException $error) {
-                // Keep an abandoned mutex waiter accounted for until it actually leaves the lane.
-                $acquire->map(function (Lock $lock) use ($payloadBytes, $admitted): void {
-                    $lock->release();
-                    if ($admitted) {
-                        $this->releaseAdmission($payloadBytes);
-                    }
-                })->ignore();
-                $admitted = false;
-                if ($allowWhileClosing) {
-                    throw $this->failLane('Shutdown budget expired while waiting for the storage lane.', $error);
+            if ($lifecycle) {
+                if (null !== $this->pendingClose) {
+                    return $this->pendingClose->completion->getFuture()->await();
                 }
-                throw new ClientContextClosedException('The client connection lifetime was cancelled.', previous: $error);
+                $this->pendingClose = $entry;
+                $this->closeRequested = true;
+            } else {
+                $this->queue[] = $entry;
             }
-            $this->assertOpen($allowWhileClosing);
-            $this->assertActive($cancellation);
-            $id = $this->nextRequestId++;
-            $context = $this->handle->context();
-            $deadline = $allowWhileClosing ? $cancellation : new TimeoutCancellation(self::EXCHANGE_TIMEOUT_SECONDS);
-            // No yield between the final admission check and marking dispatch attempted.
-            $dispatched = true;
-            $exchange = async(static function () use ($context, $id, $operation, $data): mixed {
-                $context->send([
-                    'id' => $id,
-                    'op' => $operation->value,
-                    'data' => $data,
-                ]);
-
-                return $context->receive();
+            $entry->cancellation = $cancellation;
+            $entry->cancellationId = $cancellation->subscribe(function () use ($entry): void {
+                $this->cancelQueued($entry);
             });
-            try {
-                $response = $exchange->await($deadline);
-            } catch (CancelledException $error) {
-                try {
-                    $context->close();
-                } catch (\Throwable) {
-                }
-                $exchange->ignore();
-                $reason = $error->getPrevious() instanceof TimeoutException
-                    ? 'Worker exchange deadline expired.'
-                    : 'Worker exchange cancelled during shutdown.';
-                throw $this->failLane($reason, $error);
-            } catch (\Throwable $error) {
-                throw $this->failLane('Worker exchange failed.', $error);
-            }
+            $this->wakeWriter();
 
-            return $this->validatedResult($operation, $id, $response, $expectedQueue);
+            return $entry->completion->getFuture()->await();
         } catch (ClientContextClosedException|StorageCapacityException|\InvalidArgumentException|InvalidReceiptException|StorageFailureException $error) {
             throw $error;
         } catch (\Throwable $error) {
-            if ($dispatched) {
+            if ($entry->dispatched) {
                 throw $this->failLane('Worker exchange failed.', $error);
             }
             throw $error;
         } finally {
-            $lock?->release();
-            if ($admitted) {
+            $this->unsubscribeCancellation($entry);
+            if ($admitted && !$entry->removed) {
                 $this->releaseAdmission($payloadBytes);
             }
+            $entry->data = null;
         }
     }
 
-    private function validatedResult(
-        SqliteWorkerOperationEnum $operation,
-        int $id,
-        mixed $response,
-        ?string $expectedQueue,
-    ): mixed {
+    private function writeLoop(): void
+    {
+        if ($this->writerRunning) {
+            return;
+        }
+        $this->writerRunning = true;
+        try {
+            while (true) {
+                if (SqliteWorkerLifecycleEnum::Failed === $this->lifecycle || SqliteWorkerLifecycleEnum::Closed === $this->lifecycle) {
+                    return;
+                }
+                $entry = $this->nextWritableEntry();
+                if (null === $entry) {
+                    if ($this->shouldSendClose()) {
+                        $entry = $this->pendingClose;
+                        if (null === $entry || $entry->dispatched || $entry->removed) {
+                            return;
+                        }
+                        $this->closeSent = true;
+                        $this->dispatchEntry($entry);
+                        continue;
+                    }
+                    $this->writerSignal ??= new DeferredFuture();
+                    $signal = $this->writerSignal->getFuture();
+                    $this->writerRunning = false;
+                    try {
+                        $signal->await();
+                    } finally {
+                        $this->writerRunning = true;
+                    }
+                    continue;
+                }
+                $this->dispatchEntry($entry);
+            }
+        } catch (\Throwable $error) {
+            $this->failLane('Worker writer failed.', $error);
+        } finally {
+            $this->writerRunning = false;
+        }
+    }
+
+    private function shouldSendClose(): bool
+    {
+        return $this->closeRequested
+            && !$this->closeSent
+            && null !== $this->pendingClose
+            && !$this->pendingClose->dispatched
+            && !$this->pendingClose->removed
+            && [] === $this->dispatched
+            && !$this->hasQueuedNormalWork()
+            && null === $this->failure;
+    }
+
+    private function nextWritableEntry(): ?SqliteWorkerRequestEntry
+    {
+        while ([] !== $this->queue) {
+            $entry = $this->queue[0];
+            if ($entry->removed) {
+                array_shift($this->queue);
+                continue;
+            }
+            if (!$this->hasInFlightCapacity($entry->payloadBytes)) {
+                return null;
+            }
+            array_shift($this->queue);
+
+            return $entry;
+        }
+
+        return null;
+    }
+
+    private function dispatchEntry(SqliteWorkerRequestEntry $entry): void
+    {
+        if ($entry->removed || $entry->dispatched) {
+            return;
+        }
+        if (null !== $this->failure) {
+            $this->completeEntry($entry, $this->failure);
+
+            return;
+        }
+        if (!$entry->lifecycle && SqliteWorkerLifecycleEnum::Open !== $this->lifecycle) {
+            $this->completeEntry($entry, new StorageFailureException('Queue storage is closing.'));
+
+            return;
+        }
+        if (null !== $entry->cancellation) {
+            try {
+                $entry->cancellation->throwIfRequested();
+            } catch (CancelledException $error) {
+                $this->completeEntry(
+                    $entry,
+                    new ClientContextClosedException('The client connection lifetime was cancelled.', previous: $error),
+                );
+                if (!$entry->lifecycle && !$entry->removed) {
+                    $this->releaseAdmission($entry->payloadBytes);
+                    $entry->removed = true;
+                }
+
+                return;
+            }
+        }
+
+        $id = $this->nextRequestId++;
+        $entry->id = $id;
+        $entry->dispatched = true;
+        $this->unsubscribeCancellation($entry);
+        if (!$entry->lifecycle) {
+            $this->reserveInFlight($entry->payloadBytes);
+            $entry->inFlightCharged = true;
+            $entry->timeoutId = EventLoop::delay(self::EXCHANGE_TIMEOUT_SECONDS, function () use ($entry): void {
+                if (!$entry->responseComplete || !$entry->writeComplete) {
+                    $this->failLane('Worker exchange deadline expired.');
+                }
+            });
+        }
+        $this->dispatched[$id] = $entry;
+        $payload = [
+            'id' => $id,
+            'op' => $entry->operation->value,
+            'data' => $entry->data ?? [],
+        ];
+        $entry->data = null;
+        try {
+            $this->handle->context()->send($payload);
+        } catch (\Throwable $error) {
+            $entry->writeComplete = true;
+            $this->releaseInFlightFor($entry);
+            $this->clearTimeout($entry);
+            unset($this->dispatched[$id]);
+            throw $this->failLane('Worker exchange failed.', $error);
+        }
+        $entry->writeComplete = true;
+        if ($entry->responseComplete) {
+            $this->releaseInFlightFor($entry);
+            $this->clearTimeout($entry);
+            unset($this->dispatched[$id]);
+        }
+        $this->wakeWriter();
+    }
+
+    private function readLoop(): void
+    {
+        try {
+            while (!$this->readerStopped) {
+                try {
+                    $response = $this->handle->context()->receive();
+                } catch (\Throwable $error) {
+                    if (null !== $this->failure || SqliteWorkerLifecycleEnum::Closed === $this->lifecycle) {
+                        return;
+                    }
+                    throw $this->failLane('Worker exchange failed.', $error);
+                }
+                $this->handleResponse($response);
+            }
+        } catch (StorageFailureException) {
+            // Lane already failed closed.
+        } catch (\Throwable $error) {
+            $this->failLane('Worker reader failed.', $error);
+        }
+    }
+
+    private function handleResponse(mixed $response): void
+    {
         if (!\is_array($response)) {
             throw $this->failLane('Worker response must be an array.');
         }
-        if (($response['id'] ?? null) !== $id) {
-            throw $this->failLane('Worker response id does not match the request.');
+        $id = $response['id'] ?? null;
+        if ($id !== $this->nextExpectedResponseId) {
+            throw $this->failLane('Worker response id does not match the next expected response.');
         }
-        if (($response['op'] ?? null) !== $operation->value) {
+        $entry = $this->dispatched[$id] ?? null;
+        if (null === $entry) {
+            throw $this->failLane('Worker response does not match a dispatched request.');
+        }
+        if (($response['op'] ?? null) !== $entry->operation->value) {
             throw $this->failLane('Worker response operation does not match the request.');
         }
         $statusValue = $response['status'] ?? null;
@@ -329,8 +482,14 @@ final class SqliteQueueWorker
         if (null === $status) {
             throw $this->failLane('Worker response status is invalid.');
         }
+        ++$this->nextExpectedResponseId;
         if (SqliteWorkerStatusEnum::Domain === $status) {
-            throw $this->domainException($response['error'] ?? null);
+            $error = $this->domainException($response['error'] ?? null);
+            $entry->responseComplete = true;
+            $this->completeEntry($entry, $error);
+            $this->finishDispatched($entry);
+
+            return;
         }
         if (SqliteWorkerStatusEnum::Failure === $status) {
             throw $this->failLane(SqliteWorkerDiagnostic::failure($response['error'] ?? null));
@@ -338,8 +497,160 @@ final class SqliteQueueWorker
         if (!\array_key_exists('result', $response)) {
             throw $this->failLane('Worker success response is missing its result.');
         }
-        $result = $response['result'];
+        $result = $this->validatedResult($entry->operation, $response['result'], $entry->expectedQueue);
+        $entry->responseComplete = true;
+        $this->completeEntry($entry, $result);
+        $this->finishDispatched($entry);
+        if (SqliteWorkerOperationEnum::Close === $entry->operation) {
+            $this->readerStopped = true;
 
+            return;
+        }
+        $this->wakeWriter();
+    }
+
+    private function finishDispatched(SqliteWorkerRequestEntry $entry): void
+    {
+        $id = $entry->id;
+        if (null === $id) {
+            return;
+        }
+        if ($entry->writeComplete) {
+            $this->releaseInFlightFor($entry);
+            $this->clearTimeout($entry);
+            unset($this->dispatched[$id]);
+        }
+    }
+
+    private function releaseInFlightFor(SqliteWorkerRequestEntry $entry): void
+    {
+        if (!$entry->inFlightCharged) {
+            return;
+        }
+        $entry->inFlightCharged = false;
+        $this->releaseInFlight($entry->payloadBytes);
+    }
+
+    private function clearTimeout(SqliteWorkerRequestEntry $entry): void
+    {
+        if (null === $entry->timeoutId) {
+            return;
+        }
+        EventLoop::cancel($entry->timeoutId);
+        $entry->timeoutId = null;
+    }
+
+    private function cancelQueued(SqliteWorkerRequestEntry $entry): void
+    {
+        if ($entry->dispatched || $entry->removed || $entry->completion->isComplete()) {
+            return;
+        }
+        foreach ($this->queue as $index => $candidate) {
+            if ($candidate === $entry) {
+                array_splice($this->queue, $index, 1);
+                break;
+            }
+        }
+        $entry->removed = true;
+        if (!$entry->lifecycle) {
+            $this->releaseAdmission($entry->payloadBytes);
+        }
+        $this->completeEntry($entry, new ClientContextClosedException('The client connection lifetime was cancelled.'));
+        $this->wakeWriter();
+    }
+
+    private function failQueued(\Throwable $error): void
+    {
+        $queued = $this->queue;
+        $this->queue = [];
+        foreach ($queued as $entry) {
+            if ($entry->removed || $entry->completion->isComplete()) {
+                continue;
+            }
+            $entry->removed = true;
+            $this->unsubscribeCancellation($entry);
+            if (!$entry->lifecycle) {
+                $this->releaseAdmission($entry->payloadBytes);
+            }
+            $this->completeEntry($entry, $error);
+        }
+    }
+
+    private function completeEntry(SqliteWorkerRequestEntry $entry, mixed $result): void
+    {
+        if ($entry->completion->isComplete()) {
+            return;
+        }
+        if ($result instanceof \Throwable) {
+            $entry->completion->error($result);
+        } else {
+            $entry->completion->complete($result);
+        }
+    }
+
+    private function unsubscribeCancellation(SqliteWorkerRequestEntry $entry): void
+    {
+        if (null === $entry->cancellationId || null === $entry->cancellation) {
+            $entry->cancellationId = null;
+            $entry->cancellation = null;
+
+            return;
+        }
+        $entry->cancellation->unsubscribe($entry->cancellationId);
+        $entry->cancellationId = null;
+        $entry->cancellation = null;
+    }
+
+    private function wakeWriter(): void
+    {
+        $signal = $this->writerSignal;
+        $this->writerSignal = null;
+        if (null !== $signal && !$signal->isComplete()) {
+            $signal->complete(null);
+        }
+        if (!$this->writerRunning
+            && SqliteWorkerLifecycleEnum::Closed !== $this->lifecycle
+            && SqliteWorkerLifecycleEnum::Failed !== $this->lifecycle
+        ) {
+            async($this->writeLoop(...))->ignore();
+        }
+    }
+
+    private function hasQueuedNormalWork(): bool
+    {
+        foreach ($this->queue as $entry) {
+            if (!$entry->removed) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function hasInFlightCapacity(int $payloadBytes): bool
+    {
+        return $this->inFlightOperations < self::MAX_IN_FLIGHT_OPERATIONS
+            && $this->inFlightPayloadBytes + $payloadBytes <= self::MAX_IN_FLIGHT_PAYLOAD_BYTES;
+    }
+
+    private function reserveInFlight(int $payloadBytes): void
+    {
+        ++$this->inFlightOperations;
+        $this->inFlightPayloadBytes += $payloadBytes;
+    }
+
+    private function releaseInFlight(int $payloadBytes): void
+    {
+        if ($this->inFlightOperations < 1 || $this->inFlightPayloadBytes < $payloadBytes) {
+            throw $this->failLane('In-flight counters are inconsistent.');
+        }
+        --$this->inFlightOperations;
+        $this->inFlightPayloadBytes -= $payloadBytes;
+        $this->wakeWriter();
+    }
+
+    private function validatedResult(SqliteWorkerOperationEnum $operation, mixed $result, ?string $expectedQueue): mixed
+    {
         return match ($operation) {
             SqliteWorkerOperationEnum::Send => $this->requirePositiveInt($result, 'Send'),
             SqliteWorkerOperationEnum::Claim => null === $result
@@ -431,12 +742,12 @@ final class SqliteQueueWorker
         }
     }
 
-    private function assertOpen(bool $allowWhileClosing): void
+    private function assertOpen(bool $lifecycle): void
     {
-        if ($this->closed || $this->failed) {
+        if (SqliteWorkerLifecycleEnum::Closed === $this->lifecycle || SqliteWorkerLifecycleEnum::Failed === $this->lifecycle) {
             throw new StorageFailureException('Queue storage is closed.');
         }
-        if ($this->closing && !$allowWhileClosing) {
+        if (SqliteWorkerLifecycleEnum::Closing === $this->lifecycle && !$lifecycle) {
             throw new StorageFailureException('Queue storage is closing.');
         }
     }
@@ -532,16 +843,44 @@ final class SqliteQueueWorker
         throw $this->failLane('Worker reported an unsupported domain failure.');
     }
 
+    private function markFailed(StorageFailureException $error): void
+    {
+        $this->failure ??= $error;
+        if (SqliteWorkerLifecycleEnum::Closed !== $this->lifecycle) {
+            $this->lifecycle = SqliteWorkerLifecycleEnum::Failed;
+        }
+        $this->closeRequested = true;
+        $this->failQueued($this->failure);
+        if (null !== $this->pendingClose && !$this->pendingClose->completion->isComplete()) {
+            $this->completeEntry($this->pendingClose, $this->failure);
+        }
+        foreach ($this->dispatched as $entry) {
+            if (!$entry->responseComplete) {
+                $entry->responseComplete = true;
+                $this->completeEntry($entry, $this->failure);
+            }
+            if ($entry->writeComplete) {
+                $this->releaseInFlightFor($entry);
+                $this->clearTimeout($entry);
+            }
+        }
+        $this->dispatched = [];
+        $this->signalCapacity(new StorageFailureException('Queue storage lane has failed.'));
+        $this->wakeWriter();
+    }
+
     private function failLane(string $message, ?\Throwable $previous = null): StorageFailureException
     {
-        $this->failed = true;
-        $this->closing = true;
-        try {
-            $this->handle->forceStop();
-        } catch (\Throwable) {
+        $error = new StorageFailureException(SqliteWorkerDiagnostic::text($message), previous: $previous);
+        if (null === $this->failure) {
+            $this->markFailed($error);
+            try {
+                $this->handle->forceStop();
+            } catch (\Throwable) {
+            }
+            $this->readerStopped = true;
         }
-        $this->signalCapacity(new StorageFailureException('Queue storage lane has failed.'));
 
-        return new StorageFailureException(SqliteWorkerDiagnostic::text($message), previous: $previous);
+        return $this->failure ?? $error;
     }
 }

@@ -6,9 +6,7 @@ namespace Ineersa\SqliteQueue\Tests\Sqlite;
 
 use Amp\DeferredCancellation;
 use Amp\DeferredFuture;
-use Amp\Sync\LocalMutex;
 use Amp\TimeoutCancellation;
-use Ineersa\SqliteQueue\Broker\Broker;
 use Ineersa\SqliteQueue\Exception\ClientContextClosedException;
 use Ineersa\SqliteQueue\Exception\MalformedReceiptException;
 use Ineersa\SqliteQueue\Protocol\Limits;
@@ -100,35 +98,79 @@ final class SqliteQueueWorkerTest extends TestCase
         })->await(new TimeoutCancellation(20));
     }
 
-    public function testCancelledMutexWaiterRemainsAccountedUntilItLeavesTheLane(): void
+    public function testQueuedCancellationRemovesWorkWithoutConsumingWireIds(): void
     {
         async(function (): void {
             $worker = $this->startWorker();
-            $mutex = (new \ReflectionProperty($worker, 'exchange'))->getValue($worker);
-            $this->assertInstanceOf(LocalMutex::class, $mutex);
-            $gate = $mutex->acquire();
-            $count = new \ReflectionProperty($worker, 'admittedOperations');
-            $lifetime = new DeferredCancellation();
             $queue = new QueueName('jobs');
-            try {
-                $queued = async(static fn (): int => $worker->send($queue, 'must not dispatch', cancellation: $lifetime->getCancellation()));
-                while (0 === $count->getValue($worker)) {
-                    $barrier = new DeferredFuture();
-                    EventLoop::queue(static fn () => $barrier->complete());
-                    $barrier->getFuture()->await(new TimeoutCancellation(5));
-                }
-                $lifetime->cancel();
-                try {
-                    $queued->await(new TimeoutCancellation(5));
-                    $this->fail('Cancelled waiter must return without dispatching.');
-                } catch (ClientContextClosedException) {
-                }
-                $this->assertSame(1, $count->getValue($worker));
-            } finally {
-                $gate->release();
+            $count = new \ReflectionProperty($worker, 'admittedOperations');
+            $dispatched = new \ReflectionProperty($worker, 'dispatched');
+            $nextId = new \ReflectionProperty($worker, 'nextRequestId');
+            $lifetime = new DeferredCancellation();
+            $blocked = [];
+            for ($i = 0; $i < 2; ++$i) {
+                $blocked[] = async(static fn (): ?\Ineersa\SqliteQueue\DTO\DeliveryDTO => $worker->receive($queue, 'blocker-'.$i));
             }
-            $this->assertNull($worker->receive($queue, 'owner-1'));
-            $this->assertSame(0, $count->getValue($worker));
+            while (\count($dispatched->getValue($worker)) < 2) {
+                $this->yieldOnce();
+            }
+            $wireBefore = $nextId->getValue($worker);
+            $this->assertSame(4, $wireBefore);
+            $queued = async(static fn (): int => $worker->send($queue, 'queued-cancel', cancellation: $lifetime->getCancellation()));
+            while ($count->getValue($worker) < 3) {
+                $this->yieldOnce();
+            }
+            $this->assertSame($wireBefore, $nextId->getValue($worker));
+            $lifetime->cancel();
+            try {
+                $queued->await(new TimeoutCancellation(5));
+                $this->fail('Queued cancellation must return without dispatch.');
+            } catch (ClientContextClosedException) {
+            }
+            $this->assertSame(2, $count->getValue($worker));
+            $this->assertSame($wireBefore, $nextId->getValue($worker));
+            foreach ($blocked as $future) {
+                $this->assertNull($future->await(new TimeoutCancellation(5)));
+            }
+            $id = $worker->send($queue, 'after-cancel');
+            $this->assertSame(1, $id);
+        })->await(new TimeoutCancellation(20));
+    }
+
+    public function testScriptedPeerReceivesSecondRequestBeforeFirstReply(): void
+    {
+        async(function (): void {
+            $worker = $this->startScriptedWorker();
+            $queue = new QueueName('jobs');
+            $first = async(static fn (): int => $worker->send($queue, 'A'));
+            $second = async(static fn (): int => $worker->send($queue, 'B'));
+            $this->assertSame(1, $first->await(new TimeoutCancellation(5)));
+            $this->assertSame(2, $second->await(new TimeoutCancellation(5)));
+        })->await(new TimeoutCancellation(20));
+    }
+
+    public function testInFlightByteCreditBlocksThirdMaxPayloadReservation(): void
+    {
+        async(function (): void {
+            $worker = $this->startWorker();
+            $queue = new QueueName('jobs');
+            $inFlightBytes = new \ReflectionProperty($worker, 'inFlightPayloadBytes');
+            $dispatched = new \ReflectionProperty($worker, 'dispatched');
+            $queuedDepth = new \ReflectionProperty($worker, 'queue');
+            $first = async(static fn (): ?\Ineersa\SqliteQueue\DTO\DeliveryDTO => $worker->receive($queue, 'owner-a'));
+            $second = async(static fn (): ?\Ineersa\SqliteQueue\DTO\DeliveryDTO => $worker->receive($queue, 'owner-b'));
+            while (\count($dispatched->getValue($worker)) < 2) {
+                $this->yieldOnce();
+            }
+            $this->assertSame(2 * Limits::MAX_PAYLOAD, $inFlightBytes->getValue($worker));
+            $third = async(static fn (): ?\Ineersa\SqliteQueue\DTO\DeliveryDTO => $worker->receive($queue, 'owner-c'));
+            while (0 === \count($queuedDepth->getValue($worker))) {
+                $this->yieldOnce();
+            }
+            $this->assertCount(2, $dispatched->getValue($worker));
+            $this->assertNull($first->await(new TimeoutCancellation(5)));
+            $this->assertNull($second->await(new TimeoutCancellation(5)));
+            $this->assertNull($third->await(new TimeoutCancellation(5)));
         })->await(new TimeoutCancellation(20));
     }
 
@@ -148,7 +190,6 @@ final class SqliteQueueWorkerTest extends TestCase
                     'delay' => 0,
                 ],
             ]);
-            // Non-monotonic child request IDs fail the lane closed.
             try {
                 $worker->send(new QueueName('jobs'), 'after-desync');
                 $this->fail('Desynchronized lane must fail closed.');
@@ -178,7 +219,7 @@ final class SqliteQueueWorkerTest extends TestCase
             $worker = $this->startWorker();
             $payload = str_repeat('p', Limits::MAX_PAYLOAD);
             $reserved = [];
-            for ($i = 0; $i < Broker::MAX_CONNECTIONS; ++$i) {
+            for ($i = 0; $i < Limits::MAX_CONNECTIONS; ++$i) {
                 $reserved[] = $this->forceReserve($worker, \strlen($payload));
             }
             try {
@@ -224,6 +265,31 @@ final class SqliteQueueWorkerTest extends TestCase
         $this->worker = $worker;
 
         return $worker;
+    }
+
+    private function startScriptedWorker(): SqliteQueueWorker
+    {
+        $this->database = new IsolatedDatabase();
+        touch($this->database->path());
+        $factory = new SqliteWorkerContextFactory([
+            __DIR__.'/Fixtures/worker-scripted-pipeline.php',
+        ]);
+        $worker = $factory->create(
+            $this->database->path(),
+            60_000,
+            SqliteSynchronousMode::Normal,
+            new TimeoutCancellation(15),
+        );
+        $this->worker = $worker;
+
+        return $worker;
+    }
+
+    private function yieldOnce(): void
+    {
+        $barrier = new DeferredFuture();
+        EventLoop::queue(static fn () => $barrier->complete(null));
+        $barrier->getFuture()->await(new TimeoutCancellation(5));
     }
 
     /**
