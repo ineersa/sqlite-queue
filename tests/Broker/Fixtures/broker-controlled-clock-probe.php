@@ -14,7 +14,6 @@ declare(strict_types=1);
 use Ineersa\SqliteQueue\Broker\Broker;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
 use Ineersa\SqliteQueue\Broker\QueueNotifier;
-use Ineersa\SqliteQueue\Sqlite\SqliteWorkerContextFactory;
 use Revolt\EventLoop;
 use Revolt\EventLoop\Internal\TimerCallback;
 
@@ -32,28 +31,18 @@ if ('' === $database || '' === $endpoint || '' === $control || $now < 0) {
     exit(1);
 }
 
-$clockFile = $database.'.clock';
-file_put_contents($clockFile, (string) $now);
-$workers = new SqliteWorkerContextFactory([
-    dirname(__DIR__, 2).'/Sqlite/Fixtures/worker-controlled-clock.php',
-    (string) $now,
-    $clockFile,
-]);
 $broker = (new BrokerFactory(
     $database,
     $endpoint,
-    clock: static function () use (&$now, $clockFile): int {
-        file_put_contents($clockFile, (string) $now);
-
+    clock: static function () use (&$now): int {
         return $now;
     },
-    workers: $workers,
 ))->create();
 
 $controlServer = listen('unix://'.$control);
-async(static function () use ($controlServer, $broker, &$now, $clockFile): void {
+async(static function () use ($controlServer, $broker, &$now): void {
     while (null !== ($socket = $controlServer->accept())) {
-        async(static function () use ($socket, $broker, &$now, $clockFile): void {
+        async(static function () use ($socket, $broker, &$now): void {
             $buffer = '';
             try {
                 while (null !== ($chunk = $socket->read())) {
@@ -65,7 +54,7 @@ async(static function () use ($controlServer, $broker, &$now, $clockFile): void 
                         if (!is_array($command)) {
                             throw new RuntimeException('Control command must be a JSON object.');
                         }
-                        $socket->write(json_encode(controlReply($broker, $now, $clockFile, $command), \JSON_THROW_ON_ERROR)."\n");
+                        $socket->write(json_encode(controlReply($broker, $now, $command), \JSON_THROW_ON_ERROR)."\n");
                     }
                 }
             } finally {
@@ -87,11 +76,11 @@ exit($code);
  *
  * @return array<string, mixed>
  */
-function controlReply(Broker $broker, int &$now, string $clockFile, array $command): array
+function controlReply(Broker $broker, int &$now, array $command): array
 {
     return match ($command['op'] ?? null) {
         'get_now' => ['now' => $now],
-        'set_now' => setNow($now, $clockFile, expectInt($command, 'now')),
+        'set_now' => setNow($now, expectInt($command, 'now')),
         'waiter_count' => ['count' => waiterCount($broker)],
         'deadline' => deadline($broker, expectInt($command, 'ready_at')),
         'fire' => fire(expectString($command, 'timer_id')),
@@ -103,10 +92,9 @@ function controlReply(Broker $broker, int &$now, string $clockFile, array $comma
 /**
  * @return array{now: int}
  */
-function setNow(int &$now, string $clockFile, int $value): array
+function setNow(int &$now, int $value): array
 {
     $now = $value;
-    file_put_contents($clockFile, (string) $now);
 
     return ['now' => $now];
 }

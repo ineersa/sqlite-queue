@@ -7,12 +7,14 @@ namespace Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp;
 use Ineersa\SqliteQueue\Command\BrokerCommand;
 use Ineersa\SqliteQueue\Messenger\NativeConsumeWaitSubscriber;
 use Ineersa\SqliteQueue\Messenger\TransportFactory;
-use Ineersa\SqliteQueue\Sqlite\SqliteWorkerContextFactory;
 use Ineersa\SqliteQueue\SqliteQueueBundle;
 use Symfony\Bundle\FrameworkBundle\FrameworkBundle;
 use Symfony\Bundle\FrameworkBundle\Kernel\MicroKernelTrait;
+use Symfony\Component\Clock\Clock;
+use Symfony\Component\Clock\ClockInterface;
 use Symfony\Component\DependencyInjection\Compiler\CompilerPassInterface;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
+use Symfony\Component\DependencyInjection\Reference;
 use Symfony\Component\HttpKernel\Kernel;
 
 final class NativeKernel extends Kernel
@@ -23,7 +25,6 @@ final class NativeKernel extends Kernel
         private readonly string $projectDir,
         string $environment = 'test',
         bool $debug = true,
-        private readonly string|array $workerScript = __DIR__.'/../../../../src/Sqlite/worker.php',
     ) {
         parent::__construct($environment, $debug);
     }
@@ -54,16 +55,15 @@ final class NativeKernel extends Kernel
     public function build(ContainerBuilder $container): void
     {
         parent::build($container);
-        $container->addCompilerPass(new class($this->workerScript) implements CompilerPassInterface {
-            public function __construct(private readonly string|array $workerScript)
-            {
-            }
-
+        $container->addCompilerPass(new class implements CompilerPassInterface {
             public function process(ContainerBuilder $container): void
             {
+                // Tests may replace the process clock with Clock::set(MockClock).
+                $container->register('ineersa.sqlite_queue.test_clock', ClockInterface::class)
+                    ->setFactory([Clock::class, 'get']);
                 $container->getDefinition(BrokerCommand::class)->setArgument(
-                    '$workers',
-                    new \Symfony\Component\DependencyInjection\Definition(SqliteWorkerContextFactory::class, [$this->workerScript]),
+                    '$clock',
+                    new Reference('ineersa.sqlite_queue.test_clock'),
                 );
                 // Use Symfony's durable, listable failure receiver without an application Doctrine bundle.
                 $dbal = (new \Symfony\Component\DependencyInjection\Definition(\Doctrine\DBAL\Connection::class))
@@ -75,7 +75,7 @@ final class NativeKernel extends Kernel
                 );
                 $container->setDefinition('messenger.transport.failed', new \Symfony\Component\DependencyInjection\Definition(
                     \Symfony\Component\Messenger\Bridge\Doctrine\Transport\DoctrineTransport::class,
-                    [$connection, new \Symfony\Component\DependencyInjection\Reference('messenger.transport.native_php_serializer')],
+                    [$connection, new Reference('messenger.transport.native_php_serializer')],
                 ));
                 foreach ([
                     TransportFactory::class,

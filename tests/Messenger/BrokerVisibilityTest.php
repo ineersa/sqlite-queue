@@ -50,13 +50,7 @@ final class BrokerVisibilityTest extends TestCase
         $previousClock = Clock::get();
         Clock::set($clock);
         $now = $clock->now()->getTimestamp() * 1000;
-        $clockFile = $fixture->directory().'/clock';
-        $filesystem->dumpFile($clockFile, (string) $now);
-        $kernel = new NativeKernel($project, workerScript: [
-            \dirname(__DIR__).'/Sqlite/Fixtures/worker-controlled-clock.php',
-            (string) $now,
-            $clockFile,
-        ]);
+        $kernel = new NativeKernel($project);
         $kernel->boot();
         $application = new Application($kernel);
         $application->setAutoExit(false);
@@ -94,10 +88,9 @@ final class BrokerVisibilityTest extends TestCase
                 $this->assertSame($now + $lease, $delivery->reservedUntil);
                 $handled = [];
                 $bus = new MessageBus([new HandleMessageMiddleware(new HandlersLocator([
-                    NativeProbeMessage::class => [function (NativeProbeMessage $message) use ($clock, $clockFile, $filesystem, $competitor, &$handled): void {
+                    NativeProbeMessage::class => [function (NativeProbeMessage $message) use ($clock, $competitor, &$handled): void {
                         // Simulate a handler taking longer than the original five-second lease.
                         $clock->modify('+6 seconds');
-                        $filesystem->dumpFile($clockFile, (string) ($clock->now()->getTimestamp() * 1000));
                         $this->assertNull($competitor->receive('jobs'));
                         $handled[] = $message;
                     }],

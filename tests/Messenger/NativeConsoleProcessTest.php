@@ -14,10 +14,8 @@ use Ineersa\SqliteQueue\Broker\BrokerFactory;
 use Ineersa\SqliteQueue\Broker\QueueNotifier;
 use Ineersa\SqliteQueue\Client;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeProbeMessage;
-use Ineersa\SqliteQueue\Tests\Support\ControlledWorkerClock;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
-use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\RequiresOperatingSystem;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
@@ -31,8 +29,6 @@ use function Amp\ByteStream\buffer;
 #[RequiresOperatingSystem('Linux')]
 final class NativeConsoleProcessTest extends TestCase
 {
-    use ControlledWorkerClock;
-
     private const int SAFETY_SECONDS = 15;
     // Keep reservations live until explicit settlement, independent of subprocess scheduling.
     private const int BROKER_NOW_MILLISECONDS = 1_700_000_000_000;
@@ -173,14 +169,7 @@ final class NativeConsoleProcessTest extends TestCase
         $this->assertOwnedGone();
     }
 
-    public static function activeHandlerDeaths(): iterable
-    {
-        yield 'consumer killed after effect' => [false];
-        yield 'persistence killed during handler' => [true];
-    }
-
-    #[DataProvider('activeHandlerDeaths')]
-    public function testActiveHandlerDeathPreservesEffectAndUnsettledDelivery(bool $killPersistence): void
+    public function testActiveHandlerDeathPreservesEffectAndUnsettledDelivery(): void
     {
         $this->startBroker();
         $publisher = (new \Ineersa\SqliteQueue\Messenger\TransportFactory())->createTransport(
@@ -202,24 +191,8 @@ final class NativeConsoleProcessTest extends TestCase
         } finally {
             $database->close();
         }
-        if ($killPersistence) {
-            $tree = ProcessTree::ownedBy(getmypid());
-            $this->assertCount(1, $tree['workers']);
-            $this->assertTrue(posix_kill($tree['workers'][0], \SIGKILL));
-            $this->assertNotSame(0, $this->brokerRun->await(new TimeoutCancellation(self::SAFETY_SECONDS)));
-            $this->assertFileDoesNotExist($this->endpoint());
-            foreach ([...$tree['workers'], ...$tree['launchers']] as $pid) {
-                $this->assertArrayNotHasKey($pid, ProcessTree::snapshot());
-            }
-            $consumer->getStdin()->write("release\n");
-            $this->assertNotSame(0, $consumer->join(new TimeoutCancellation(self::SAFETY_SECONDS)));
-            $diagnostics = $this->errors[$consumer->getPid()]->await(new TimeoutCancellation(self::SAFETY_SECONDS));
-            $this->assertStringContainsString('queue broker', $diagnostics);
-            $this->startBroker();
-        } else {
-            $this->assertTrue(posix_kill($consumer->getPid(), \SIGKILL));
-            $this->assertNotSame(0, $consumer->join(new TimeoutCancellation(self::SAFETY_SECONDS)));
-        }
+        $this->assertTrue(posix_kill($consumer->getPid(), \SIGKILL));
+        $this->assertNotSame(0, $consumer->join(new TimeoutCancellation(self::SAFETY_SECONDS)));
         $this->assertOwnedGone();
         $this->assertSame(1, $this->messageCount());
         $client = Client::connect($this->endpoint());
@@ -267,7 +240,6 @@ final class NativeConsoleProcessTest extends TestCase
     private function setNow(int $value): void
     {
         $this->now = $value;
-        (new Filesystem())->dumpFile($this->database().'.clock', (string) $value);
     }
 
     private function startBroker(): void
@@ -276,8 +248,7 @@ final class NativeConsoleProcessTest extends TestCase
         $broker = (new BrokerFactory(
             $database,
             $this->endpoint(),
-            clock: $this->syncedClock(fn (): int => $this->now, $database),
-            workers: $this->workerFactory($database, fn (): int => $this->now),
+            clock: fn (): int => $this->now,
         ))->create();
         $this->broker = $broker;
         $ready = new DeferredFuture();
@@ -306,8 +277,7 @@ final class NativeConsoleProcessTest extends TestCase
 
     private function trackDescendants(Process $process): void
     {
-        $tree = ProcessTree::ownedBy($process->getPid());
-        $this->ownedPids = [...$this->ownedPids, ...$tree['launchers'], ...$tree['workers']];
+        $this->ownedPids[] = $process->getPid();
     }
 
     private function assertOwnedGone(): void

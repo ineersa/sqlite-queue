@@ -473,9 +473,6 @@ final class QueueNotifierTest extends ProcessTestCase
 
                 return $queue->earliestEligibility($name, $cancellation);
             },
-            static function (Cancellation $cancellation): void {
-                $cancellation->throwIfRequested();
-            },
             fn (): int => $this->now,
             function (\Throwable $error): void {
                 $this->failures[] = $error;

@@ -4,7 +4,15 @@ Use an existing Symfony 8 application with Messenger and FrameworkBundle install
 
 ## Install the package
 
-1. Add the source repository to your application's Composer configuration. Require the branch or local version available in that repository, then run `composer install`.
+1. Add the package and driver repositories to your application's Composer configuration:
+
+	```sh
+	composer config repositories.sqlite-queue vcs https://github.com/ineersa/sqlite-queue
+	composer config repositories.amp-sqlite3 vcs https://github.com/ineersa/amp-sqlite3
+	composer require ineersa/sqlite-queue:dev-main fabpot/amphp-sqlite3:dev-development
+	```
+
+   Composer does not inherit repository declarations from dependencies. The explicit driver requirement also permits its development stability in your application. Use the appropriate package branch if you are testing an unmerged change.
 2. Check `config/bundles.php` for Flex's registration of `SqliteQueueBundle`. Without Flex, add this entry to the returned array:
 
    ```php
@@ -23,7 +31,7 @@ The example uses native PHP serialization. Accept only trusted messages with thi
 
 ## Start the broker
 
-1. Check that CLI PHP has `pdo_sqlite`, `pcntl`, and `posix` enabled.
+1. Check that CLI PHP has `sqlite3`, `pcntl`, and `posix` enabled.
 2. Create a private directory owned by the user running the broker and consumers:
 
    ```sh

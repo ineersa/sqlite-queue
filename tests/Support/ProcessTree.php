@@ -7,19 +7,10 @@ namespace Ineersa\SqliteQueue\Tests\Support;
 /**
  * Reads the local process tree from /proc.
  *
- * The driver starts one OS process per connection. These helpers find that process
- * and the short-lived shell wrapper that amphp/parallel creates for it.
+ * Identifies broker processes and their descendants, including driver-owned children.
  */
 final class ProcessTree
 {
-    /** Path fragments that identify package worker scripts in a command line. */
-    public const string WORKER_SCRIPT = 'src/Sqlite/worker.php';
-    public const string WORKER_CLOCK_SCRIPT = 'tests/Sqlite/Fixtures/worker-controlled-clock.php';
-    public const string WORKER_PROBE_SCRIPT = 'tests/Broker/Fixtures/persistence-probe.php';
-
-    /** Process title that the persistence worker sets for itself. */
-    public const string WORKER_TITLE = 'amp-process';
-
     public static function available(): bool
     {
         return is_dir('/proc/self');
@@ -76,76 +67,5 @@ final class ProcessTree
         }
 
         return false;
-    }
-
-    /**
-     * PIDs of the shell wrappers that amphp/parallel starts for a connection.
-     *
-     * @param array<int, array{ppid: ?int, cmd: string}> $snapshot
-     *
-     * @return list<int>
-     */
-    public static function workerLaunchers(array $snapshot): array
-    {
-        $pids = [];
-
-        foreach ($snapshot as $pid => $process) {
-            if (self::isWorkerCommand($process['cmd'])) {
-                $pids[] = $pid;
-            }
-        }
-
-        return $pids;
-    }
-
-    /**
-     * PIDs of the persistence worker processes owned by $ancestor.
-     *
-     * @param array<int, array{ppid: ?int, cmd: string}> $snapshot
-     *
-     * @return list<int>
-     */
-    public static function persistenceWorkers(int $ancestor, array $snapshot): array
-    {
-        $pids = [];
-
-        foreach ($snapshot as $pid => $process) {
-            if (self::WORKER_TITLE !== $process['cmd']) {
-                continue;
-            }
-            if (self::isDescendantOf($pid, $ancestor, $snapshot)) {
-                $pids[] = $pid;
-            }
-        }
-
-        return $pids;
-    }
-
-    /**
-     * Every launcher and persistence worker process owned by $ancestor.
-     *
-     * @return array{launchers: list<int>, workers: list<int>}
-     */
-    public static function ownedBy(int $ancestor): array
-    {
-        $snapshot = self::snapshot();
-
-        $launchers = array_values(array_filter(
-            self::workerLaunchers($snapshot),
-            static fn (int $pid): bool => self::isDescendantOf($pid, $ancestor, $snapshot),
-        ));
-
-        return [
-            'launchers' => $launchers,
-            'workers' => self::persistenceWorkers($ancestor, $snapshot),
-        ];
-    }
-
-    private static function isWorkerCommand(string $command): bool
-    {
-        return str_contains($command, self::WORKER_SCRIPT)
-            || str_contains($command, self::WORKER_CLOCK_SCRIPT)
-            || str_contains($command, self::WORKER_PROBE_SCRIPT)
-            || str_contains($command, 'persistence-env-probe.php');
     }
 }

@@ -5,11 +5,10 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Broker;
 
 use Amp\Cancellation;
-use Amp\CompositeCancellation;
-use Amp\TimeoutCancellation;
 use Ineersa\SqliteQueue\Queue;
+use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
-use Ineersa\SqliteQueue\Sqlite\SqliteWorkerContextFactory;
+use Revolt\EventLoop;
 use Symfony\Component\Filesystem\Exception\IOException;
 use Symfony\Component\Filesystem\Filesystem;
 
@@ -19,24 +18,16 @@ use function Amp\Socket\listen;
  * Acquires every resource a Broker needs, then hands over a fully initialized service.
  *
  * Steps release in reverse order when a later step fails, so a partial startup never
- * keeps lifetime locks, a socket, or a SQLite worker. Failed steps are best-effort:
+ * keeps lifetime locks, a socket, or open storage. Failed steps are best-effort:
  * the original failure is what the caller receives.
  */
 final class BrokerFactory
 {
-    /** Total budget for worker spawn, initialization, and readiness, in seconds. */
-    private const float STARTUP_BUDGET_SECONDS = 15.0;
-    /** Budget for observing the SQLite worker while a failed startup releases resources, in seconds. */
-    private const float RELEASE_BUDGET_SECONDS = 5.0;
-
-    private readonly SqliteWorkerContextFactory $workers;
-
     /**
-     * @param SqliteSynchronousMode       $synchronous       NORMAL is the product default; FULL enables stronger commit durability
-     * @param int                         $visibilityTimeout redelivery delay in milliseconds; defaults to Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS
-     * @param (\Closure(): int)|null      $clock             parent wall-clock milliseconds for notifier timers; never a worker clock
-     * @param ?Cancellation               $cancellation      cooperative cancellation for the blocking startup only; serving cancellation stays on Broker::run()
-     * @param ?SqliteWorkerContextFactory $workers           production uses the package default; tests may inject a controlled-clock bootstrap
+     * @param SqliteSynchronousMode  $synchronous       NORMAL is the product default; FULL enables stronger commit durability
+     * @param int                    $visibilityTimeout redelivery delay in milliseconds; defaults to Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS
+     * @param (\Closure(): int)|null $clock             shared wall-clock milliseconds for queue policy and notifier timers
+     * @param ?Cancellation          $cancellation      cooperative cancellation for the blocking startup only; serving cancellation stays on Broker::run()
      */
     public function __construct(
         private readonly string $database,
@@ -45,12 +36,10 @@ final class BrokerFactory
         private readonly ?\Closure $clock = null,
         private readonly ?Cancellation $cancellation = null,
         private readonly SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal,
-        ?SqliteWorkerContextFactory $workers = null,
     ) {
         if ($visibilityTimeout <= 0) {
             throw new \InvalidArgumentException('Visibility timeout must be positive milliseconds.');
         }
-        $this->workers = $workers ?? new SqliteWorkerContextFactory();
     }
 
     public function create(): Broker
@@ -61,13 +50,14 @@ final class BrokerFactory
         if (!\function_exists('posix_geteuid')) {
             throw new \RuntimeException('The broker requires the posix extension to validate file ownership.');
         }
-        if (!\extension_loaded('pdo_sqlite')) {
-            throw new \RuntimeException('The broker requires the pdo_sqlite extension.');
+        if (!\extension_loaded('sqlite3')) {
+            throw new \RuntimeException('The broker requires the sqlite3 extension.');
         }
         /** @var list<callable(): void> */
         $release = [];
         $filesystem = new Filesystem();
         try {
+            $this->assertNotCancelled();
             $locks = new BrokerLifetimeLocks($this->database, $this->endpoint);
             $release[] = $locks->close(...);
             $this->prepareDatabaseFile($locks->database, $filesystem);
@@ -76,21 +66,13 @@ final class BrokerFactory
                 throw new \RuntimeException('Endpoint already exists; it will not be removed without verified ownership.');
             }
 
-            $startup = new TimeoutCancellation(self::STARTUP_BUDGET_SECONDS);
-            $budget = null === $this->cancellation
-                ? $startup
-                : new CompositeCancellation($this->cancellation, $startup);
-            $worker = $this->workers->create(
-                $locks->database,
-                $this->visibilityTimeout,
-                $this->synchronous,
-                $budget,
-            );
-            $release[] = static function () use ($worker): void {
-                $worker->close(new TimeoutCancellation(self::RELEASE_BUDGET_SECONDS));
-            };
-
+            $this->assertNotCancelled();
+            $storage = SqliteQueueStorage::open($locks->database, $this->synchronous, $this->cancellation);
+            $release[] = $storage->close(...);
             $clock = $this->clock ?? static fn (): int => (int) floor(microtime(true) * 1000);
+            $queue = new Queue($storage, $this->visibilityTimeout, $clock);
+
+            $this->assertNotCancelled();
             $mask = umask(0077);
             try {
                 $server = listen('unix://'.$locks->endpoint);
@@ -110,13 +92,12 @@ final class BrokerFactory
                 throw new \RuntimeException('Cannot make socket private.', 0, $error);
             }
 
-            return new Broker($server, $worker, $locks, $socketIdentity, $clock);
+            // One safe checkpoint before readiness so queued signal callbacks can be observed.
+            $this->yieldToEventLoop();
+            $this->assertNotCancelled();
+
+            return new Broker($server, $queue, $storage, $locks, $socketIdentity, $clock);
         } catch (\Throwable $error) {
-            try {
-                $this->workers->forceStopAll();
-            } catch (\Throwable) {
-                // Best-effort: the original failure is what the caller receives.
-            }
             foreach (array_reverse($release) as $step) {
                 try {
                     $step();
@@ -124,6 +105,24 @@ final class BrokerFactory
                 }
             }
             throw $error;
+        }
+    }
+
+    private function assertNotCancelled(): void
+    {
+        $this->cancellation?->throwIfRequested();
+    }
+
+    private function yieldToEventLoop(): void
+    {
+        $suspension = EventLoop::getSuspension();
+        $callback = EventLoop::defer(static function () use ($suspension): void {
+            $suspension->resume();
+        });
+        try {
+            $suspension->suspend();
+        } finally {
+            EventLoop::cancel($callback);
         }
     }
 

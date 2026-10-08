@@ -2,6 +2,8 @@
 
 The native benchmark measures configured Symfony buses and stock `messenger:consume`. The [method](benchmark-method.md) defines its workload, completion boundaries, and coverage limits. Observations from the earlier synthetic runner are not interchangeable repetitions of this experiment.
 
+This page records historical builds. The current broker uses the asynchronous driver directly, without a package-owned worker. The figures below are not measurements of that implementation.
+
 ## Matched polling baseline for the PDO worker rewrite
 
 Primary Doctrine comparisons for the operation-level PDO worker use `--sleep=0.05`, matching Hatfield's 50 ms idle poll. Historical captures below used `--sleep=0.001`. Keep those results as aggressive-polling history. Do not compare old 1 ms idle CPU against new 50 ms idle CPU and attribute the difference to PDO. New PDO-worker throughput numbers belong in a later capture under the same 50 ms setting; this document does not invent them.
