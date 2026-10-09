@@ -468,6 +468,8 @@ final class ClientTest extends TestCase
         $this->assertSame(['receipt'], Operation::Acknowledge->allowedFields());
         $this->assertSame(['receipt'], Operation::Reject->allowedFields());
         $this->assertSame(['queue', 'wait_ms'], Operation::Wait->allowedFields());
+        $this->assertSame(['queues', 'wait_ms'], Operation::WaitAny->allowedFields());
+        $this->assertSame(16, Limits::MAX_WAIT_QUEUES);
     }
 
     public function testWaitBooleanReplyAndLocalBoundsPreserveSequence(): void
@@ -503,6 +505,53 @@ final class ClientTest extends TestCase
         }
         $this->assertSame(7, $client->send('jobs', 'after local wait validation'));
         $this->assertSame([1, 2], $seen);
+    }
+
+    public function testWaitAnyBooleanReplyAndLocalBoundsPreserveSequence(): void
+    {
+        $seen = [];
+        $endpoint = $this->serve(static function (Socket $socket) use (&$seen): void {
+            Frame::read($socket, new TimeoutCancellation(3));
+            $socket->write(self::helloReply());
+            while (null !== ($request = Frame::read($socket, new TimeoutCancellation(3)))) {
+                $seen[] = $request->control;
+                $op = $request->control['op'] ?? null;
+                if ('wait_any' === $op) {
+                    $socket->write((new Frame(['v' => Frame::VERSION, 'id' => $request->control['id'], 'ok' => true, 'result' => true]))->encode());
+                    continue;
+                }
+                if ('send' === $op) {
+                    $socket->write((new Frame(['v' => Frame::VERSION, 'id' => $request->control['id'], 'ok' => true, 'result' => 9]))->encode());
+                }
+            }
+        });
+        $client = Client::connect($endpoint);
+        $this->clients[] = $client;
+        $this->assertTrue($client->waitAny(['jobs', 'other'], 0));
+        $this->assertSame(['jobs', 'other'], $seen[0]['queues'] ?? null);
+        foreach ([
+            [[], 'WAIT_ANY requires at least one queue.'],
+            [['jobs', 'jobs'], 'WAIT_ANY queue names must be unique.'],
+            [array_fill(0, Limits::MAX_WAIT_QUEUES + 1, 'jobs'), \sprintf('WAIT_ANY accepts at most %d queues.', Limits::MAX_WAIT_QUEUES)],
+            [['bad name'], 'Queue names must contain 1 to 255 ASCII letters, digits, dots, underscores, or hyphens and start with a letter or digit.'],
+            [[1], 'WAIT_ANY queue names must be strings.'],
+        ] as [$queues, $message]) {
+            try {
+                $client->waitAny($queues, 0);
+                $this->fail('Invalid WAIT_ANY input must fail locally.');
+            } catch (\InvalidArgumentException $error) {
+                $this->assertSame($message, $error->getMessage());
+            }
+        }
+        try {
+            $client->waitAny(['jobs'], -1);
+            $this->fail('Negative WAIT_ANY timeout must fail locally.');
+        } catch (\InvalidArgumentException) {
+        }
+        $this->assertSame(9, $client->send('jobs', 'after local wait_any validation'));
+        $this->assertCount(2, $seen);
+        $this->assertSame(1, $seen[0]['id'] ?? null);
+        $this->assertSame(2, $seen[1]['id'] ?? null);
     }
 
     public function testWaitNonBooleanResultInvalidatesTheClient(): void

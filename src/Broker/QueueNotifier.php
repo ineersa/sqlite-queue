@@ -8,6 +8,7 @@ use Amp\Cancellation;
 use Amp\CancelledException;
 use Amp\DeferredFuture;
 use Ineersa\SqliteQueue\Exception\ClientContextClosedException;
+use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use Revolt\EventLoop;
 
@@ -17,6 +18,10 @@ use Revolt\EventLoop;
  * A true result is only a hint to receive, never a claim. Waiters are registered before the
  * readiness recheck so a committed send between empty receive and WAIT cannot be lost. Derived
  * timer state exists only for watched queues and is rebuilt lazily from storage.
+ *
+ * WAIT_ANY reuses the same per-queue watches and timers. One waiter occupies every selected queue
+ * until settlement, then detaches from all of them. Claims and selection priority stay outside this
+ * coordinator.
  *
  * Positive wait bounds use an event-loop delay only. The controlled wall clock schedules delayed
  * readiness, but it must not expire a positive WAIT early when it jumps forward, and a backward
@@ -72,47 +77,52 @@ final class QueueNotifier
 
         $key = self::watchKey($queue);
         $deferred = new DeferredFuture();
-        $future = $deferred->getFuture();
         $waiter = new QueueNotifierWaiter($deferred, $timeoutMilliseconds);
-        $this->waiters[$key][] = $waiter;
-        try {
-            $waiter->cancellationId = $cancellation->subscribe(
-                function (CancelledException $error) use ($key, $waiter): void {
-                    $this->failWaiter($key, $waiter, $error);
-                },
-            );
-            if ($waiter->settled) {
-                return $future->await();
-            }
-            if ($timeoutMilliseconds > 0) {
-                // Bound the wait by event-loop duration, not by comparing the controlled wall clock.
-                // A forward clock jump must not expire a still-running wait early.
-                $waiter->timeoutId = EventLoop::delay($timeoutMilliseconds / 1000, function () use ($key, $waiter): void {
-                    try {
-                        if ($waiter->settled || $this->closed) {
-                            return;
-                        }
-                        $waiter->timeoutId = null;
-                        $this->completeWaiter($key, $waiter, false);
-                    } catch (\Throwable $error) {
-                        $this->failQueue($key, $error);
-                    }
-                });
-            }
-
-            $this->watches[$key] ??= new QueueNotifierWatch($queue);
-            // Register first, then recheck on a queued callback. notify() may dirty the watch
-            // before that callback runs, forcing another pass.
-            $this->scheduleRefresh($key);
-
-            return $future->await();
-        } finally {
-            if (null !== $waiter->cancellationId) {
-                $cancellation->unsubscribe($waiter->cancellationId);
-                $waiter->cancellationId = null;
-            }
-            $this->detachWaiter($key, $waiter);
+        $waiter->keys = [$key];
+        if (0 === $timeoutMilliseconds) {
+            $waiter->pendingProbeKeys = [$key];
         }
+        $this->waiters[$key][] = $waiter;
+
+        return $this->awaitWaiter($waiter, [$queue], $cancellation);
+    }
+
+    /**
+     * Wait until any selected queue may have eligible work, or until the shared bound expires.
+     *
+     * Every selected queue is registered before any readiness recheck can suspend. The boolean is
+     * only a hint to receive on the caller's chosen queues. Cancellation fails the wait with
+     * {@see CancelledException}.
+     *
+     * @param list<QueueName> $queues
+     */
+    public function waitAny(array $queues, int $timeoutMilliseconds, Cancellation $cancellation): bool
+    {
+        if ($timeoutMilliseconds < 0) {
+            throw new \InvalidArgumentException('Wait timeout must be nonnegative milliseconds.');
+        }
+        $selected = $this->validatedQueues($queues);
+        if ($this->closed) {
+            throw new ClientContextClosedException('Broker wait service is closed.');
+        }
+        $cancellation->throwIfRequested();
+
+        $deferred = new DeferredFuture();
+        $waiter = new QueueNotifierWaiter($deferred, $timeoutMilliseconds);
+        $keys = [];
+        foreach ($selected as $queue) {
+            $keys[] = self::watchKey($queue);
+        }
+        $waiter->keys = $keys;
+        if (0 === $timeoutMilliseconds) {
+            $waiter->pendingProbeKeys = $keys;
+        }
+        // Occupy every selected queue before any refresh callback can suspend.
+        foreach ($keys as $key) {
+            $this->waiters[$key][] = $waiter;
+        }
+
+        return $this->awaitWaiter($waiter, $selected, $cancellation);
     }
 
     /** Called only after a committed mutation that may change readiness for the named queue. */
@@ -138,13 +148,99 @@ final class QueueNotifier
         foreach (array_keys($this->watches) as $key) {
             $this->clearDeadline($key);
         }
-        foreach ($this->waiters as $key => $waiters) {
+        $outstanding = [];
+        foreach ($this->waiters as $waiters) {
             foreach ($waiters as $waiter) {
-                $this->failWaiter($key, $waiter, new CancelledException());
+                $outstanding[spl_object_id($waiter)] = $waiter;
             }
+        }
+        foreach ($outstanding as $waiter) {
+            $this->failWaiter($waiter, new CancelledException());
         }
         $this->waiters = [];
         $this->watches = [];
+    }
+
+    /**
+     * @param list<QueueName> $queues
+     */
+    private function awaitWaiter(QueueNotifierWaiter $waiter, array $queues, Cancellation $cancellation): bool
+    {
+        $future = $waiter->deferred->getFuture();
+        try {
+            $waiter->cancellationId = $cancellation->subscribe(
+                function (CancelledException $error) use ($waiter): void {
+                    $this->failWaiter($waiter, $error);
+                },
+            );
+            if ($waiter->settled) {
+                return $future->await();
+            }
+            if ($waiter->durationMilliseconds > 0) {
+                // Bound the wait by event-loop duration, not by comparing the controlled wall clock.
+                // A forward clock jump must not expire a still-running wait early.
+                $waiter->timeoutId = EventLoop::delay($waiter->durationMilliseconds / 1000, function () use ($waiter): void {
+                    try {
+                        if ($waiter->settled || $this->closed) {
+                            return;
+                        }
+                        $waiter->timeoutId = null;
+                        $this->completeWaiter($waiter, false);
+                    } catch (\Throwable $error) {
+                        foreach ($waiter->keys as $key) {
+                            $this->failQueue($key, $error);
+
+                            return;
+                        }
+                    }
+                });
+            }
+
+            foreach ($queues as $queue) {
+                $key = self::watchKey($queue);
+                $this->watches[$key] ??= new QueueNotifierWatch($queue);
+                // Register first, then recheck on a queued callback. notify() may dirty the watch
+                // before that callback runs, forcing another pass.
+                $this->scheduleRefresh($key);
+            }
+
+            return $future->await();
+        } finally {
+            if (null !== $waiter->cancellationId) {
+                $cancellation->unsubscribe($waiter->cancellationId);
+                $waiter->cancellationId = null;
+            }
+            $this->detachWaiter($waiter);
+        }
+    }
+
+    /**
+     * @param list<QueueName> $queues
+     *
+     * @return list<QueueName>
+     */
+    private function validatedQueues(array $queues): array
+    {
+        if ([] === $queues) {
+            throw new \InvalidArgumentException('WAIT_ANY requires at least one queue.');
+        }
+        if (\count($queues) > Limits::MAX_WAIT_QUEUES) {
+            throw new \InvalidArgumentException(\sprintf('WAIT_ANY accepts at most %d queues.', Limits::MAX_WAIT_QUEUES));
+        }
+        $selected = [];
+        $seen = [];
+        foreach ($queues as $queue) {
+            if (!$queue instanceof QueueName) {
+                throw new \InvalidArgumentException('WAIT_ANY queues must be QueueName instances.');
+            }
+            if (isset($seen[$queue->value])) {
+                throw new \InvalidArgumentException('WAIT_ANY queue names must be unique.');
+            }
+            $seen[$queue->value] = true;
+            $selected[] = $queue;
+        }
+
+        return $selected;
     }
 
     /** Stable string map key that keeps numeric queue names from becoming integer array keys. */
@@ -160,6 +256,16 @@ final class QueueNotifier
             return;
         }
         $watch->dirty = true;
+        foreach ($this->waiters[$key] ?? [] as $waiter) {
+            if (0 !== $waiter->durationMilliseconds || $waiter->settled) {
+                continue;
+            }
+            if (!\in_array($key, $waiter->pendingProbeKeys, true)) {
+                // A later notify must keep a zero-duration WAIT_ANY open until every selected
+                // queue has a fresh not-ready sample for this generation.
+                $waiter->pendingProbeKeys[] = $key;
+            }
+        }
         if ($watch->querying) {
             return;
         }
@@ -220,17 +326,23 @@ final class QueueNotifier
         if (null !== $readyAt && $readyAt <= $now) {
             $this->clearDeadline($key);
             foreach ($this->waiters[$key] ?? [] as $waiter) {
-                $this->completeWaiter($key, $waiter, true);
+                $this->completeWaiter($waiter, true);
             }
             $this->forgetIdle($key);
 
             return;
         }
         // Positive waits expire only through their event-loop timers. Zero-duration probes settle
-        // here once the first successful readiness sample for this generation is known.
+        // false only after every selected queue has reported not-ready for this generation.
         foreach ($this->waiters[$key] ?? [] as $waiter) {
             if (0 === $waiter->durationMilliseconds) {
-                $this->completeWaiter($key, $waiter, false);
+                $waiter->pendingProbeKeys = array_values(array_filter(
+                    $waiter->pendingProbeKeys,
+                    static fn (string $candidate): bool => $candidate !== $key,
+                ));
+                if ([] === $waiter->pendingProbeKeys) {
+                    $this->completeWaiter($waiter, false);
+                }
             }
         }
         if ([] === ($this->waiters[$key] ?? [])) {
@@ -271,7 +383,7 @@ final class QueueNotifier
         });
     }
 
-    private function completeWaiter(string $key, QueueNotifierWaiter $waiter, bool $ready): void
+    private function completeWaiter(QueueNotifierWaiter $waiter, bool $ready): void
     {
         if ($waiter->settled) {
             return;
@@ -279,10 +391,10 @@ final class QueueNotifier
         $waiter->settled = true;
         $this->cancelTimeout($waiter);
         $waiter->deferred->complete($ready);
-        $this->detachWaiter($key, $waiter);
+        $this->detachWaiter($waiter);
     }
 
-    private function failWaiter(string $key, QueueNotifierWaiter $waiter, \Throwable $error): void
+    private function failWaiter(QueueNotifierWaiter $waiter, \Throwable $error): void
     {
         if ($waiter->settled) {
             return;
@@ -292,26 +404,25 @@ final class QueueNotifier
         $future = $waiter->deferred->getFuture();
         $future->ignore();
         $waiter->deferred->error($error);
-        $this->detachWaiter($key, $waiter);
+        $this->detachWaiter($waiter);
     }
 
-    private function detachWaiter(string $key, QueueNotifierWaiter $waiter): void
+    private function detachWaiter(QueueNotifierWaiter $waiter): void
     {
-        if (!isset($this->waiters[$key])) {
-            return;
-        }
         $this->cancelTimeout($waiter);
-        $this->waiters[$key] = array_values(array_filter(
-            $this->waiters[$key],
-            static fn (QueueNotifierWaiter $candidate): bool => $candidate !== $waiter,
-        ));
-        if ([] === $this->waiters[$key]) {
-            unset($this->waiters[$key]);
-            if (!$this->closed) {
-                // Cancel the deadline immediately, even while a readiness query is still running.
-                // Dropping this identity prevents stale results from mutating a replacement watch.
-                $watch = $this->watches[$key] ?? null;
-                if (null !== $watch) {
+        foreach ($waiter->keys as $key) {
+            if (!isset($this->waiters[$key])) {
+                continue;
+            }
+            $this->waiters[$key] = array_values(array_filter(
+                $this->waiters[$key],
+                static fn (QueueNotifierWaiter $candidate): bool => $candidate !== $waiter,
+            ));
+            if ([] === $this->waiters[$key]) {
+                unset($this->waiters[$key]);
+                if (!$this->closed) {
+                    // Cancel the deadline immediately, even while a readiness query is still running.
+                    // Dropping this identity prevents stale results from mutating a replacement watch.
                     $this->clearDeadline($key);
                     unset($this->watches[$key]);
                 }
@@ -366,7 +477,7 @@ final class QueueNotifier
             unset($this->watches[$key]);
         }
         foreach ($this->waiters[$key] ?? [] as $waiter) {
-            $this->failWaiter($key, $waiter, $error);
+            $this->failWaiter($waiter, $error);
         }
         ($this->onFailure)($error);
     }

@@ -423,6 +423,25 @@ final class BrokerTest extends TestCase
         });
     }
 
+    public function testIdleWaitAnyWakesOnEitherSelectedQueue(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker(clock: fn (): int => $this->now);
+            $waiter = $this->connectClient();
+            $publisher = $this->connectClient();
+            $waiting = async(static fn (): bool => $waiter->waitAny(['jobs', 'other'], 5_000));
+            $this->awaitNotifierWaiters(2);
+            $publisher->send('other', 'wake other');
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $this->assertNull($waiter->receive('jobs'));
+            $delivery = $waiter->receive('other');
+            $this->assertNotNull($delivery);
+            $this->assertSame('wake other', $delivery->body);
+            $waiter->acknowledge($delivery->receipt);
+            $this->awaitNotifierWaiters(0);
+        });
+    }
+
     public function testEmptyReceiveThenWaitCannotMissALaterCommittedSend(): void
     {
         $this->runAsync(function (): void {
@@ -650,6 +669,10 @@ final class BrokerTest extends TestCase
         yield 'oversized wait' => ['oversized wait', 'invalid_request'];
         yield 'string wait' => ['string wait', 'invalid_request'];
         yield 'missing wait_ms' => ['missing wait_ms', 'invalid_request'];
+        yield 'wait_any empty queues' => ['wait_any empty queues', 'invalid_request'];
+        yield 'wait_any duplicate queues' => ['wait_any duplicate queues', 'invalid_request'];
+        yield 'wait_any oversized list' => ['wait_any oversized list', 'invalid_request'];
+        yield 'wait_any missing queues' => ['wait_any missing queues', 'invalid_request'];
         yield 'extra field on send' => ['extra field on send', 'invalid_request'];
         yield 'receive with body' => ['receive with body', 'invalid_request'];
         yield 'acknowledge with headers' => ['acknowledge with headers', 'invalid_request'];
@@ -687,6 +710,10 @@ final class BrokerTest extends TestCase
                 'oversized wait' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'wait', 'queue' => 'jobs', 'wait_ms' => Limits::MAX_WAIT_MILLISECONDS + 1]))->encode(),
                 'string wait' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'wait', 'queue' => 'jobs', 'wait_ms' => '5']))->encode(),
                 'missing wait_ms' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'wait', 'queue' => 'jobs']))->encode(),
+                'wait_any empty queues' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'wait_any', 'queues' => [], 'wait_ms' => 0]))->encode(),
+                'wait_any duplicate queues' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'wait_any', 'queues' => ['jobs', 'jobs'], 'wait_ms' => 0]))->encode(),
+                'wait_any oversized list' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'wait_any', 'queues' => array_map(static fn (int $i): string => 'q'.$i, range(1, Limits::MAX_WAIT_QUEUES + 1)), 'wait_ms' => 0]))->encode(),
+                'wait_any missing queues' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'wait_any', 'wait_ms' => 0]))->encode(),
                 'extra field on send' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'send', 'queue' => 'jobs', 'delay' => 0, 'receipt' => 'x']))->encode(),
                 'receive with body' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'receive', 'queue' => 'jobs'], 'body'))->encode(),
                 'acknowledge with headers' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'acknowledge', 'receipt' => 'r'], '', 'h'))->encode(),

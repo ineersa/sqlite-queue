@@ -21,6 +21,16 @@ final class QueueNotifierWaiter
     public ?string $cancellationId = null;
     public ?string $timeoutId = null;
 
+    /** @var list<string> Watch keys this waiter occupies until settlement. */
+    public array $keys = [];
+
+    /**
+     * Zero-duration probes settle false only after every selected queue has reported not-ready.
+     *
+     * @var list<string>
+     */
+    public array $pendingProbeKeys = [];
+
     /**
      * @param DeferredFuture<bool> $deferred
      */

@@ -12,6 +12,7 @@ enum Operation: string
     case Acknowledge = 'acknowledge';
     case Reject = 'reject';
     case Wait = 'wait';
+    case WaitAny = 'wait_any';
 
     /**
      * Operation-specific request fields beyond the common framing keys.
@@ -26,6 +27,7 @@ enum Operation: string
             self::Receive => [ControlField::Queue->value],
             self::Acknowledge, self::Reject => [ControlField::Receipt->value],
             self::Wait => [ControlField::Queue->value, ControlField::WaitMilliseconds->value],
+            self::WaitAny => [ControlField::Queues->value, ControlField::WaitMilliseconds->value],
         };
     }
 }

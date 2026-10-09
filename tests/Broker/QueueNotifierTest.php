@@ -12,6 +12,7 @@ use Amp\TimeoutCancellation;
 use Ineersa\SqliteQueue\Broker\QueueNotifier;
 use Ineersa\SqliteQueue\Broker\QueueNotifierWaiter;
 use Ineersa\SqliteQueue\Broker\QueueNotifierWatch;
+use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTestCase;
@@ -80,6 +81,60 @@ final class QueueNotifierTest extends ProcessTestCase
             $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
             $this->assertSame([], $this->failures);
         });
+    }
+
+    public function testWaitAnyWakesForEitherSelectedQueueAndDetachesFromAll(): void
+    {
+        $this->runAsync(function (): void {
+            $queue = $this->open();
+            $notifier = $this->notifier($queue);
+            $jobs = new QueueName('jobs');
+            $other = new QueueName('other');
+            $waiting = async(static fn (): bool => $notifier->waitAny([$jobs, $other], 5_000, new TimeoutCancellation(5)));
+            $this->awaitEmptyWatch($notifier, $jobs->value);
+            $this->awaitEmptyWatch($notifier, $other->value);
+            $this->assertSame(['jobs', 'other'], $this->waiterNames($notifier));
+            $queue->send($other, 'wake other');
+            $notifier->notify($other);
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $this->assertSame([], $this->waiterNames($notifier));
+            $this->assertNull($this->watch($notifier, $jobs->value));
+            $this->assertNull($this->watch($notifier, $other->value));
+            $this->assertSame([], $this->failures);
+        });
+    }
+
+    public function testZeroDurationWaitAnyRequiresEveryQueueNotReady(): void
+    {
+        $this->runAsync(function (): void {
+            $queue = $this->open();
+            $notifier = $this->notifier($queue);
+            $jobs = new QueueName('jobs');
+            $other = new QueueName('other');
+            $this->assertFalse($notifier->waitAny([$jobs, $other], 0, new TimeoutCancellation(5)));
+            $queue->send($other, 'ready');
+            $this->assertTrue($notifier->waitAny([$jobs, $other], 0, new TimeoutCancellation(5)));
+            $this->assertSame([], $this->waiterNames($notifier));
+            $this->assertSame([], $this->failures);
+        });
+    }
+
+    public function testWaitAnyRejectsInvalidQueueListsLocally(): void
+    {
+        $notifier = $this->notifier($this->open());
+        foreach ([
+            [[], 'WAIT_ANY requires at least one queue.'],
+            [[new QueueName('jobs'), new QueueName('jobs')], 'WAIT_ANY queue names must be unique.'],
+            [array_fill(0, Limits::MAX_WAIT_QUEUES + 1, new QueueName('jobs')), \sprintf('WAIT_ANY accepts at most %d queues.', Limits::MAX_WAIT_QUEUES)],
+        ] as [$queues, $message]) {
+            try {
+                $notifier->waitAny($queues, 0, new \Amp\NullCancellation());
+                $this->fail('Invalid WAIT_ANY list must fail locally.');
+            } catch (\InvalidArgumentException $error) {
+                $this->assertSame($message, $error->getMessage());
+            }
+        }
+        $this->assertSame([], $this->waiterNames($notifier));
     }
 
     public function testRegistrationBeforeRecheckCannotMissCommittedSend(): void
