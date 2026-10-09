@@ -63,6 +63,7 @@ final readonly class RunOptionsDTO
         $settings = ['workload' => $this->scenario->value, 'mode' => $this->smoke ? 'smoke' : 'measured', 'smoke' => $this->smoke, 'duration_seconds' => $this->durationSeconds, 'synchronous_desired' => $this->synchronous->value, 'doctrine_polling_milliseconds' => $this->doctrinePollingMilliseconds, 'clock_basis' => 'same-host hrtime nanoseconds; elapsed spans, not wall time'];
 
         return $settings + match ($this->scenario) {
+            Scenario::MultiQueue => ['queues' => ['async', 'results'], 'consumers' => 1, 'pickup_modes' => [Backend::Broker->value => 'notification-wait-any', Backend::Doctrine->value => 'polling'], 'method_change' => 'two selected queues on one stock worker; not comparable to earlier single-queue polling captures'],
             Scenario::Application => ['rate' => self::APPLICATION_RATE, 'handler_milliseconds' => self::HANDLER_MILLISECONDS, 'capacity' => self::APPLICATION_CAPACITY],
             Scenario::Concurrent => ['publishers' => ConcurrentCohort::PUBLISHERS, 'consumers' => ConcurrentCohort::CONSUMERS, 'measured_messages' => ConcurrentCohort::PUBLISHERS * ($this->smoke ? ConcurrentCohort::SMOKE_PER_PUBLISHER : ConcurrentCohort::MESSAGES_PER_PUBLISHER), 'duration_scope' => 'finite cohort through final required ACK, not sustained capacity'],
             Scenario::Retention => ['cycles' => $this->effectiveCycles(), 'cycle_messages' => $this->effectiveCycleMessages(), 'retention_evidence' => $this->smoke ? 'smoke control-path check only' : 'matched drained-state screen, not leak-free proof'],
@@ -115,7 +116,7 @@ final readonly class RunOptionsDTO
     /** Null means roundtrip runs until its measured window ends. */
     public function finiteCohortMessages(): ?int
     {
-        if (Scenario::Idle === $this->scenario) {
+        if ($this->scenario->isPickup()) {
             return Runner::WAKEUP_MESSAGES;
         }
 

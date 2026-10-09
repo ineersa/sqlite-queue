@@ -91,10 +91,9 @@ final class NativeConsumeWaitSubscriberTest extends TestCase
     {
         $factory = new TransportFactory();
         $serializer = new PhpSerializer();
-        $maxQueues = (new \ReflectionClassConstant(NativeConsumeWaitSubscriber::class, 'MAX_WAIT_QUEUES'))->getValue();
         $locator = [];
         $names = [];
-        for ($i = 0; $i <= $maxQueues; ++$i) {
+        for ($i = 0; $i <= Limits::MAX_WAIT_QUEUES; ++$i) {
             $name = 'q'.$i;
             $names[] = $name;
             $locator[$name] = static function () use ($factory, $serializer, $i): Transport {

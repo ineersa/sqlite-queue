@@ -51,9 +51,6 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
 {
     private const int DEFAULT_WAIT_BUDGET_MILLISECONDS = 1_000;
 
-    /** Matches Limits::MAX_WAIT_QUEUES from the multi-queue protocol slice. */
-    private const int MAX_WAIT_QUEUES = 16;
-
     /** @var \WeakMap<Command, ConsumeWaitPendingDTO> */
     private \WeakMap $pendingByCommand;
 
@@ -313,7 +310,7 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
                 $queues[] = $queue;
             }
         }
-        if (\count($queues) > self::MAX_WAIT_QUEUES) {
+        if (\count($queues) > Limits::MAX_WAIT_QUEUES) {
             return $this->fallbackWait();
         }
 

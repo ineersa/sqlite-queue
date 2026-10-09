@@ -350,9 +350,6 @@ final class NativeIntegrationTest extends TestCase
     public function testSameBrokerReceiversShareOneNotificationWaitOnDistinctQueueNames(): void
     {
         $this->runAsync(function (): void {
-            if (!method_exists(Client::class, 'waitAny')) {
-                $this->markTestSkipped('Client::waitAny belongs to the protocol slice.');
-            }
             $this->startBroker();
             $idleTimeout = null;
             $this->eventDispatcher()->addListener(WorkerStartedEvent::class, static function (WorkerStartedEvent $event) use (&$idleTimeout): void {
@@ -804,12 +801,14 @@ final class NativeIntegrationTest extends TestCase
         }
         $notifier = (new \ReflectionProperty(Broker::class, 'notifier'))->getValue($this->broker);
         $waiters = (new \ReflectionProperty(QueueNotifier::class, 'waiters'))->getValue($notifier);
-        $total = 0;
+        $unique = [];
         foreach ($waiters as $list) {
-            $total += \count($list);
+            foreach ($list as $waiter) {
+                $unique[spl_object_id($waiter)] = $waiter;
+            }
         }
 
-        return $total;
+        return \count($unique);
     }
 
     private function activeWaitDurationMilliseconds(): int

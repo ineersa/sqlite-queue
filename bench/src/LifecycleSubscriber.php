@@ -15,7 +15,8 @@ final class LifecycleSubscriber implements EventSubscriberInterface
     // A requested idle barrier may arrive on a non-idle WorkerRunningEvent.
     private ?string $idleRequest = null;
 
-    public function __construct(private readonly Recorder $recorder, private readonly Control $control, private readonly ObservedTransport $transport)
+    /** @param list<ObservedTransport> $transports transports share the actor recorder and phase boundaries */
+    public function __construct(private readonly Recorder $recorder, private readonly Control $control, private readonly array $transports)
     {
     }
 
@@ -48,7 +49,9 @@ final class LifecycleSubscriber implements EventSubscriberInterface
                 $this->control->sendPacket(['id' => $packet, 'pid' => getmypid(), 'used_bytes' => memory_get_usage(false), 'reserved_bytes' => memory_get_usage(true), 'peak_bytes' => memory_get_peak_usage(true), 'monotonic_ns' => hrtime(true)]);
             } else {
                 $phase = Phase::from($packet);
-                $this->transport->setPhase($phase);
+                foreach ($this->transports as $transport) {
+                    $transport->setPhase($phase);
+                }
                 $this->recorder->flush();
                 Runtime::saveJson(Runtime::environment('BENCH_TELEMETRY').'.counters.json', $this->recorder->counters());
                 $this->control->send($packet);

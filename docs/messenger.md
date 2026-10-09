@@ -25,7 +25,7 @@ Transport construction validates configuration without connecting. Container boo
 
 The adapter opens separate socket connections for queue operations and notification waits. Cancelling a wait does not close the connection needed to acknowledge messages during the worker's final batch flush. Both sockets use the same broker and SQLite storage.
 
-For direct PHP construction, `Transport` requires distinct operation and notification `BrokerConnection` owners. Each receives a closure that accepts Amp `Cancellation` and returns a fresh `Client`. `TransportFactory` supplies these owners for normal Messenger use.
+For direct PHP construction, `Transport` requires distinct operation and notification `BrokerConnection` owners and the absolute broker endpoint path. Each owner receives a closure that accepts Amp `Cancellation` and returns a fresh `Client`. `TransportFactory` supplies these dependencies for normal Messenger use.
 
 ## Serialization and settlement
 
@@ -39,9 +39,13 @@ Received envelopes carry Symfony's `TransportMessageIdStamp` and the adapter's n
 
 ## Idle waits
 
-A native consumer of one literal sqlite-queue receiver uses broker WAIT when `--sleep` is omitted or zero. Each idle wait lasts at most **1,000 milliseconds**, shortened by the native time limit. A readiness reply means try receiving again; it does not reserve a message.
+A native consumer uses broker notifications when `--sleep` is omitted or zero and all selected receivers are sqlite-queue transports with the same configured endpoint. One distinct queue uses WAIT; **2 through 16** distinct queues use WAIT_ANY. Queue aliases are deduplicated. Each idle wait lasts at most **1,000 milliseconds**, shortened by the native time limit. A readiness reply means try receiving again; it does not reserve a message or change Messenger's receive priority.
 
-Explicit positive sleep, such as `--sleep=0.5`, retains native polling. Multiple receivers, `--all`, regex-like names, and unrelated transports also retain polling. Dotted names retain polling on both Symfony 8.0 and 8.1. There is no multi-queue WAIT.
+The adapter reads the receiver set from the started worker's metadata, after native selection. `--all`, regex expansion, exclusions, and interactive selection participate when the installed Symfony version supports them. Symfony 8.0's literal names and Symfony 8.1's expanded names follow their native behavior.
+
+Selected transports keep their own operation connections for settlement. A group shares the first selected transport's separate notification connection. Cancelling that wait leaves operation connections available for final batch ACKs.
+
+Explicit positive sleep, such as `--sleep=0.5`, retains native polling. Mixed transport types, different configured endpoints, and sets larger than 16 queues use a bounded Clock sleep fallback. The fallback uses the same 1,000-millisecond budget, shortened by the native time limit, so omitted or zero `--sleep` cannot cause busy polling. Cross-broker notification waiting is not implemented. Older brokers reject WAIT_ANY explicitly; there is no automatic polling downgrade.
 
 Console stop signals cancel an active notification wait. `SIGALRM` remains under native handling. Other idle stop listeners may take up to one additional 1,000-millisecond wait before the worker exits. Message, memory, and time limits remain Messenger's responsibility.
 

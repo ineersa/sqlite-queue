@@ -7,6 +7,7 @@ namespace Ineersa\SqliteQueue\Bench;
 use Ineersa\SqliteQueue\Bench\DTO\RunOptionsDTO;
 use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\Messenger\MessageBusInterface;
+use Symfony\Component\Messenger\Stamp\TransportNamesStamp;
 use Symfony\Component\Process\Process as ChildProcess;
 
 /** Tiny characterization foundation only. No capacity or full measurement acceptance claims. */
@@ -55,12 +56,14 @@ final class Runner
             }
         }
         $coverage = match ($this->options->scenario) {
+            Scenario::MultiQueue => 'two queues selected in native order by one consumer; isolated arrivals; broker WAIT_ANY, Doctrine polling; exact WAIT counters unavailable',
             Scenario::Concurrent => 'three publishers, two native consumers on one queue; fixed finite cohort; phase boundaries; exact WAIT counters and lower-driver diagnostics unavailable',
             Scenario::Application => 'one execution queue and one result queue, each with a native consumer; bounded workflows; phase-boundary resources; exact WAIT counters and lower-driver diagnostics unavailable',
             default => 'one consumed queue; bounded outstanding messages for application, one in flight otherwise; phase-boundary resources; exact WAIT counters and lower-driver diagnostics unavailable',
         };
         Runtime::saveJson($directory.'/summary.json', ['method' => Config::METHOD_REVISION, 'configuration' => $this->options->configuration(), 'schedule' => $schedule, 'results' => $results, 'coverage' => $coverage]);
         $topology = match ($this->options->scenario) {
+            Scenario::MultiQueue => 'One publisher and one stock messenger:consume async results worker. Broker pickup mode: notification-wait-any. Doctrine pickup mode: polling. This topology differs from earlier single-queue polling captures.',
             Scenario::Concurrent => 'Three publisher processes and two native consumers on one queue. Finite cohort release through final required ACK, not sustained capacity.',
             Scenario::Application => 'One publisher, one execution consumer and one result/control consumer.',
             default => 'One publisher and one native consumer.',
@@ -72,7 +75,7 @@ final class Runner
         if (\in_array(Role::Persistence->value, $results['broker']['resources']['coverage_details']['not_present_roles'] ?? [], true)) {
             $text .= "\nBroker storage runs in-process. The persistence process is not present; broker CPU and memory include local storage.\n";
         }
-        if (Scenario::Idle === $this->options->scenario) {
+        if ($this->options->scenario->isPickup()) {
             $text .= "\nThe declared no-publication interval and isolated-arrival pickup cohort are separate. Idle CPU and IO use boundary snapshots, not periodic peaks. Empty receives use fixed per-phase count and active-duration histograms; these are actor-phase counts, not exact parent-window events. Exact WAIT registration and wake counts are unavailable.\n";
         }
         if (Scenario::Application === $this->options->scenario) {
@@ -130,6 +133,9 @@ final class Runner
         $boundary(Phase::Boot);
         $broker = new ChildProcess([\PHP_BINARY, $root.'/bin/sqlite-queue', 'broker', '--database='.$database, '--endpoint='.$short.'/broker.sock', '--redeliver-timeout='.Config::REDELIVER_TIMEOUT_S, '--synchronous='.$this->options->synchronous->value, '--no-ansi'], env: Process::environment(), timeout: $this->options->processTimeoutSeconds());
         $consumerArguments = [\PHP_BINARY, __DIR__.'/console.php', 'messenger:consume', 'async', '--no-ansi', '--no-interaction'];
+        if (Scenario::MultiQueue === $this->options->scenario) {
+            $consumerArguments[] = 'results';
+        }
         if (Backend::Doctrine === $backend) {
             $consumerArguments[] = '--sleep='.($this->options->doctrinePollingMilliseconds / 1000);
         }
@@ -255,10 +261,10 @@ final class Runner
             $snapshot(Phase::Reset);
             $journal = CohortJournal::create($directory.'/expected-ids.txt');
             $release[] = $journal->close(...);
-            $measurementPhase = Scenario::Idle === $this->options->scenario ? Phase::Pickup : Phase::Measure;
+            $measurementPhase = $this->options->scenario->isPickup() ? Phase::Pickup : Phase::Measure;
             $idleWindow = [];
             $pickupProofs = [];
-            if (Scenario::Idle === $this->options->scenario) {
+            if ($this->options->scenario->isPickup()) {
                 $control->send(Phase::Idle->value);
                 if (Phase::Idle->value !== $control->receive()) {
                     throw new \RuntimeException('Idle phase barrier failed.');
@@ -280,13 +286,13 @@ final class Runner
             $start = $boundary($measurementPhase);
             $windowEnd = $start + (int) ((Scenario::Application === $this->options->scenario ? $this->options->applicationSeconds() : $this->options->durationSeconds) * 1e9);
             $analysisBounds = ['phase' => $measurementPhase, 'start' => $start];
-            if (Scenario::Application === $this->options->scenario || (!$this->options->smoke && Scenario::Retention !== $this->options->scenario && Scenario::Idle !== $this->options->scenario)) {
+            if (Scenario::Application === $this->options->scenario || (!$this->options->smoke && Scenario::Retention !== $this->options->scenario && !$this->options->scenario->isPickup())) {
                 $analysisBounds['end'] = $windowEnd;
             }
             $index = 0;
             // Empty means no outstanding delivery. A nonempty ID survives the fixed window into drain.
             $pending = '';
-            $finiteCohort = $this->options->smoke || Scenario::Idle === $this->options->scenario;
+            $finiteCohort = $this->options->smoke || $this->options->scenario->isPickup();
             $cohortCount = $this->options->finiteCohortMessages();
 
             $fixedPending = [];
@@ -311,7 +317,7 @@ final class Runner
             }
             while (Scenario::Retention !== $this->options->scenario && Scenario::Application !== $this->options->scenario && (null !== $cohortCount ? $index < $cohortCount : hrtime(true) < $windowEnd)) {
                 $id = $measurementPhase->value.':'.$index;
-                if (Scenario::Idle === $this->options->scenario) {
+                if ($this->options->scenario->isPickup()) {
                     $pickupProofs[$id] = $this->idleBarrier($control, $id);
                 }
                 $journal->append($id);
@@ -382,14 +388,18 @@ final class Runner
                 $accounting['retention']['configuration'] = $this->options->configuration();
             }
             $accounting['measurement_phase'] = $measurementPhase->value;
-            $accounting['rate_interpretation'] = Scenario::Retention === $this->options->scenario ? 'cycle sequence wall time includes settling, audits and observation; not capacity evidence' : (Scenario::Idle === $this->options->scenario ? 'finite isolated-arrival pickup cohort, separate from empty interval' : 'measured cohort; fixed-window goodput only outside smoke');
-            if (Scenario::Idle === $this->options->scenario) {
+            $accounting['rate_interpretation'] = Scenario::Retention === $this->options->scenario ? 'cycle sequence wall time includes settling, audits and observation; not capacity evidence' : ($this->options->scenario->isPickup() ? 'finite isolated-arrival pickup cohort, separate from empty interval' : 'measured cohort; fixed-window goodput only outside smoke');
+            if ($this->options->scenario->isPickup()) {
                 $accounting['idle'] = IdleMetrics::summarize($events(), $idleWindow['start'], $idleWindow['end']);
                 $accounting['idle']['declared_seconds'] = $this->options->idleSeconds();
                 $accounting['idle']['actual_resource_boundary_end_ns'] = $idleWindow['actual_end'];
                 $accounting['idle']['readiness'] = $idleWindow['readiness'];
                 $accounting['idle']['observer_coverage'] = 'fixed per-phase empty receive aggregation; full failures and actual work records; idle-specific observer perturbation has not been isolated';
                 $accounting['pickup'] = ['count' => self::WAKEUP_MESSAGES, 'readiness' => $pickupProofs, 'coverage' => 'isolated arrivals after prior ACK and worker idle; no backlog latency or idle-interval goodput claim'];
+                if (Scenario::MultiQueue === $this->options->scenario) {
+                    $accounting['pickup']['mode'] = Backend::Broker === $backend ? 'notification-wait-any' : 'polling';
+                    $accounting['pickup']['queues'] = ['async', 'results'];
+                }
                 if (IntegrityStatus::Pass->value !== $accounting['idle']['integrity_status']) {
                     $accounting['integrity_status'] = IntegrityStatus::Fail->value;
                 }
@@ -830,7 +840,9 @@ final class Runner
         $payload = Payload::generate($id);
         $bus->dispatch(Scenario::Application === $this->options->scenario
             ? new ApplicationMessage($id, $phase, $payload, true, workMilliseconds: RunOptionsDTO::HANDLER_MILLISECONDS)
-            : new ProbeMessage($id, $phase, $payload, false));
+            : new ProbeMessage($id, $phase, $payload, false),
+            Scenario::MultiQueue === $this->options->scenario ? [new TransportNamesStamp([0 === $index % 2 ? 'async' : 'results'])] : [],
+        );
     }
 
     /** @return array<string, mixed> */
