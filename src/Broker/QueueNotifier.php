@@ -67,24 +67,7 @@ final class QueueNotifier
      */
     public function wait(QueueName $queue, int $timeoutMilliseconds, Cancellation $cancellation): bool
     {
-        if ($timeoutMilliseconds < 0) {
-            throw new \InvalidArgumentException('Wait timeout must be nonnegative milliseconds.');
-        }
-        if ($this->closed) {
-            throw new ClientContextClosedException('Broker wait service is closed.');
-        }
-        $cancellation->throwIfRequested();
-
-        $key = self::watchKey($queue);
-        $deferred = new DeferredFuture();
-        $waiter = new QueueNotifierWaiter($deferred, $timeoutMilliseconds);
-        $waiter->keys = [$key];
-        if (0 === $timeoutMilliseconds) {
-            $waiter->pendingProbeKeys = [$key];
-        }
-        $this->waiters[$key][] = $waiter;
-
-        return $this->awaitWaiter($waiter, [$queue], $cancellation);
+        return $this->waitAny([$queue], $timeoutMilliseconds, $cancellation);
     }
 
     /**
@@ -108,15 +91,11 @@ final class QueueNotifier
         $cancellation->throwIfRequested();
 
         $deferred = new DeferredFuture();
-        $waiter = new QueueNotifierWaiter($deferred, $timeoutMilliseconds);
         $keys = [];
         foreach ($selected as $queue) {
             $keys[] = self::watchKey($queue);
         }
-        $waiter->keys = $keys;
-        if (0 === $timeoutMilliseconds) {
-            $waiter->pendingProbeKeys = $keys;
-        }
+        $waiter = new QueueNotifierWaiter($deferred, $timeoutMilliseconds, $keys);
         // Occupy every selected queue before any refresh callback can suspend.
         foreach ($keys as $key) {
             $this->waiters[$key][] = $waiter;

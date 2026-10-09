@@ -137,6 +137,38 @@ final class QueueNotifierTest extends ProcessTestCase
         $this->assertSame([], $this->waiterNames($notifier));
     }
 
+    public function testZeroDurationWaitAnyRechecksAfterPublicationWhileSiblingQueryIsSuspended(): void
+    {
+        $this->runAsync(function (): void {
+            $entered = new DeferredFuture();
+            $release = new DeferredFuture();
+            $blockOther = false;
+            $queue = $this->open();
+            $notifier = $this->notifier($queue, static function (QueueName $name) use ($entered, $release, &$blockOther): void {
+                if (!$blockOther || 'other' !== $name->value) {
+                    return;
+                }
+                $blockOther = false;
+                $entered->complete();
+                $release->getFuture()->await(new TimeoutCancellation(5));
+            });
+            $jobs = new QueueName('jobs');
+            $other = new QueueName('other');
+            $blockOther = true;
+            $waiting = async(static fn (): bool => $notifier->waitAny([$jobs, $other], 0, new TimeoutCancellation(5)));
+            $entered->getFuture()->await(new TimeoutCancellation(5));
+            $this->assertFalse($waiting->isComplete(), 'The probe must stay open while a sibling eligibility query is suspended.');
+            $this->open()->send($jobs, 'published after jobs reported empty');
+            $notifier->notify($jobs);
+            $release->complete();
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $this->assertSame([], $this->waiterNames($notifier));
+            $this->assertNull($this->watch($notifier, $jobs->value));
+            $this->assertNull($this->watch($notifier, $other->value));
+            $this->assertSame([], $this->failures);
+        });
+    }
+
     public function testRegistrationBeforeRecheckCannotMissCommittedSend(): void
     {
         $this->runAsync(function (): void {
@@ -144,7 +176,7 @@ final class QueueNotifierTest extends ProcessTestCase
             $release = new DeferredFuture();
             $armed = false;
             $queue = $this->open();
-            $notifier = $this->notifier($queue, static function () use ($entered, $release, &$armed): void {
+            $notifier = $this->notifier($queue, static function (QueueName $name) use ($entered, $release, &$armed): void {
                 if ($armed) {
                     $armed = false;
                     $entered->complete();
@@ -523,7 +555,7 @@ final class QueueNotifierTest extends ProcessTestCase
         $this->notifier = new QueueNotifier(
             static function (QueueName $name, ?Cancellation $cancellation = null) use ($queue, $onEligibility): ?int {
                 if (null !== $onEligibility) {
-                    $onEligibility();
+                    $onEligibility($name);
                 }
 
                 return $queue->earliestEligibility($name, $cancellation);
