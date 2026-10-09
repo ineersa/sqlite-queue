@@ -125,6 +125,8 @@ final class TransportFactoryTest extends TestCase
             $received = iterator_to_array($transport->get());
             $this->assertCount(1, $received);
             $this->assertSame('Jobs', (new \ReflectionProperty(Transport::class, 'queue'))->getValue($transport)->value);
+            $this->assertSame($this->endpoint, $transport->brokerEndpoint());
+            $this->assertSame('Jobs', $transport->queueName());
             $transport->ack($received[0]);
             $transport->close();
         });

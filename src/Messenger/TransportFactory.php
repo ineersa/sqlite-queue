@@ -95,7 +95,7 @@ final class TransportFactory implements TransportFactoryInterface
 
         $connect = static fn (Cancellation $cancellation): Client => Client::connect($endpoint, $timeout, $cancellation);
 
-        return new Transport(new BrokerConnection($connect), $queue, $serializer, new BrokerConnection($connect));
+        return new Transport(new BrokerConnection($connect), $queue, $serializer, new BrokerConnection($connect), $endpoint);
     }
 
     /** @param array<mixed> $options */

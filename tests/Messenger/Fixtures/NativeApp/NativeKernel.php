@@ -82,6 +82,7 @@ final class NativeKernel extends Kernel
                     NativeConsumeWaitSubscriber::class,
                     BrokerCommand::class,
                     'messenger.transport.async',
+                    'messenger.transport.reports',
                     'messenger.transport.async_terminal',
                     'messenger.transport.async_failure',
                     'messenger.transport.failed',

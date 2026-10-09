@@ -29,6 +29,9 @@ framework:
                     multiplier: 1
                     max_delay: 50
                     jitter: 0.0
+            reports:
+                dsn: '%env(NATIVE_REPORTS_DSN)%'
+                serializer: messenger.transport.native_php_serializer
             async_terminal:
                 dsn: '%env(NATIVE_ASYNC_DSN)%'
                 serializer: messenger.transport.native_php_serializer

@@ -425,7 +425,7 @@ final class TransportTest extends TestCase
             });
 
             try {
-                $transport = new Transport($this->connection($endpoint), new QueueName('jobs'), new PhpSerializer(), $this->connection($endpoint));
+                $transport = new Transport($this->connection($endpoint), new QueueName('jobs'), new PhpSerializer(), $this->connection($endpoint), $endpoint);
                 try {
                     $transport->send(new Envelope(new TransportProbeMessage('lost')));
                     $this->fail('A peer close without confirmation must fail the send.');
@@ -473,7 +473,7 @@ final class TransportTest extends TestCase
             throw new \LogicException('Constructor validation must not acquire a client.');
         });
         try {
-            new Transport($owner, new QueueName('jobs'), new PhpSerializer(), $owner);
+            new Transport($owner, new QueueName('jobs'), new PhpSerializer(), $owner, '/tmp/unused-broker.sock');
             $this->fail('Reservation and notification owners must be distinct.');
         } catch (\InvalidArgumentException $error) {
             $this->assertStringContainsString('must be distinct', $error->getMessage());
@@ -503,7 +503,7 @@ final class TransportTest extends TestCase
                     $socket->close();
                 }
             });
-            $transport = new Transport($this->connection($this->endpoint), new QueueName('jobs'), new PhpSerializer(), $this->connection($endpoint));
+            $transport = new Transport($this->connection($this->endpoint), new QueueName('jobs'), new PhpSerializer(), $this->connection($endpoint), $this->endpoint);
             $stop = new DeferredCancellation();
             try {
                 $transport->send(new Envelope(new TransportProbeMessage('reserved-during-handshake')));
@@ -598,7 +598,7 @@ final class TransportTest extends TestCase
 
     private function transportWithSerializer(SerializerInterface $serializer): Transport
     {
-        return new Transport($this->connection($this->endpoint), new QueueName('jobs'), $serializer, $this->connection($this->endpoint));
+        return new Transport($this->connection($this->endpoint), new QueueName('jobs'), $serializer, $this->connection($this->endpoint), $this->endpoint);
     }
 
     private function connection(string $endpoint): BrokerConnection
