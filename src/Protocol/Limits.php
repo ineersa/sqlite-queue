@@ -40,6 +40,14 @@ final class Limits
     /** Maximum WAIT bound in milliseconds. Zero is an immediate readiness probe. */
     public const int MAX_WAIT_MILLISECONDS = 30_000;
 
+    /**
+     * Maximum queue names accepted by one WAIT_ANY request.
+     *
+     * Sixteen maximum-length queue names plus the shared protocol fields fit inside the 8 KiB
+     * control budget, so the broker rejects larger lists instead of truncating them.
+     */
+    public const int MAX_WAIT_QUEUES = 16;
+
     private function __construct()
     {
     }

@@ -5,10 +5,13 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Tests\Messenger;
 
 use Amp\DeferredCancellation;
+use Amp\NullCancellation;
 use Ineersa\SqliteQueue\Messenger\DTO\ConsumeWaitSessionDTO;
 use Ineersa\SqliteQueue\Messenger\NativeConsumeWaitSubscriber;
+use Ineersa\SqliteQueue\Messenger\Transport;
 use Ineersa\SqliteQueue\Messenger\TransportFactory;
 use Ineersa\SqliteQueue\Protocol\Limits;
+use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\ControllableClock;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Clock\MockClock;
@@ -47,14 +50,106 @@ final class NativeConsumeWaitSubscriberTest extends TestCase
         $this->assertSame(0, $this->timeout(1000, 0.0));
     }
 
+    public function testMetadataSelectionUsesFirstTransportNotificationOwnerAcrossDistinctQueues(): void
+    {
+        $factory = new TransportFactory();
+        $serializer = new PhpSerializer();
+        $first = $factory->createTransport('sqlite-queue://jobs?endpoint=/tmp/sqlite-queue-wait-a.sock', [], $serializer);
+        $second = $factory->createTransport('sqlite-queue://reports?endpoint=/tmp/sqlite-queue-wait-a.sock', [], $serializer);
+        $subscriber = new NativeConsumeWaitSubscriber(new ServiceLocator([
+            'async' => static fn (): Transport => $first,
+            'reports' => static fn (): Transport => $second,
+        ]), new MockClock('2026-10-03 00:00:00 UTC'));
+
+        $wait = (new \ReflectionMethod($subscriber, 'buildWait'))->invoke($subscriber, ['async', 'reports']);
+        $variables = (new \ReflectionFunction($wait))->getStaticVariables();
+        $this->assertSame($first, $variables['owner'] ?? null);
+        $this->assertSame(['jobs', 'reports'], $variables['queues'] ?? null);
+    }
+
+    public function testMixedOrForeignBrokerSelectionsUseBoundedClockFallback(): void
+    {
+        $factory = new TransportFactory();
+        $serializer = new PhpSerializer();
+        $ours = $factory->createTransport('sqlite-queue://jobs?endpoint=/tmp/sqlite-queue-wait-a.sock', [], $serializer);
+        $otherBroker = $factory->createTransport('sqlite-queue://jobs?endpoint=/tmp/sqlite-queue-wait-b.sock', [], $serializer);
+        $clock = new ControllableClock(1_700_000_000.0);
+        $subscriber = new NativeConsumeWaitSubscriber(new ServiceLocator([
+            'async' => static fn (): Transport => $ours,
+            'other' => static fn (): Transport => $otherBroker,
+            'sync' => static fn (): object => new \stdClass(),
+        ]), $clock);
+
+        $foreign = (new \ReflectionMethod($subscriber, 'buildWait'))->invoke($subscriber, ['async', 'other']);
+        $mixed = (new \ReflectionMethod($subscriber, 'buildWait'))->invoke($subscriber, ['async', 'sync']);
+        $this->assertFalse($foreign(250, new NullCancellation()));
+        $this->assertFalse($mixed(250, new NullCancellation()));
+        $this->assertSame([0.25, 0.25], $clock->sleepCalls);
+    }
+
+    public function testOversizedDistinctQueueSetUsesBoundedClockFallback(): void
+    {
+        $factory = new TransportFactory();
+        $serializer = new PhpSerializer();
+        $locator = [];
+        $names = [];
+        for ($i = 0; $i <= Limits::MAX_WAIT_QUEUES; ++$i) {
+            $name = 'q'.$i;
+            $names[] = $name;
+            $locator[$name] = static function () use ($factory, $serializer, $i): Transport {
+                return $factory->createTransport(
+                    'sqlite-queue://queue'.$i.'?endpoint=/tmp/sqlite-queue-wait-a.sock',
+                    [],
+                    $serializer,
+                );
+            };
+        }
+        $clock = new ControllableClock(1_700_000_000.0);
+        $subscriber = new NativeConsumeWaitSubscriber(new ServiceLocator($locator), $clock);
+        $wait = (new \ReflectionMethod($subscriber, 'buildWait'))->invoke($subscriber, $names);
+        $this->assertFalse($wait(100, new NullCancellation()));
+        $this->assertSame([0.1], $clock->sleepCalls);
+    }
+
+    public function testSelectedSqliteQueueReceiverActivatesOmittedSleepBeforeWorkerOptions(): void
+    {
+        $factory = new TransportFactory();
+        $serializer = new PhpSerializer();
+        $transport = $factory->createTransport('sqlite-queue://jobs?endpoint=/tmp/sqlite-queue-wait-a.sock', [], $serializer);
+        $subscriber = new NativeConsumeWaitSubscriber(new ServiceLocator([
+            'async' => static fn (): Transport => $transport,
+            'sync' => static fn (): object => new \stdClass(),
+        ]), new MockClock('2026-10-03 00:00:00 UTC'));
+        $command = new \Symfony\Component\Messenger\Command\ConsumeMessagesCommand(
+            new \Symfony\Component\Messenger\RoutableMessageBus(new ServiceLocator([]), new MessageBus()),
+            new ServiceLocator([]),
+            new \Symfony\Component\EventDispatcher\EventDispatcher(),
+        );
+        $input = new \Symfony\Component\Console\Input\ArrayInput([]);
+        $input->bind($command->getDefinition());
+        $event = new \Symfony\Component\Console\Event\ConsoleCommandEvent($command, $input, new \Symfony\Component\Console\Output\NullOutput());
+        $subscriber->onConsoleCommand($event);
+        $this->assertSame(1, $input->getOption('sleep'));
+        $subscriber->onSelectedReceiver('sync');
+        $this->assertSame(1, $input->getOption('sleep'));
+        $subscriber->onSelectedReceiver('async');
+        $this->assertSame(0, $input->getOption('sleep'));
+        $pending = (new \ReflectionProperty($subscriber, 'pendingByCommand'))->getValue($subscriber);
+        foreach ($pending as $state) {
+            $this->assertSame(1, $state->originalSleepOption);
+            $this->assertTrue($state->sleepOptionMutated);
+        }
+    }
+
     private function timeout(int $budget, ?float $deadlineOffset): int
     {
         $clock = new MockClock('2026-10-03 00:00:00 UTC');
         $subscriber = new NativeConsumeWaitSubscriber(new ServiceLocator([]), $clock);
-        $transport = (new TransportFactory())->createTransport('sqlite-queue://jobs?endpoint=/tmp/unused-wait-budget.sock', [], new PhpSerializer());
         $session = new ConsumeWaitSessionDTO(
-            new Command('probe'), $transport, 'jobs', 1000000, false,
-            new DeferredCancellation(), $budget,
+            new Command('probe'),
+            static fn (int $timeoutMilliseconds, $cancellation): bool => false,
+            new DeferredCancellation(),
+            $budget,
             null === $deadlineOffset ? null : $clock->now()->getTimestamp() + $deadlineOffset,
             new Worker([], new MessageBus()),
         );

@@ -65,7 +65,7 @@ Delay uses integer milliseconds, including positive subsecond values. Send persi
 
 Clock changes can advance or postpone eligibility. Duration timers are not a realtime guarantee; an already armed wake timer can run late after a forward wall-clock jump. Storage eligibility checks still decide whether receive can claim a message.
 
-WAIT is a readiness hint, not a reservation. The public bound is **0 through 30,000 milliseconds**. Zero probes immediately. Messenger's single-receiver idle wait uses at most **1,000 milliseconds**. Its multiple-receiver and regex-like selections retain polling.
+WAIT and WAIT_ANY return readiness hints, not reservations. The public bound is **0 through 30,000 milliseconds**. Zero probes immediately. WAIT_ANY accepts **1 through 16 distinct queues**. Messenger uses at most **1,000 milliseconds** per idle wait for selected receivers on the same configured broker endpoint. Native selection order remains unchanged. Selections containing sqlite-queue use a bounded sleep fallback for mixed transports, different endpoints, or larger sets. Consumers without sqlite-queue receivers retain native idle handling.
 
 The default communication allowance is **10 seconds** for connection establishment and exchanges. WAIT adds its requested duration to that allowance. This communication setting has no 30-second cap and does not change message visibility. The broker's frame-read deadline is a separate protocol limit.
 

@@ -47,7 +47,7 @@ final class RunCommand extends Command
     protected function configure(): void
     {
         $this->setDescription('Compare native Messenger workloads, one run per backend.')
-            ->addOption('workload', null, InputOption::VALUE_REQUIRED, 'roundtrip, concurrent, application, idle or retention.', 'roundtrip')
+            ->addOption('workload', null, InputOption::VALUE_REQUIRED, 'roundtrip, concurrent, application, idle, multi-queue or retention.', 'roundtrip')
             ->addOption('smoke', null, InputOption::VALUE_NONE, 'Tiny control-path checks, not performance evidence.')
             ->addOption('duration', null, InputOption::VALUE_REQUIRED, 'Measured window in seconds.', (string) RunOptionsDTO::DEFAULT_DURATION_SECONDS)
             ->addOption('polling-ms', null, InputOption::VALUE_REQUIRED, 'Doctrine idle poll interval, 1..1000 milliseconds. Broker uses WAIT.', (string) RunOptionsDTO::DEFAULT_DOCTRINE_POLLING_MILLISECONDS)

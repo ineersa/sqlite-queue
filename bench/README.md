@@ -14,7 +14,7 @@ Smoke verifies wiring, payloads, accounting, and cleanup. It is not performance 
 
 ## Measure a workload
 
-The available workloads are `roundtrip`, `concurrent`, `application`, `idle`, and `retention`. Controls are `--workload`, `--smoke`, `--duration`, `--synchronous`, and `--polling-ms`.
+The available workloads are `roundtrip`, `concurrent`, `application`, `idle`, `multi-queue`, and `retention`. Controls are `--workload`, `--smoke`, `--duration`, `--synchronous`, and `--polling-ms`.
 
 `--polling-ms` sets Doctrine's idle poll interval in integer milliseconds, from 1 to 1000. The default is 50 ms. Use 1000 for Symfony's one-second polling comparison. Broker consumers use notification WAIT in both cases. Each capture records the selected interval.
 
@@ -29,6 +29,14 @@ The available workloads are `roundtrip`, `concurrent`, `application`, `idle`, an
 ```
 
 Time-based workloads default to 60 seconds per backend, about two minutes plus setup. Concurrent uses a fixed 3000-message cohort. Retention uses twenty cycles of one hundred messages. Smoke substitutes explicitly small cohorts.
+
+`multi-queue` selects `async results` on one stock consumer and publishes one isolated arrival to each queue after an empty interval. Broker pickup uses `notification-wait-any`; Doctrine uses the configured polling interval. Reports name both modes and the changed topology. Earlier single-queue polling captures remain unchanged and are not directly comparable.
+
+Each worker resolves only its selected observed transports. Single-queue consumers do not open an unused results connection; the multi-queue consumer intentionally opens both.
+
+```sh
+	XDEBUG_MODE=off vendor/bin/castor bench --smoke --workload=multi-queue
+```
 
 Commit the source before publishing measurements so the recorded revision identifies the code. Run one command at a time without competing builds or benchmarks. Do not retry failed comparisons until green.
 

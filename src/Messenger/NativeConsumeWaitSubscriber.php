@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Messenger;
 
+use Amp\Cancellation;
 use Amp\CancelledException;
 use Amp\DeferredCancellation;
 use Ineersa\SqliteQueue\Exception\TransportException as ClientTransportException;
@@ -27,19 +28,26 @@ use Symfony\Component\Messenger\Exception\TransportException;
 use Symfony\Component\Messenger\Worker;
 
 /**
- * Arms bounded Transport::wait() for stock messenger:consume on one sqlite-queue receiver.
+ * Arms bounded idle waits for stock messenger:consume using the receivers WorkerStarted selected.
  *
- * Activation requires exactly one literal receiver name that resolves through the Messenger
- * receiver locator to our Transport. When the user omits --sleep, the subscriber mutates the
- * sleep InputOption default to 0 so Command::run() rebind yields idleTimeout 0. Explicit
- * --sleep=0 arms WAIT without mutating the default. Explicit positive --sleep, including
- * fractional values such as 0.5, keeps native polling. Mixed, regex, and --all consumes are
- * left untouched.
+ * ConsoleEvents::COMMAND only captures the live input, sleep mode, and time-limit configuration.
+ * It does not mutate the sleep InputOption default. ConsumeReceiverLocator reports each selected
+ * receiver before Worker options read --sleep. The first selected sqlite-queue Transport activates
+ * the wait: omitted --sleep binds input sleep=0, and explicit --sleep=0 arms without mutation.
+ * Foreign-only selections keep native sleep handling.
+ *
+ * WorkerStartedEvent metadata supplies the actual selected receiver names in native priority
+ * order after regex/--all/exclusions/interactive selection. When every selected receiver is our
+ * Transport on one broker and the distinct queue set fits MAX_WAIT_QUEUES, the first
+ * transport's notification owner waits across those queues. Other transports keep their own
+ * operation connections for batch ACKs. Mixed receivers, different brokers, empty selections, or
+ * oversized queue sets use a bounded Clock sleep fallback so explicit --sleep=0 cannot busy-spin.
  *
  * Default wait budget is 1000ms, matching the stock Messenger sleep default. The budget is capped
- * by any native --time-limit deadline. Invalid budgets are rejected. Stop listeners may
- * mark the worker stopped before this callback runs; without a public shouldStop getter the
- * worst-case idle stop latency is one wait budget unless ConsoleEvents::SIGNAL cancels first.
+ * by any native --time-limit deadline. Stop listeners may mark the worker stopped before this
+ * callback runs; without a public shouldStop getter the worst-case idle stop latency is one wait
+ * budget. ConsoleEvents::SIGNAL can cancel notification waits, but fallback Clock sleep is not
+ * cancellation-aware and may use the whole remaining budget.
  */
 final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
 {
@@ -89,57 +97,46 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         }
 
         $input = $event->getInput();
-        if ($input->hasOption('all') && true === $input->getOption('all')) {
-            return;
-        }
-
-        $receivers = $input->getArgument('receivers');
-        if (!\is_array($receivers) || 1 !== \count($receivers) || !\is_string($receivers[0]) || '' === $receivers[0]) {
-            return;
-        }
-
         $explicitSleep = $this->explicitSleepSeconds($input->hasParameterOption(['--sleep'], true)
             ? $input->getParameterOption(['--sleep'], false, true)
             : null);
-        if (ExplicitSleep::Positive === $explicitSleep) {
-            return;
-        }
-        if (ExplicitSleep::Invalid === $explicitSleep) {
+        if (ExplicitSleep::Positive === $explicitSleep || ExplicitSleep::Invalid === $explicitSleep) {
             return;
         }
 
-        $name = $receivers[0];
-        // Symfony 8.1 interprets receiver arguments as anchored regular expressions.
-        // Symfony 8.0 uses literal names; use the same conservative activation on both.
-        // Do not change its sleep default when one name could select several receivers.
-        // In {^name$}, '-' and ':' are literal. Only operators and delimiters exclude WAIT.
-        if (false !== strpbrk($name, '.\\+*?[]^$(){}|')) {
+        $this->pendingByCommand[$command] = new ConsumeWaitPendingDTO(
+            $command,
+            $input,
+            $input->getOption('sleep'),
+            ExplicitSleep::Omitted === $explicitSleep,
+            self::DEFAULT_WAIT_BUDGET_MILLISECONDS,
+            $this->timeLimitSeconds($input->getOption('time-limit')),
+        );
+    }
+
+    /**
+     * Called by ConsumeReceiverLocator for each selected receiver before Worker options read sleep.
+     */
+    public function onSelectedReceiver(string $name): void
+    {
+        $pending = $this->currentPending();
+        if (null === $pending || $pending->activated) {
             return;
         }
         if (!$this->receiverLocator->has($name)) {
             return;
         }
-        $receiver = $this->receiverLocator->get($name);
-        if (!$receiver instanceof Transport) {
+        if (!$this->receiverLocator->get($name) instanceof Transport) {
             return;
         }
 
-        $option = $command->getDefinition()->getOption('sleep');
-        $originalDefault = $option->getDefault();
-        $mutateDefault = ExplicitSleep::Omitted === $explicitSleep;
-        $pending = new ConsumeWaitPendingDTO(
-            $command,
-            $receiver,
-            $name,
-            $originalDefault,
-            $mutateDefault,
-            self::DEFAULT_WAIT_BUDGET_MILLISECONDS,
-            $this->timeLimitSeconds($input->getOption('time-limit')),
-        );
-        $this->pendingByCommand[$command] = $pending;
-        if ($mutateDefault) {
-            $option->setDefault(0);
+        $pending->activated = true;
+        if (!$pending->sleepOmitted) {
+            return;
         }
+
+        $pending->input->setOption('sleep', 0);
+        $pending->sleepOptionMutated = true;
     }
 
     public function onWorkerStarted(WorkerStartedEvent $event): void
@@ -148,27 +145,23 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         if (null === $pending) {
             return;
         }
-
-        $names = $event->getWorker()->getMetadata()->getTransportNames();
-        if ([0 => $pending->receiverName] !== $names) {
-            $this->restoreSleepDefault($pending);
+        if (!$pending->activated) {
+            $this->restorePending($pending);
 
             return;
         }
 
         $idleTimeout = $this->idleTimeoutMicroseconds($event);
         if (null !== $idleTimeout && 0 !== $idleTimeout) {
-            $this->restoreSleepDefault($pending);
+            $this->restorePending($pending);
 
             return;
         }
 
+        $names = $event->getWorker()->getMetadata()->getTransportNames();
         $session = new ConsumeWaitSessionDTO(
             $pending->command,
-            $pending->transport,
-            $pending->receiverName,
-            $pending->originalSleepDefault,
-            $pending->sleepDefaultMutated,
+            $this->buildWait($names),
             new DeferredCancellation(),
             $pending->waitBudgetMilliseconds,
             $this->deadline($event, $pending->timeLimitSeconds),
@@ -176,6 +169,7 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         );
         $this->sessionsByWorker[$event->getWorker()] = $session;
         $this->sessionsByCommand[$pending->command] = $session;
+        $this->restorePending($pending);
     }
 
     public function onWorkerRunning(WorkerRunningEvent $event): void
@@ -200,8 +194,8 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         }
 
         try {
-            $session->transport->wait($timeoutMilliseconds, $session->stop->getCancellation());
-        } catch (TransportException|ClientTransportException $error) {
+            ($session->wait)($timeoutMilliseconds, $session->stop->getCancellation());
+        } catch (CancelledException|TransportException|ClientTransportException $error) {
             if ($this->isStopCancellation($session, $error)) {
                 return;
             }
@@ -233,7 +227,6 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         unset($this->sessionsByWorker[$event->getWorker()]);
         unset($this->sessionsByCommand[$session->command]);
         $session->stop->cancel();
-        $this->restoreSleepDefault($session);
     }
 
     public function onConsoleTerminate(ConsoleTerminateEvent $event): void
@@ -254,6 +247,11 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
     {
         if (null === $command) {
             $this->restoreAllPending();
+            foreach ($this->sessionsByCommand as $sessionCommand => $session) {
+                unset($this->sessionsByCommand[$sessionCommand]);
+                unset($this->sessionsByWorker[$session->worker]);
+                $session->stop->cancel();
+            }
 
             return;
         }
@@ -261,7 +259,7 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         $pending = $this->pendingByCommand[$command] ?? null;
         if (null !== $pending) {
             unset($this->pendingByCommand[$command]);
-            $this->restoreSleepDefault($pending);
+            $this->restorePending($pending);
         }
 
         $session = $this->sessionsByCommand[$command] ?? null;
@@ -271,15 +269,23 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         unset($this->sessionsByCommand[$command]);
         unset($this->sessionsByWorker[$session->worker]);
         $session->stop->cancel();
-        $this->restoreSleepDefault($session);
     }
 
     private function restoreAllPending(): void
     {
         foreach ($this->pendingByCommand as $command => $pending) {
             unset($this->pendingByCommand[$command]);
-            $this->restoreSleepDefault($pending);
+            $this->restorePending($pending);
         }
+    }
+
+    private function currentPending(): ?ConsumeWaitPendingDTO
+    {
+        foreach ($this->pendingByCommand as $pending) {
+            return $pending;
+        }
+
+        return null;
     }
 
     private function takePending(): ?ConsumeWaitPendingDTO
@@ -288,7 +294,7 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
             unset($this->pendingByCommand[$command]);
             foreach ($this->pendingByCommand as $extraCommand => $extraPending) {
                 unset($this->pendingByCommand[$extraCommand]);
-                $this->restoreSleepDefault($extraPending);
+                $this->restorePending($extraPending);
             }
 
             return $pending;
@@ -297,11 +303,77 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         return null;
     }
 
-    private function restoreSleepDefault(ConsumeWaitPendingDTO|ConsumeWaitSessionDTO $state): void
+    private function restorePending(ConsumeWaitPendingDTO $pending): void
     {
-        if ($state->sleepDefaultMutated) {
-            $state->command->getDefinition()->getOption('sleep')->setDefault($state->originalSleepDefault);
+        if (!$pending->sleepOptionMutated) {
+            return;
         }
+        $pending->input->setOption('sleep', $pending->originalSleepOption);
+        $pending->sleepOptionMutated = false;
+    }
+
+    /**
+     * @param list<string> $receiverNames
+     *
+     * @return \Closure(int, Cancellation): bool
+     */
+    private function buildWait(array $receiverNames): \Closure
+    {
+        $transports = [];
+        foreach ($receiverNames as $name) {
+            if (!\is_string($name) || '' === $name || !$this->receiverLocator->has($name)) {
+                return $this->fallbackWait();
+            }
+            $receiver = $this->receiverLocator->get($name);
+            if (!$receiver instanceof Transport) {
+                return $this->fallbackWait();
+            }
+            $transports[] = $receiver;
+        }
+        if ([] === $transports) {
+            return $this->fallbackWait();
+        }
+
+        $endpoint = $transports[0]->brokerEndpoint();
+        $queues = [];
+        foreach ($transports as $transport) {
+            if ($transport->brokerEndpoint() !== $endpoint) {
+                return $this->fallbackWait();
+            }
+            $queue = $transport->queueName();
+            if (!\in_array($queue, $queues, true)) {
+                $queues[] = $queue;
+            }
+        }
+        if (\count($queues) > Limits::MAX_WAIT_QUEUES) {
+            return $this->fallbackWait();
+        }
+
+        $owner = $transports[0];
+        if (1 === \count($queues)) {
+            return static fn (int $timeoutMilliseconds, Cancellation $cancellation): bool => $owner->wait($timeoutMilliseconds, $cancellation);
+        }
+
+        return static fn (int $timeoutMilliseconds, Cancellation $cancellation): bool => $owner->waitAny($queues, $timeoutMilliseconds, $cancellation);
+    }
+
+    /**
+     * @return \Closure(int, Cancellation): bool
+     */
+    private function fallbackWait(): \Closure
+    {
+        return function (int $timeoutMilliseconds, Cancellation $cancellation): bool {
+            try {
+                $cancellation->throwIfRequested();
+                // NativeClock sleep blocks the stock worker; cancellation is checked on return.
+                $this->clock->sleep($timeoutMilliseconds / 1000);
+                $cancellation->throwIfRequested();
+            } catch (CancelledException $error) {
+                throw new TransportException('Queue wait was cancelled.', 0, $error);
+            }
+
+            return false;
+        };
     }
 
     private function waitTimeoutMilliseconds(ConsumeWaitSessionDTO $session): int

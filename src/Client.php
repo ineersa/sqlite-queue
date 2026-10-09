@@ -18,6 +18,7 @@ use Ineersa\SqliteQueue\Protocol\Frame;
 use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Protocol\Operation;
 use Ineersa\SqliteQueue\Protocol\ProtocolException;
+use Ineersa\SqliteQueue\ValueObject\QueueName;
 
 use function Amp\Socket\connect;
 
@@ -168,6 +169,43 @@ final class Client
         );
     }
 
+    /**
+     * Bounded multi-queue readiness hint. True means try receive on the selected queues; it never
+     * grants a reservation. False means the shared wait elapsed without a readiness hint.
+     *
+     * Queue lists, each name, empty input, duplicates, count, and the timeout are validated
+     * locally before any bytes are written. Unsupported peers reject wait_any explicitly; this
+     * client never falls back to single-queue WAIT or silently truncates the list.
+     *
+     * @param list<string> $queues
+     */
+    public function waitAny(array $queues, int $timeoutMilliseconds, ?Cancellation $cancellation = null): bool
+    {
+        if ($timeoutMilliseconds < 0 || $timeoutMilliseconds > Limits::MAX_WAIT_MILLISECONDS) {
+            throw new \InvalidArgumentException(\sprintf('Wait timeout must be between 0 and %d milliseconds.', Limits::MAX_WAIT_MILLISECONDS));
+        }
+        $selected = self::validatedWaitQueues($queues);
+
+        return $this->exchange(
+            Operation::WaitAny,
+            static function (Frame $reply): bool {
+                $result = $reply->control[ControlField::Result->value];
+                if (!\is_bool($result)) {
+                    throw new ProtocolException(ErrorCode::InvalidRequest, 'WAIT_ANY result must be a boolean.');
+                }
+                self::assertNoPayload($reply, 'WAIT_ANY');
+
+                return $result;
+            },
+            [
+                ControlField::Queues->value => $selected,
+                ControlField::WaitMilliseconds->value => $timeoutMilliseconds,
+            ],
+            cancellation: $cancellation,
+            timeout: $this->timeout + ($timeoutMilliseconds / 1000),
+        );
+    }
+
     public function close(): void
     {
         $this->closed = true;
@@ -257,6 +295,36 @@ final class Client
             $this->close();
             throw $error;
         }
+    }
+
+    /**
+     * @param list<mixed> $queues
+     *
+     * @return list<string>
+     */
+    private static function validatedWaitQueues(array $queues): array
+    {
+        if ([] === $queues) {
+            throw new \InvalidArgumentException('WAIT_ANY requires at least one queue.');
+        }
+        if (\count($queues) > Limits::MAX_WAIT_QUEUES) {
+            throw new \InvalidArgumentException(\sprintf('WAIT_ANY accepts at most %d queues.', Limits::MAX_WAIT_QUEUES));
+        }
+        $selected = [];
+        $seen = [];
+        foreach ($queues as $queue) {
+            if (!\is_string($queue)) {
+                throw new \InvalidArgumentException('WAIT_ANY queue names must be strings.');
+            }
+            $name = new QueueName($queue);
+            if (isset($seen[$name->value])) {
+                throw new \InvalidArgumentException('WAIT_ANY queue names must be unique.');
+            }
+            $seen[$name->value] = true;
+            $selected[] = $name->value;
+        }
+
+        return $selected;
     }
 
     private function successfulReply(Frame $reply, int $id): Frame

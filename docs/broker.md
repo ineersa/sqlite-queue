@@ -85,7 +85,7 @@ The PHP `BrokerFactory::visibilityTimeout` argument uses milliseconds and defaul
 
 An unacknowledged reservation becomes eligible again at its persisted deadline. Closing a client does not shorten that deadline. PHP callers can construct `BrokerFactory` with `visibilityTimeout` and call `create()`. For an application-owned cancellation token, pass it to `Broker::run()`.
 
-The Messenger bundle maps WAIT onto native consumer idle events for one literal receiver when `--sleep` is omitted or zero. See [Messenger idle behavior and limits](messenger.md#idle-waits).
+The Messenger bundle maps WAIT and WAIT_ANY onto native consumer idle events when `--sleep` is omitted or zero. Selected receivers must share one configured endpoint and name at most 16 distinct queues. See [Messenger idle behavior and limits](messenger.md#idle-waits).
 
 ## Recover from a failed exchange
 

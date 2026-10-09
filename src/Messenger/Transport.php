@@ -39,16 +39,21 @@ final class Transport implements TransportInterface, CloseableTransportInterface
     /**
      * Owners must acquire distinct broker Clients. Cancelling notification WAIT closes that
      * connection; the operation connection must remain live for deferred reservation ACKs.
-     * Both owners belong to this transport and are closed with it.
+     * Both owners belong to this transport and are closed with it. brokerEndpoint identifies the
+     * broker socket for shared multi-queue notification waits across transports.
      */
     public function __construct(
         private readonly BrokerConnection $operations,
         private readonly QueueName $queue,
         private readonly SerializerInterface $serializer,
         private readonly BrokerConnection $notifications,
+        private readonly string $brokerEndpoint,
     ) {
         if ($operations === $notifications) {
             throw new \InvalidArgumentException('Operation and notification connection owners must be distinct.');
+        }
+        if ('' === $brokerEndpoint || !str_starts_with($brokerEndpoint, '/')) {
+            throw new \InvalidArgumentException('The broker endpoint must be a non-empty absolute filesystem path.');
         }
     }
 
@@ -131,6 +136,34 @@ final class Transport implements TransportInterface, CloseableTransportInterface
         } catch (ClientTransportException|ProtocolException $error) {
             throw new TransportException('Could not wait on the queue broker.', 0, $error);
         }
+    }
+
+    /**
+     * Bounded readiness hint across several queues on this transport's notification owner.
+     *
+     * True means try get() on the selected receivers; false is a normal timeout or empty probe.
+     *
+     * @param list<string> $queues
+     */
+    public function waitAny(array $queues, int $timeoutMilliseconds, Cancellation $cancellation): bool
+    {
+        try {
+            return $this->notifications->client($cancellation)->waitAny($queues, $timeoutMilliseconds, $cancellation);
+        } catch (CancelledException $error) {
+            throw new TransportException('Queue wait was cancelled.', 0, $error);
+        } catch (ClientTransportException|ProtocolException $error) {
+            throw new TransportException('Could not wait on the queue broker.', 0, $error);
+        }
+    }
+
+    public function queueName(): string
+    {
+        return $this->queue->value;
+    }
+
+    public function brokerEndpoint(): string
+    {
+        return $this->brokerEndpoint;
     }
 
     public function close(): void

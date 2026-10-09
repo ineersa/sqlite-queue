@@ -1,6 +1,6 @@
 # Task 09: notification waits across multiple queues
 
-Status: TODO
+Status: Implemented; user approved merge after the foreign-consumer and benchmark-connection fixes.
 Dependencies: Task 05 notification handling and Task 06 native Messenger integration.
 Requested during Task 08. Creating this task does not authorize changing the ongoing benchmark method or implementing it in the benchmark branch.
 
@@ -28,16 +28,25 @@ No custom consume command or Worker replacement. No atomic multi-queue receive, 
 
 ## Acceptance criteria
 
-- [ ] Waiting on queues A and B wakes for publication to either queue without an extra idle sleep.
-- [ ] A pre-existing ready message and publication during registration/recheck cannot be missed.
-- [ ] Delayed messages and expired reservations wake the wait without another publication, including after restart.
-- [ ] Overlapping waits from multiple consumers remain safe. A hint can lose the claim race without losing future wakeups.
-- [ ] Completion removes registrations from every queue, with no leaked timers, reads, or futures.
-- [ ] Cancellation during notification acquisition or WAIT preserves connections needed for batch settlement.
-- [ ] Native multi-receiver consumption handles both queues, preserves native selection order, and respects shutdown and worker limits.
-- [ ] Single-queue callers remain compatible; unsupported peers and malformed inputs fail explicitly.
-- [ ] Tests use controlled clocks and observable barriers rather than sleeps or elapsed-time thresholds.
+- [x] Waiting on queues A and B wakes for publication to either queue without an extra idle sleep.
+- [x] A pre-existing ready message and publication during registration/recheck cannot be missed.
+- [x] Delayed messages and expired reservations wake the wait without another publication, including after restart.
+- [x] Overlapping waits from multiple consumers remain safe. A hint can lose the claim race without losing future wakeups.
+- [x] Completion removes registrations from every queue, with no leaked timers, reads, or futures.
+- [x] Cancellation during notification acquisition or WAIT preserves connections needed for batch settlement.
+- [x] Native multi-receiver consumption handles both queues, preserves native selection order, and respects shutdown and worker limits.
+- [x] Single-queue callers remain compatible; unsupported peers and malformed inputs fail explicitly.
+- [x] Tests use controlled clocks and observable barriers rather than sleeps or elapsed-time thresholds.
 
 ## Validation
 
 Run focused notifier, protocol/client, and native Messenger tests, then Castor formatting and QA. Verify both supported Symfony 8.0 and 8.1 selection behavior. Run an explicit multi-queue benchmark smoke check and label notification mode in its report; do not compare it silently with earlier polling captures.
+
+Validation completed:
+
+- Castor formatting and full QA pass after the review fixes: 417 tests, 2,407 assertions, about 25 seconds.
+- Isolated Symfony 8.0.15 native integration and subscriber checks pass: 30 tests, 215 assertions. Dependency downgrades were not committed.
+- The activation follow-up passes 32 native/subscriber checks on Symfony Messenger and FrameworkBundle 8.0.15 with Console 8.1.8. Temporary dependency changes were restored.
+- `vendor/bin/castor bench --smoke --workload=multi-queue` passes both backends with complete accounting and process cleanup. Broker pickup mode is `notification-wait-any`; Doctrine uses polling. Historical captures remain unchanged.
+- Single-queue smoke confirms the Doctrine consumer does not create a results durability file. Multi-queue smoke confirms both selected transport connections are acquired.
+- Independent review approves the implementation and follow-up fixes. Cross-broker waits remain outside scope.

@@ -13,6 +13,9 @@ use Amp\DeferredFuture;
  * event-loop timeout timer. Positive durations arm a Revolt delay and never compare wall-clock
  * expiry against the controlled clock.
  *
+ * Known watch membership is constructor state. Zero-duration probes start with every selected key
+ * pending and settle false only after each selected queue has a fresh not-ready sample.
+ *
  * @internal
  */
 final class QueueNotifierWaiter
@@ -22,11 +25,21 @@ final class QueueNotifierWaiter
     public ?string $timeoutId = null;
 
     /**
+     * Zero-duration probes settle false only after every selected queue has reported not-ready.
+     *
+     * @var list<string>
+     */
+    public array $pendingProbeKeys;
+
+    /**
      * @param DeferredFuture<bool> $deferred
+     * @param list<string>         $keys     Watch keys this waiter occupies until settlement
      */
     public function __construct(
         public readonly DeferredFuture $deferred,
         public readonly int $durationMilliseconds,
+        public readonly array $keys,
     ) {
+        $this->pendingProbeKeys = 0 === $durationMilliseconds ? $keys : [];
     }
 }

@@ -40,7 +40,7 @@ Read this plan before the assigned task. The task files divide the work; they do
 | [06: Messenger adapter](TASK-06-MESSENGER-ADAPTER.md) | Implemented, PR #7 awaiting user review; not merged. Native consume, serializers, delay/retry mapping. QA 350/2098; isolated 8.0 adapter/native 68/327 | 05 |
 | [07: failure and lifecycle proof](TASK-07-FAILURE-AND-LIFECYCLE-PROOF.md) | Implemented, pending independent review. Four missing reply-loss/active-handler death cases; QA 368/2210. Existing lower-layer proofs reused | 06 |
 | [08: benchmark and MVP acceptance](TASK-08-BENCHMARK-AND-MVP-ACCEPTANCE.md) | Actual A/B comparison, documentation, package acceptance | 02 and 07 |
-| [09: multi-queue WAIT](TASK-09-MULTI-QUEUE-WAIT.md) | Requested. One notification wait across several queues, with native multi-receiver Messenger integration | 05 and 06 |
+| [09: multi-queue WAIT](TASK-09-MULTI-QUEUE-WAIT.md) | Implemented, approved for merge. Bounded WAIT_ANY and native multi-receiver notifications. Foreign-only consumers stay native; benchmark connections match selected receivers. QA 417/2407; smoke passes | 05 and 06 |
 
 Use numeric order by default. Tasks 02 and 03 can proceed independently after Task 01, but freeze the baseline method before candidate tuning. Parallel writers require isolated checkouts and explicit integration ownership; do not overlap performance measurements with unrelated load.
 

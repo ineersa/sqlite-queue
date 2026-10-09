@@ -188,7 +188,6 @@ final class NativeIntegrationTest extends TestCase
             if (null !== $idleTimeout) {
                 $this->assertSame(0, $idleTimeout);
             }
-            $this->assertSame(0, $this->consumeCommand()->getDefinition()->getOption('sleep')->getDefault());
             $this->assertSame(1_000, $this->activeWaitDurationMilliseconds());
             $this->assertSame([], $this->clock?->sleepCalls ?? []);
 
@@ -282,25 +281,45 @@ final class NativeIntegrationTest extends TestCase
         });
     }
 
-    public function testUnrelatedReceiverLeavesSleepDefaultIntact(): void
+    public static function foreignOnlySleepModes(): iterable
     {
-        $this->runAsync(function (): void {
-            $this->startBroker();
-            $command = $this->consumeCommand();
-            $original = $command->getDefinition()->getOption('sleep')->getDefault();
-            $this->eventDispatcher()->addListener(WorkerRunningEvent::class, static function (WorkerRunningEvent $event): void {
-                $event->getWorker()->stop();
-            });
+        yield 'omitted sleep keeps native one-second budget' => [[], 1_000_000];
+        yield 'explicit zero sleep keeps native zero budget' => [['--sleep' => '0'], 0];
+    }
 
-            $exit = $this->runConsume([
+    #[DataProvider('foreignOnlySleepModes')]
+    public function testForeignOnlyReceiverHandlesReadyWorkWithoutExtraFallbackSleep(array $options, int $expectedIdleTimeout): void
+    {
+        $this->runAsync(function () use ($options, $expectedIdleTimeout): void {
+            $this->startBroker();
+            $idleTimeout = null;
+            $this->eventDispatcher()->addListener(WorkerStartedEvent::class, static function (WorkerStartedEvent $event) use (&$idleTimeout): void {
+                if (method_exists($event, 'getIdleTimeout')) {
+                    $idleTimeout = $event->getIdleTimeout();
+                }
+            }, 100);
+            $this->eventDispatcher()->addListener(WorkerRunningEvent::class, function (WorkerRunningEvent $event): void {
+                if (!$event->isWorkerIdle()) {
+                    return;
+                }
+                // Earlier idle listeners may already wait; advancing past 1s exposes any extra fallback sleep.
+                $this->clock?->advance(1.5);
+                $this->bootKernel()->getContainer()->get('messenger.transport.sync_probe')
+                    ->send(new Envelope(new NativeProbeMessage('foreign-ready')));
+            }, 0);
+
+            $exit = $this->runConsume($options + [
                 'command' => 'messenger:consume',
                 'receivers' => ['sync_probe'],
                 '--limit' => '1',
-                '--time-limit' => '1',
             ]);
             $this->assertSame(0, $exit);
-            $this->assertSame($original, $command->getDefinition()->getOption('sleep')->getDefault());
+            if (null !== $idleTimeout) {
+                $this->assertSame($expectedIdleTimeout, $idleTimeout);
+            }
+            $this->assertSame(['foreign-ready'], NativeProbeMessageHandler::$handled);
             $this->assertSame(0, $this->notifierWaiterCount());
+            $this->assertSame([], $this->clock?->sleepCalls ?? []);
         });
     }
 
@@ -325,7 +344,6 @@ final class NativeIntegrationTest extends TestCase
             if (null !== $idleTimeout) {
                 $this->assertSame(0, $idleTimeout);
             }
-            $this->assertSame(0, $this->consumeCommand()->getDefinition()->getOption('sleep')->getDefault());
             $this->publisher()->send(new Envelope(new NativeProbeMessage('later'), [new DelayStamp(50)]));
             $timerId = $this->awaitNotifierDeadline($this->now + 50);
             $this->assertFalse(EventLoop::isEnabled($timerId));
@@ -338,32 +356,69 @@ final class NativeIntegrationTest extends TestCase
         });
     }
 
-    public function testRegexLikeExistingNameLeavesNativeMultiReceiverPollingUntouched(): void
+    public function testSameBrokerReceiversShareOneNotificationWaitOnDistinctQueueNames(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker();
+            $idleTimeout = null;
+            $this->eventDispatcher()->addListener(WorkerStartedEvent::class, static function (WorkerStartedEvent $event) use (&$idleTimeout): void {
+                if (method_exists($event, 'getIdleTimeout')) {
+                    $idleTimeout = $event->getIdleTimeout();
+                }
+            }, 100);
+
+            $consume = async(fn (): int => $this->runConsume([
+                'command' => 'messenger:consume',
+                'receivers' => ['async', 'reports'],
+                '--limit' => '1',
+            ]));
+
+            $this->awaitNotifierWaiters(1);
+            if (null !== $idleTimeout) {
+                $this->assertSame(0, $idleTimeout);
+            }
+            $this->assertSame(1_000, $this->activeWaitDurationMilliseconds());
+            $this->assertSame([], $this->clock?->sleepCalls ?? []);
+
+            $reports = new Transport($this->connection(), new QueueName('reports'), new PhpSerializer(), $this->connection(), $this->endpoint);
+            $reports->send(new Envelope(new NativeProbeMessage('shared-wait')));
+            $this->assertSame(0, $consume->await(new TimeoutCancellation(self::SAFETY_SECONDS)));
+            $this->assertSame(['shared-wait'], NativeProbeMessageHandler::$handled);
+            $this->assertSame([], $this->clock?->sleepCalls ?? []);
+        });
+    }
+
+    public function testRegexSelectionUsesMetadataAndFallsBackWhenMixedWithForeignReceivers(): void
     {
         $this->runAsync(function (): void {
             $this->startBroker();
             $selected = [];
+            $idleTimeout = null;
             $command = $this->consumeCommand();
             $original = $command->getDefinition()->getOption('sleep')->getDefault();
-            $this->eventDispatcher()->addListener(WorkerStartedEvent::class, function (WorkerStartedEvent $event) use (&$selected, $command, $original): void {
+            $this->eventDispatcher()->addListener(WorkerStartedEvent::class, static function (WorkerStartedEvent $event) use (&$selected, &$idleTimeout): void {
                 $selected = $event->getWorker()->getMetadata()->getTransportNames();
-                $this->assertSame($original, $command->getDefinition()->getOption('sleep')->getDefault());
                 if (method_exists($event, 'getIdleTimeout')) {
-                    $this->assertSame(1_000_000, $event->getIdleTimeout());
+                    $idleTimeout = $event->getIdleTimeout();
                 }
-            });
+            }, 100);
             $this->publisher()->send(new Envelope(new NativeProbeMessage('regex')));
             $this->assertSame(0, $this->runConsume([
                 'command' => 'messenger:consume', 'receivers' => ['async.alpha'], '--limit' => '1',
             ]));
-            // Native receiver regex expansion was added in Symfony 8.1. The conservative
-            // activation guard also leaves literal dotted names on native polling in 8.0.
+            // Native receiver regex expansion was added in Symfony 8.1 and can include the
+            // foreign in-memory asyncXalpha receiver. Metadata selection then uses the bounded
+            // Clock fallback instead of WAIT. Symfony 8.0 keeps the literal dotted name alone.
             $expected = version_compare(\Composer\InstalledVersions::getVersion('symfony/messenger') ?? '0', '8.1.0', '>=')
                 ? ['async.alpha', 'asyncXalpha']
                 : ['async.alpha'];
             $this->assertSame($expected, $selected);
+            if (null !== $idleTimeout) {
+                $this->assertSame(0, $idleTimeout);
+            }
             $this->assertSame(['regex'], NativeProbeMessageHandler::$handled);
             $this->assertSame(0, $this->notifierWaiterCount());
+            $this->assertSame($original, $command->getDefinition()->getOption('sleep')->getDefault());
         });
     }
 
@@ -513,7 +568,7 @@ final class NativeIntegrationTest extends TestCase
     {
         $this->runAsync(function (): void {
             $this->startBroker();
-            $broken = new Transport($this->connection(), new QueueName('jobs'), new BrokenDecodeSerializer(), $this->connection());
+            $broken = new Transport($this->connection(), new QueueName('jobs'), new BrokenDecodeSerializer(), $this->connection(), $this->endpoint);
             $broken->send(new Envelope(new NativeProbeMessage('ignored')));
 
             if (\is_callable([MessageDecodingFailedException::class, 'wrap'])) {
@@ -648,6 +703,10 @@ final class NativeIntegrationTest extends TestCase
         putenv('NATIVE_ASYNC_DSN='.$dsn);
         $_ENV['NATIVE_ASYNC_DSN'] = $dsn;
         $_SERVER['NATIVE_ASYNC_DSN'] = $dsn;
+        $reports = 'sqlite-queue://reports?endpoint='.rawurlencode($this->endpoint);
+        putenv('NATIVE_REPORTS_DSN='.$reports);
+        $_ENV['NATIVE_REPORTS_DSN'] = $reports;
+        $_SERVER['NATIVE_REPORTS_DSN'] = $reports;
 
         $kernel = new NativeKernel($this->projectDir);
         $kernel->boot();
@@ -677,7 +736,7 @@ final class NativeIntegrationTest extends TestCase
 
     private function publisher(): Transport
     {
-        return new Transport($this->connection(), new QueueName('jobs'), new PhpSerializer(), $this->connection());
+        return new Transport($this->connection(), new QueueName('jobs'), new PhpSerializer(), $this->connection(), $this->endpoint);
     }
 
     private function connection(): BrokerConnection
@@ -750,12 +809,14 @@ final class NativeIntegrationTest extends TestCase
         }
         $notifier = (new \ReflectionProperty(Broker::class, 'notifier'))->getValue($this->broker);
         $waiters = (new \ReflectionProperty(QueueNotifier::class, 'waiters'))->getValue($notifier);
-        $total = 0;
+        $unique = [];
         foreach ($waiters as $list) {
-            $total += \count($list);
+            foreach ($list as $waiter) {
+                $unique[spl_object_id($waiter)] = $waiter;
+            }
         }
 
-        return $total;
+        return \count($unique);
     }
 
     private function activeWaitDurationMilliseconds(): int

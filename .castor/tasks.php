@@ -70,7 +70,7 @@ function test_broker(#[AsOption(description: 'PHPUnit test-name filter.')] ?stri
 #[AsTask(name: 'bench', namespace: '', description: 'Capture a benchmark; save the capture path and progress in the task log.')]
 function bench(
     #[AsOption(description: 'Tiny control-path checks, not performance evidence.')] bool $smoke = false,
-    #[AsOption(description: 'Roundtrip, concurrent, application, idle or retention.')] string $workload = 'roundtrip',
+    #[AsOption(description: 'Roundtrip, concurrent, application, idle, multi-queue or retention.')] string $workload = 'roundtrip',
     #[AsOption(description: 'Measured window in seconds.')] float $duration = 60,
     #[AsOption(description: 'WAL synchronous mode for both backends: normal or full.')] string $synchronous = 'normal',
     #[AsOption(description: 'Doctrine idle poll interval in milliseconds; broker uses WAIT.')] string $pollingMs = '50',

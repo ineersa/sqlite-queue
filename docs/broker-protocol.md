@@ -1,6 +1,6 @@
 # Broker protocol v1
 
-The v1 Unix-socket protocol covers immediate queue operations and bounded WAIT. No operation executes application handlers or accepts SQL or database paths over the socket.
+The v1 Unix-socket protocol covers immediate queue operations and bounded WAIT and WAIT_ANY. No operation executes application handlers or accepts SQL or database paths over the socket.
 
 ## Framing and limits
 
@@ -16,6 +16,8 @@ The first request is `{"v":1,"id":0,"op":"hello"}`. The response confirms v1 and
 
 Operations are `send` with `queue` and nonnegative millisecond `delay`, `receive` with `queue`, `acknowledge` or `reject` with `receipt`, and `wait` with `queue` and integer `wait_ms`. Send uses the raw payload blocks and returns the insertion ID. Receive remains immediate: it returns null or delivery metadata with raw payload blocks and never accepts `wait_ms`. Delivery metadata contains `id`, `queue`, `receipt`, `available_at`, and `reserved_until`. Both timestamps use Unix milliseconds. Settlement returns null. Closing the socket ends a session. Unknown operations and control fields are rejected.
 
+`wait_any` carries `queues` instead of `queue`, plus integer `wait_ms`. It accepts a JSON list of 1 through 16 distinct queue names. Each name follows the same validation as `queue`; empty input, duplicates, non-list input, invalid names, and larger lists are rejected. Sixteen maximum-length names fit within the existing 8,192-byte control limit. Payload blocks must be empty.
+
 ### WAIT
 
 A WAIT request carries `queue` and `wait_ms` only. Both body and headers must be empty. `wait_ms` must be an integer from `0` through `30_000`. Zero is an immediate readiness probe. The successful result is a boolean: `true` is a receive hint, never a reservation; `false` means the bound elapsed without a readiness hint. The reply carries no payload.
@@ -25,6 +27,10 @@ WAIT-specific validation rejects negative, oversized, non-integer, or missing `w
 Persisted availability and visibility deadlines use Unix wall-clock milliseconds. WAIT bounds and per-queue deadline delays use Revolt duration timers. The broker converts a future wall-clock deadline into a duration under normal forward clock progression. A backward jump can postpone eligibility and force rearming. A forward jump can make work eligible on the next recheck, but an already armed monotonic timer is not moved earlier, so a wake hint may arrive late until another recheck, mutation, or WAIT. This is not a realtime or latency guarantee, and there is no separate scheduler service.
 
 The broker schedules wakeups for watched queues from persisted eligibility deadlines. Committed mutations trigger a readiness recheck. Restart rebuilds scheduling from storage. Timeout, cancellation, disconnect, and shutdown remove the affected waiters and timers.
+
+WAIT_ANY uses the same timeout, boolean response, disconnect handling, and per-queue timers as WAIT. It registers every selected queue before checking readiness. A ready queue completes the whole request and removes every registration. Zero duration returns false only after all selected queues have been checked without a readiness hint. The reply does not identify a queue or choose one to claim. Consumers retain their own receive order.
+
+Single-queue WAIT remains unchanged. Older v1 brokers reject `wait_any` as `invalid_request`; the client fails explicitly and does not retry or downgrade to polling. Upgrade the broker before enabling multi-queue notification consumers.
 
 General errors are `invalid_request`, `unsupported_protocol_version`, `frame_too_large`, `invalid_queue_name`, and `broker_shutting_down`. Receipt errors are listed below. Malformed traffic ends the connection after a bounded error response when framing permits one. Storage failures are treated conservatively as uncertain outcomes, terminate service, and never trigger replay. Default diagnostics contain error categories, not payloads or worker exception text.
 

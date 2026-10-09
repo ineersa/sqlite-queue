@@ -356,6 +356,9 @@ final class Broker
         if (Operation::Wait === $operation) {
             return $this->awaitReadiness($request, $socket, $lifetime, $id);
         }
+        if (Operation::WaitAny === $operation) {
+            return $this->awaitAnyReadiness($request, $socket, $lifetime, $id);
+        }
         throw new ProtocolException(ErrorCode::InvalidRequest, 'Unsupported operation.');
     }
 
@@ -410,20 +413,28 @@ final class Broker
     {
         $this->assertNoPayload($request);
         $name = $this->queueName($request->control[ControlField::Queue->value] ?? null);
-        $timeout = $request->control[ControlField::WaitMilliseconds->value] ?? null;
-        if (!\is_int($timeout)) {
-            throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid wait timeout.');
-        }
-        if ($timeout < 0) {
-            throw new ProtocolException(ErrorCode::InvalidRequest, 'Wait timeout must be nonnegative milliseconds.');
-        }
-        if ($timeout > Limits::MAX_WAIT_MILLISECONDS) {
-            throw new ProtocolException(ErrorCode::InvalidRequest, 'Wait timeout exceeds the protocol maximum.');
-        }
+        $timeout = $this->waitTimeout($request);
 
+        return $this->runWait($id, $socket, $lifetime, 'WAIT', fn (Cancellation $waitCancellation): bool => $this->notifier->wait($name, $timeout, $waitCancellation));
+    }
+
+    private function awaitAnyReadiness(Frame $request, Socket $socket, Cancellation $lifetime, int $id): Frame
+    {
+        $this->assertNoPayload($request);
+        $queues = $this->waitQueues($request->control[ControlField::Queues->value] ?? null);
+        $timeout = $this->waitTimeout($request);
+
+        return $this->runWait($id, $socket, $lifetime, 'WAIT_ANY', fn (Cancellation $waitCancellation): bool => $this->notifier->waitAny($queues, $timeout, $waitCancellation));
+    }
+
+    /**
+     * @param \Closure(Cancellation): bool $wait
+     */
+    private function runWait(int $id, Socket $socket, Cancellation $lifetime, string $label, \Closure $wait): Frame
+    {
         $monitor = new DeferredCancellation();
         $waitCancellation = new CompositeCancellation($lifetime, $monitor->getCancellation());
-        $monitorFuture = async(static function () use ($socket, $monitor, $lifetime): void {
+        $monitorFuture = async(static function () use ($socket, $monitor, $lifetime, $label): void {
             try {
                 $chunk = $socket->read(new CompositeCancellation($lifetime, $monitor->getCancellation()));
             } catch (CancelledException) {
@@ -438,11 +449,11 @@ final class Broker
 
                 return;
             }
-            $monitor->cancel(new ProtocolException(ErrorCode::InvalidRequest, 'Pipelined bytes during WAIT are not allowed.'));
+            $monitor->cancel(new ProtocolException(ErrorCode::InvalidRequest, 'Pipelined bytes during '.$label.' are not allowed.'));
         });
 
         try {
-            $ready = $this->notifier->wait($name, $timeout, $waitCancellation);
+            $ready = $wait($waitCancellation);
             $waitCancellation->throwIfRequested();
         } catch (CancelledException $error) {
             $previous = $error->getPrevious();
@@ -450,12 +461,12 @@ final class Broker
                 throw $previous;
             }
             if ($this->stopping) {
-                throw new ClientContextClosedException('The broker stopped during WAIT.', previous: $error);
+                throw new ClientContextClosedException('The broker stopped during '.$label.'.', previous: $error);
             }
             if ($lifetime->isRequested()) {
                 throw new ClientContextClosedException('The client connection lifetime was cancelled.', previous: $error);
             }
-            throw new ClientContextClosedException('The client connection closed during WAIT.', previous: $error);
+            throw new ClientContextClosedException('The client connection closed during '.$label.'.', previous: $error);
         } finally {
             $monitor->cancel();
             try {
@@ -466,6 +477,53 @@ final class Broker
         }
 
         return self::ok($id, $ready);
+    }
+
+    private function waitTimeout(Frame $request): int
+    {
+        $timeout = $request->control[ControlField::WaitMilliseconds->value] ?? null;
+        if (!\is_int($timeout)) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid wait timeout.');
+        }
+        if ($timeout < 0) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Wait timeout must be nonnegative milliseconds.');
+        }
+        if ($timeout > Limits::MAX_WAIT_MILLISECONDS) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'Wait timeout exceeds the protocol maximum.');
+        }
+
+        return $timeout;
+    }
+
+    /**
+     * @return list<QueueName>
+     */
+    private function waitQueues(mixed $queues): array
+    {
+        if (!\is_array($queues)) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'WAIT_ANY queues must be an array.');
+        }
+        if ([] === $queues) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'WAIT_ANY requires at least one queue.');
+        }
+        if (\count($queues) > Limits::MAX_WAIT_QUEUES) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'WAIT_ANY exceeds the maximum queue count.');
+        }
+        if (false === array_is_list($queues)) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'WAIT_ANY queues must be a list.');
+        }
+        $selected = [];
+        $seen = [];
+        foreach ($queues as $queue) {
+            $name = $this->queueName($queue);
+            if (isset($seen[$name->value])) {
+                throw new ProtocolException(ErrorCode::InvalidRequest, 'WAIT_ANY queue names must be unique.');
+            }
+            $seen[$name->value] = true;
+            $selected[] = $name;
+        }
+
+        return $selected;
     }
 
     private function settle(Frame $request, Operation $operation, string $ownerId, Cancellation $lifetime, int $id): Frame

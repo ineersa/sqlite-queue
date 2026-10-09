@@ -4,25 +4,27 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Messenger\DTO;
 
+use Amp\Cancellation;
 use Amp\DeferredCancellation;
-use Ineersa\SqliteQueue\Messenger\Transport;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Messenger\Worker;
 
 /**
- * Initialized wait state for one native messenger:consume invocation.
+ * Initialized idle wait for one native messenger:consume invocation.
  *
- * Constructed only after WorkerStartedEvent confirms the selected receiver and idleTimeout 0.
- * deadline null means the consume run has no --time-limit; WAIT then uses only the wait budget.
+ * Constructed after WorkerStartedEvent confirms the selection activated a wait and idleTimeout is
+ * 0. wait is a fully initialized Closure for either shared broker WAIT or the bounded Clock
+ * fallback used when our transports mix with foreign receivers. deadline null means the consume
+ * run has no --time-limit; WAIT then uses only the wait budget.
  */
 final class ConsumeWaitSessionDTO
 {
+    /**
+     * @param \Closure(int, Cancellation): bool $wait
+     */
     public function __construct(
         public readonly Command $command,
-        public readonly Transport $transport,
-        public readonly string $receiverName,
-        public readonly int|string|float|bool|null $originalSleepDefault,
-        public readonly bool $sleepDefaultMutated,
+        public readonly \Closure $wait,
         public readonly DeferredCancellation $stop,
         public readonly int $waitBudgetMilliseconds,
         public readonly ?float $deadline,

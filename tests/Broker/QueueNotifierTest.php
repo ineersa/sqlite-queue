@@ -12,6 +12,7 @@ use Amp\TimeoutCancellation;
 use Ineersa\SqliteQueue\Broker\QueueNotifier;
 use Ineersa\SqliteQueue\Broker\QueueNotifierWaiter;
 use Ineersa\SqliteQueue\Broker\QueueNotifierWatch;
+use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTestCase;
@@ -82,6 +83,148 @@ final class QueueNotifierTest extends ProcessTestCase
         });
     }
 
+    public function testWaitAnyWakesForEitherSelectedQueueAndDetachesFromAll(): void
+    {
+        $this->runAsync(function (): void {
+            $queue = $this->open();
+            $notifier = $this->notifier($queue);
+            $jobs = new QueueName('jobs');
+            $other = new QueueName('other');
+            $waiting = async(static fn (): bool => $notifier->waitAny([$jobs, $other], 5_000, new TimeoutCancellation(5)));
+            $this->awaitEmptyWatch($notifier, $jobs->value);
+            $this->awaitEmptyWatch($notifier, $other->value);
+            $this->assertSame(['jobs', 'other'], $this->waiterNames($notifier));
+            $queue->send($other, 'wake other');
+            $notifier->notify($other);
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $this->assertSame([], $this->waiterNames($notifier));
+            $this->assertNull($this->watch($notifier, $jobs->value));
+            $this->assertNull($this->watch($notifier, $other->value));
+            $this->assertSame([], $this->failures);
+        });
+    }
+
+    public function testZeroDurationWaitAnyRequiresEveryQueueNotReady(): void
+    {
+        $this->runAsync(function (): void {
+            $queue = $this->open();
+            $notifier = $this->notifier($queue);
+            $jobs = new QueueName('jobs');
+            $other = new QueueName('other');
+            $this->assertFalse($notifier->waitAny([$jobs, $other], 0, new TimeoutCancellation(5)));
+            $queue->send($other, 'ready');
+            $this->assertTrue($notifier->waitAny([$jobs, $other], 0, new TimeoutCancellation(5)));
+            $this->assertSame([], $this->waiterNames($notifier));
+            $this->assertSame([], $this->failures);
+        });
+    }
+
+    public function testWaitAnyRejectsInvalidQueueListsLocally(): void
+    {
+        $notifier = $this->notifier($this->open());
+        foreach ([
+            [[], 'WAIT_ANY requires at least one queue.'],
+            [[new QueueName('jobs'), new QueueName('jobs')], 'WAIT_ANY queue names must be unique.'],
+            [array_fill(0, Limits::MAX_WAIT_QUEUES + 1, new QueueName('jobs')), \sprintf('WAIT_ANY accepts at most %d queues.', Limits::MAX_WAIT_QUEUES)],
+        ] as [$queues, $message]) {
+            try {
+                $notifier->waitAny($queues, 0, new \Amp\NullCancellation());
+                $this->fail('Invalid WAIT_ANY list must fail locally.');
+            } catch (\InvalidArgumentException $error) {
+                $this->assertSame($message, $error->getMessage());
+            }
+        }
+        $this->assertSame([], $this->waiterNames($notifier));
+    }
+
+    public function testWaitAnyPersistedDeadlineOnSecondQueueWakesWithoutAnotherPublication(): void
+    {
+        $this->runAsync(function (): void {
+            $queue = $this->open();
+            $notifier = $this->notifier($queue);
+            $jobs = new QueueName('jobs');
+            $other = new QueueName('other');
+            $queue->send($other, 'later', delay: 100);
+            $waiting = async(static fn (): bool => $notifier->waitAny([$jobs, $other], 5_000, new TimeoutCancellation(5)));
+            $this->awaitEmptyWatch($notifier, $jobs->value);
+            $timerId = $this->awaitDeadlineTimer($notifier, $other->value, $this->now + 100);
+            $this->assertSame(['jobs', 'other'], $this->waiterNames($notifier));
+            $this->now += 100;
+            $this->fireTimer($timerId);
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $this->assertSame([], $this->waiterNames($notifier));
+            $this->assertNull($this->watch($notifier, $jobs->value));
+            $this->assertNull($this->watch($notifier, $other->value));
+            $this->assertSame([], $this->failures);
+        });
+    }
+
+    public function testOverlappingWaitAnyCancelDetachesOnlyTheCancelledWaiter(): void
+    {
+        $this->runAsync(function (): void {
+            $queue = $this->open();
+            $notifier = $this->notifier($queue);
+            $jobs = new QueueName('jobs');
+            $other = new QueueName('other');
+            $queue->send($other, 'future', delay: 1_000);
+            $firstLifetime = new DeferredCancellation();
+            $first = async(static fn (): bool => $notifier->waitAny([$jobs, $other], 5_000, $firstLifetime->getCancellation()));
+            $second = async(static fn (): bool => $notifier->waitAny([$jobs, $other], 5_000, new TimeoutCancellation(5)));
+            $this->awaitEmptyWatch($notifier, $jobs->value);
+            $timerId = $this->awaitDeadlineTimer($notifier, $other->value, $this->now + 1_000);
+            $this->assertSame(['jobs', 'other'], $this->waiterNames($notifier));
+            $firstLifetime->cancel();
+            try {
+                $first->await(new TimeoutCancellation(5));
+                $this->fail('Cancelled waitAny must fail.');
+            } catch (CancelledException) {
+                $this->addToAssertionCount(1);
+            }
+            $this->assertSame(['jobs', 'other'], $this->waiterNames($notifier));
+            $this->assertSame($timerId, $this->watch($notifier, $other->value)?->timerId);
+            $this->assertFalse($second->isComplete());
+            $this->now += 1_000;
+            $this->fireTimer($timerId);
+            $this->assertTrue($second->await(new TimeoutCancellation(5)));
+            $this->assertSame([], $this->waiterNames($notifier));
+            $this->assertNull($this->watch($notifier, $jobs->value));
+            $this->assertNull($this->watch($notifier, $other->value));
+            $this->assertSame([], $this->failures);
+        });
+    }
+
+    public function testZeroDurationWaitAnyRechecksAfterPublicationWhileSiblingQueryIsSuspended(): void
+    {
+        $this->runAsync(function (): void {
+            $entered = new DeferredFuture();
+            $release = new DeferredFuture();
+            $blockOther = false;
+            $queue = $this->open();
+            $notifier = $this->notifier($queue, static function (QueueName $name) use ($entered, $release, &$blockOther): void {
+                if (!$blockOther || 'other' !== $name->value) {
+                    return;
+                }
+                $blockOther = false;
+                $entered->complete();
+                $release->getFuture()->await(new TimeoutCancellation(5));
+            });
+            $jobs = new QueueName('jobs');
+            $other = new QueueName('other');
+            $blockOther = true;
+            $waiting = async(static fn (): bool => $notifier->waitAny([$jobs, $other], 0, new TimeoutCancellation(5)));
+            $entered->getFuture()->await(new TimeoutCancellation(5));
+            $this->assertFalse($waiting->isComplete(), 'The probe must stay open while a sibling eligibility query is suspended.');
+            $this->open()->send($jobs, 'published after jobs reported empty');
+            $notifier->notify($jobs);
+            $release->complete();
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $this->assertSame([], $this->waiterNames($notifier));
+            $this->assertNull($this->watch($notifier, $jobs->value));
+            $this->assertNull($this->watch($notifier, $other->value));
+            $this->assertSame([], $this->failures);
+        });
+    }
+
     public function testRegistrationBeforeRecheckCannotMissCommittedSend(): void
     {
         $this->runAsync(function (): void {
@@ -89,7 +232,7 @@ final class QueueNotifierTest extends ProcessTestCase
             $release = new DeferredFuture();
             $armed = false;
             $queue = $this->open();
-            $notifier = $this->notifier($queue, static function () use ($entered, $release, &$armed): void {
+            $notifier = $this->notifier($queue, static function (QueueName $name) use ($entered, $release, &$armed): void {
                 if ($armed) {
                     $armed = false;
                     $entered->complete();
@@ -468,7 +611,7 @@ final class QueueNotifierTest extends ProcessTestCase
         $this->notifier = new QueueNotifier(
             static function (QueueName $name, ?Cancellation $cancellation = null) use ($queue, $onEligibility): ?int {
                 if (null !== $onEligibility) {
-                    $onEligibility();
+                    $onEligibility($name);
                 }
 
                 return $queue->earliestEligibility($name, $cancellation);

@@ -8,7 +8,7 @@ Doctrine uses its stock Messenger transport with PHP 8.5 PDO SQLite immediate tr
 
 Both backends use WAL, immediate transactions, a 5000ms busy timeout, and a 3600-second redelivery interval. `--synchronous=normal|full` selects the same mode for both, defaulting to NORMAL. Before measurement, the actual Doctrine transport connections read back their pragmas, and broker readiness reports readback from its owning storage connection. Desired and effective modes are recorded in configuration, manifest, and per-run results. The read-only audit connection is not authoritative for synchronous mode. Do not pool NORMAL and FULL captures.
 
-NORMAL preserves commits across application or process crashes, but OS crashes or power loss can lose recent committed publications or ACKs. Confirmed sends may vanish and ACKed messages may reappear. NORMAL does not guarantee at-least-once across power loss. FULL retains stronger commit durability if storage honors synchronization. Payloads alternate between 256 bytes and 16 KiB. The serializer and payload-validation handler are shared. Broker workers use native single-receiver WAIT integration. Doctrine workers use the named 1ms polling reference.
+NORMAL preserves commits across application or process crashes, but OS crashes or power loss can lose recent committed publications or ACKs. Confirmed sends may vanish and ACKed messages may reappear. NORMAL does not guarantee at-least-once across power loss. FULL retains stronger commit durability if storage honors synchronization. Payloads alternate between 256 bytes and 16 KiB. The serializer and payload-validation handler are shared. Broker workers use native WAIT integration, or WAIT_ANY for the explicit multi-queue workload. Doctrine workers use the recorded `--polling-ms` interval, defaulting to 50 milliseconds.
 
 Outside the concurrent workload, the publisher and observer share a process. Concurrent publishers run in three separate processes. Broker consumers and publishers have no diagnostic SQL connections. The observer audits storage through a separate read-only process after measurement and drain. Resource reports do not pretend that shared publisher and observer costs are isolated product costs.
 
@@ -18,11 +18,14 @@ Outside the concurrent workload, the publisher and observer share a process. Con
 | --- | --- |
 | `roundtrip` | Unloaded public latency with one message in flight. Socket control signals completion without per-message marker files. |
 | `idle` | Connected empty-queue CPU, I/O, and receive activity. Two isolated pickups follow in a separate phase. |
+| `multi-queue` | One stock worker selects two queues in order. An empty interval precedes one isolated arrival per queue. Broker pickup mode is `notification-wait-any`; Doctrine uses polling. |
 | `concurrent` | A released 3,000-message cohort with three publishers and two consumers. Finite drain time, not sustained capacity. |
 | `application` | Execution-to-control result routing with two consumers and declared synchronous handler waiting. |
 | `retention` | At least twenty publish/drain cycles with the same processes and clients, followed by audited-empty memory observations. |
 
 Application offers five workflows/s with 100ms handler work and at most sixteen outstanding workflows. Stalled sends do not trigger catch-up bursts. Actual attempts and completions are recorded; this is not a configurable offered-rate capacity test.
+
+Multi-queue captures explicitly change receiver topology and pickup mode. Do not pool them with historical single-queue or polling-only captures. Smoke checks the control path and accounting, not a latency guarantee or throughput advantage.
 
 Application handlers dispatch correlated results through Messenger. Reports distinguish message ACKs from workflows whose root and result both complete cleanly. The workflow is synthetic. It does not reproduce real LLM latency, external side effects, keepalive incidents, or multi-receiver native selection.
 
