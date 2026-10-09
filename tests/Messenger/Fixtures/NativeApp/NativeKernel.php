@@ -85,6 +85,7 @@ final class NativeKernel extends Kernel
                     'messenger.transport.reports',
                     'messenger.transport.async_terminal',
                     'messenger.transport.async_failure',
+                    'messenger.transport.sync_probe',
                     'messenger.transport.failed',
                     'messenger.default_bus',
                     'event_dispatcher',

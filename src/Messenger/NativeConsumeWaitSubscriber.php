@@ -107,6 +107,7 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         $this->pendingByCommand[$command] = new ConsumeWaitPendingDTO(
             $command,
             $input,
+            $input->getOption('sleep'),
             ExplicitSleep::Omitted === $explicitSleep,
             self::DEFAULT_WAIT_BUDGET_MILLISECONDS,
             $this->timeLimitSeconds($input->getOption('time-limit')),
@@ -130,11 +131,10 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         }
 
         $pending->activated = true;
-        if (!$pending->sleepOmitted || $pending->sleepOptionMutated) {
+        if (!$pending->sleepOmitted) {
             return;
         }
 
-        $pending->originalSleepOption = $pending->input->getOption('sleep');
         $pending->input->setOption('sleep', 0);
         $pending->sleepOptionMutated = true;
     }
@@ -310,7 +310,6 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         }
         $pending->input->setOption('sleep', $pending->originalSleepOption);
         $pending->sleepOptionMutated = false;
-        $pending->originalSleepOption = null;
     }
 
     /**

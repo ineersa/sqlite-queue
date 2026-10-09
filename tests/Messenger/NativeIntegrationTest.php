@@ -281,12 +281,17 @@ final class NativeIntegrationTest extends TestCase
         });
     }
 
-    public function testForeignOnlyReceiverKeepsNativeSleepAndSkipsFallback(): void
+    public static function foreignOnlySleepModes(): iterable
     {
-        $this->runAsync(function (): void {
+        yield 'omitted sleep keeps native one-second budget' => [[], 1_000_000];
+        yield 'explicit zero sleep keeps native zero budget' => [['--sleep' => '0'], 0];
+    }
+
+    #[DataProvider('foreignOnlySleepModes')]
+    public function testForeignOnlyReceiverHandlesReadyWorkWithoutExtraFallbackSleep(array $options, int $expectedIdleTimeout): void
+    {
+        $this->runAsync(function () use ($options, $expectedIdleTimeout): void {
             $this->startBroker();
-            $command = $this->consumeCommand();
-            $original = $command->getDefinition()->getOption('sleep')->getDefault();
             $idleTimeout = null;
             $this->eventDispatcher()->addListener(WorkerStartedEvent::class, static function (WorkerStartedEvent $event) use (&$idleTimeout): void {
                 if (method_exists($event, 'getIdleTimeout')) {
@@ -297,22 +302,22 @@ final class NativeIntegrationTest extends TestCase
                 if (!$event->isWorkerIdle()) {
                     return;
                 }
-                // Simulate an earlier notification listener that already waited and made work ready.
+                // Earlier idle listeners may already wait; advancing past 1s exposes any extra fallback sleep.
                 $this->clock?->advance(1.5);
-                $event->getWorker()->stop();
+                $this->bootKernel()->getContainer()->get('messenger.transport.sync_probe')
+                    ->send(new Envelope(new NativeProbeMessage('foreign-ready')));
             }, 0);
 
-            $exit = $this->runConsume([
+            $exit = $this->runConsume($options + [
                 'command' => 'messenger:consume',
                 'receivers' => ['sync_probe'],
                 '--limit' => '1',
-                '--time-limit' => '1',
             ]);
             $this->assertSame(0, $exit);
             if (null !== $idleTimeout) {
-                $this->assertSame(1_000_000, $idleTimeout);
+                $this->assertSame($expectedIdleTimeout, $idleTimeout);
             }
-            $this->assertSame($original, $command->getDefinition()->getOption('sleep')->getDefault());
+            $this->assertSame(['foreign-ready'], NativeProbeMessageHandler::$handled);
             $this->assertSame(0, $this->notifierWaiterCount());
             $this->assertSame([], $this->clock?->sleepCalls ?? []);
         });

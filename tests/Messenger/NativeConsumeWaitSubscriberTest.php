@@ -134,6 +134,11 @@ final class NativeConsumeWaitSubscriberTest extends TestCase
         $this->assertSame(1, $input->getOption('sleep'));
         $subscriber->onSelectedReceiver('async');
         $this->assertSame(0, $input->getOption('sleep'));
+        $pending = (new \ReflectionProperty($subscriber, 'pendingByCommand'))->getValue($subscriber);
+        foreach ($pending as $state) {
+            $this->assertSame(1, $state->originalSleepOption);
+            $this->assertTrue($state->sleepOptionMutated);
+        }
     }
 
     private function timeout(int $budget, ?float $deadlineOffset): int
