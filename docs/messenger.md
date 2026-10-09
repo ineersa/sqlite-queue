@@ -45,7 +45,9 @@ The adapter reads the receiver set from the started worker's metadata, after nat
 
 Selected transports keep their own operation connections for settlement. A group shares the first selected transport's separate notification connection. Cancelling that wait leaves operation connections available for final batch ACKs.
 
-Explicit positive sleep, such as `--sleep=0.5`, retains native polling. Mixed transport types, different configured endpoints, and sets larger than 16 queues use a bounded Clock sleep fallback. The fallback uses the same 1,000-millisecond budget, shortened by the native time limit, so omitted or zero `--sleep` cannot cause busy polling. Cross-broker notification waiting is not implemented. Older brokers reject WAIT_ANY explicitly; there is no automatic polling downgrade.
+Consumers with no sqlite-queue receivers keep their native sleep options and idle listeners unchanged. The adapter activates only after the stock command resolves a selected sqlite-queue receiver, before the worker captures its sleep option.
+
+Explicit positive sleep, such as `--sleep=0.5`, retains native polling. Selections containing sqlite-queue use a bounded Clock sleep fallback if they mix transport types, use different configured endpoints, or name more than 16 queues. The fallback uses the same 1,000-millisecond budget, shortened by the native time limit, so these selections cannot busy-poll with omitted or zero `--sleep`. Cross-broker notification waiting is not implemented. Older brokers reject WAIT_ANY explicitly; there is no automatic polling downgrade.
 
 Console stop signals cancel an active notification wait. `SIGALRM` remains under native handling. Other idle stop listeners may take up to one additional 1,000-millisecond wait before the worker exits. Message, memory, and time limits remain Messenger's responsibility.
 

@@ -55,7 +55,16 @@ final class Kernel extends BaseKernel
         $container->register(Control::class)->setFactory([Runtime::class, 'control']);
         $container->register(DoctrineFactory::class)->addTag('messenger.transport_factory');
         $container->register(Handler::class)->setArguments([new Reference(Recorder::class), new Reference('messenger.default_bus'), new Reference(Clock::class)])->addTag('messenger.message_handler');
-        $container->register(LifecycleSubscriber::class)->setArguments([new Reference(Recorder::class), new Reference(Control::class), [new Reference(ObservedTransport::class), new Reference(ObservedTransport::class.'.results')]])->addTag('kernel.event_subscriber');
+        $observedTransports = [];
+        foreach (explode(',', Runtime::environment('BENCH_RECEIVER')) as $receiver) {
+            $service = match ($receiver) {
+                'async' => ObservedTransport::class,
+                'results' => ObservedTransport::class.'.results',
+                default => throw new \LogicException('Unknown benchmark receiver: '.$receiver),
+            };
+            $observedTransports[] = new Reference($service);
+        }
+        $container->register(LifecycleSubscriber::class)->setArguments([new Reference(Recorder::class), new Reference(Control::class), $observedTransports])->addTag('kernel.event_subscriber');
         $container->register(ObservedTransport::class)->setPublic(true)->setDecoratedService('messenger.transport.async')->setArguments([new Reference(ObservedTransport::class.'.inner'), new Reference(Recorder::class), new Reference(Control::class), new Reference(Clock::class)]);
         $container->register(ObservedTransport::class.'.results', ObservedTransport::class)->setDecoratedService('messenger.transport.results')->setArguments([new Reference(ObservedTransport::class.'.results.inner'), new Reference(Recorder::class), new Reference(Control::class), new Reference(Clock::class)]);
         $container->addCompilerPass(new class implements CompilerPassInterface {

@@ -21,6 +21,7 @@ use Symfony\Component\DependencyInjection\Reference;
  */
 final class RegisterNativeConsumeWaitSubscriberPass implements CompilerPassInterface
 {
+    // FrameworkBundle's native consume service ID is shared by the supported Symfony 8 versions.
     private const string CONSUME_COMMAND_ID = 'console.command.messenger_consume_messages';
 
     public function process(ContainerBuilder $container): void

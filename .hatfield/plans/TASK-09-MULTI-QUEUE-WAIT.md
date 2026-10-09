@@ -1,6 +1,6 @@
 # Task 09: notification waits across multiple queues
 
-Status: Implemented; pending user review.
+Status: Implemented; user approved merge after the foreign-consumer and benchmark-connection fixes.
 Dependencies: Task 05 notification handling and Task 06 native Messenger integration.
 Requested during Task 08. Creating this task does not authorize changing the ongoing benchmark method or implementing it in the benchmark branch.
 
@@ -44,7 +44,9 @@ Run focused notifier, protocol/client, and native Messenger tests, then Castor f
 
 Validation completed:
 
-- Castor formatting and full QA pass: 415 tests, 2,401 assertions, 25.69 seconds.
+- Castor formatting and full QA pass after the review fixes: 417 tests, 2,407 assertions, about 25 seconds.
 - Isolated Symfony 8.0.15 native integration and subscriber checks pass: 30 tests, 215 assertions. Dependency downgrades were not committed.
+- The activation follow-up passes 32 native/subscriber checks on Symfony Messenger and FrameworkBundle 8.0.15 with Console 8.1.8. Temporary dependency changes were restored.
 - `vendor/bin/castor bench --smoke --workload=multi-queue` passes both backends with complete accounting and process cleanup. Broker pickup mode is `notification-wait-any`; Doctrine uses polling. Historical captures remain unchanged.
+- Single-queue smoke confirms the Doctrine consumer does not create a results durability file. Multi-queue smoke confirms both selected transport connections are acquired.
 - Independent review approves the implementation and follow-up fixes. Cross-broker waits remain outside scope.

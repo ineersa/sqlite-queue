@@ -175,7 +175,7 @@ final class Runner
             }
             $environment = ['BENCH_PROJECT' => $directory, 'BENCH_DATABASE' => $database, 'BENCH_DSN' => Backend::Broker === $backend ? 'sqlite-queue://async?endpoint='.$short.'/broker.sock' : 'doctrine-benchmark://async', 'BENCH_CONTROL' => $short.'/control.sock', 'BENCH_RUN' => basename(\dirname($directory)), 'BENCH_ROLE' => 'consumer', 'BENCH_TELEMETRY' => $directory.'/consumer.operations.jsonl'];
             $environment['BENCH_SYNCHRONOUS'] = $this->options->synchronous->value;
-            $environment['BENCH_RECEIVER'] = 'async';
+            $environment['BENCH_RECEIVER'] = Scenario::MultiQueue === $this->options->scenario ? implode(',', Scenario::MULTI_QUEUE_RECEIVERS) : 'async';
             $environment['BENCH_RESULT_DSN'] = Backend::Broker === $backend ? 'sqlite-queue://results?endpoint='.$short.'/broker.sock' : 'doctrine-benchmark://results';
             $consumer->setEnv(Process::environment($environment));
             $consumer->start();

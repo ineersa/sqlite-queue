@@ -72,6 +72,6 @@ Separate workers also use notifications:
 	php bin/console messenger:consume reports
 ```
 
-Explicit positive `--sleep` retains native polling. `--all` and native selection expansion use notifications when all selected receivers meet the same-broker limit. Mixed transport types, different endpoints, and more than 16 distinct queues use a bounded sleep fallback. See [idle waits](messenger.md#idle-waits).
+Explicit positive `--sleep` retains native polling. `--all` and native selection expansion use notifications when all selected receivers meet the same-broker limit. Selections containing sqlite-queue use a bounded sleep fallback for mixed transport types, different endpoints, or more than 16 distinct queues. Consumers selecting only other transports remain unchanged. See [idle waits](messenger.md#idle-waits).
 
 Transport service resolution works before broker startup, but actual operations require the broker. Use an external supervisor for restarts. After a transport failure, do not replay an unconfirmed operation or reuse its receipt.

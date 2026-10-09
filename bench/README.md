@@ -32,6 +32,8 @@ Time-based workloads default to 60 seconds per backend, about two minutes plus s
 
 `multi-queue` selects `async results` on one stock consumer and publishes one isolated arrival to each queue after an empty interval. Broker pickup uses `notification-wait-any`; Doctrine uses the configured polling interval. Reports name both modes and the changed topology. Earlier single-queue polling captures remain unchanged and are not directly comparable.
 
+Each worker resolves only its selected observed transports. Single-queue consumers do not open an unused results connection; the multi-queue consumer intentionally opens both.
+
 ```sh
 	XDEBUG_MODE=off vendor/bin/castor bench --smoke --workload=multi-queue
 ```
