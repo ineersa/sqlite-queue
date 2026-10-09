@@ -137,6 +137,62 @@ final class QueueNotifierTest extends ProcessTestCase
         $this->assertSame([], $this->waiterNames($notifier));
     }
 
+    public function testWaitAnyPersistedDeadlineOnSecondQueueWakesWithoutAnotherPublication(): void
+    {
+        $this->runAsync(function (): void {
+            $queue = $this->open();
+            $notifier = $this->notifier($queue);
+            $jobs = new QueueName('jobs');
+            $other = new QueueName('other');
+            $queue->send($other, 'later', delay: 100);
+            $waiting = async(static fn (): bool => $notifier->waitAny([$jobs, $other], 5_000, new TimeoutCancellation(5)));
+            $this->awaitEmptyWatch($notifier, $jobs->value);
+            $timerId = $this->awaitDeadlineTimer($notifier, $other->value, $this->now + 100);
+            $this->assertSame(['jobs', 'other'], $this->waiterNames($notifier));
+            $this->now += 100;
+            $this->fireTimer($timerId);
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $this->assertSame([], $this->waiterNames($notifier));
+            $this->assertNull($this->watch($notifier, $jobs->value));
+            $this->assertNull($this->watch($notifier, $other->value));
+            $this->assertSame([], $this->failures);
+        });
+    }
+
+    public function testOverlappingWaitAnyCancelDetachesOnlyTheCancelledWaiter(): void
+    {
+        $this->runAsync(function (): void {
+            $queue = $this->open();
+            $notifier = $this->notifier($queue);
+            $jobs = new QueueName('jobs');
+            $other = new QueueName('other');
+            $queue->send($other, 'future', delay: 1_000);
+            $firstLifetime = new DeferredCancellation();
+            $first = async(static fn (): bool => $notifier->waitAny([$jobs, $other], 5_000, $firstLifetime->getCancellation()));
+            $second = async(static fn (): bool => $notifier->waitAny([$jobs, $other], 5_000, new TimeoutCancellation(5)));
+            $this->awaitEmptyWatch($notifier, $jobs->value);
+            $timerId = $this->awaitDeadlineTimer($notifier, $other->value, $this->now + 1_000);
+            $this->assertSame(['jobs', 'other'], $this->waiterNames($notifier));
+            $firstLifetime->cancel();
+            try {
+                $first->await(new TimeoutCancellation(5));
+                $this->fail('Cancelled waitAny must fail.');
+            } catch (CancelledException) {
+                $this->addToAssertionCount(1);
+            }
+            $this->assertSame(['jobs', 'other'], $this->waiterNames($notifier));
+            $this->assertSame($timerId, $this->watch($notifier, $other->value)?->timerId);
+            $this->assertFalse($second->isComplete());
+            $this->now += 1_000;
+            $this->fireTimer($timerId);
+            $this->assertTrue($second->await(new TimeoutCancellation(5)));
+            $this->assertSame([], $this->waiterNames($notifier));
+            $this->assertNull($this->watch($notifier, $jobs->value));
+            $this->assertNull($this->watch($notifier, $other->value));
+            $this->assertSame([], $this->failures);
+        });
+    }
+
     public function testZeroDurationWaitAnyRechecksAfterPublicationWhileSiblingQueryIsSuspended(): void
     {
         $this->runAsync(function (): void {

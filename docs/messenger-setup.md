@@ -60,7 +60,7 @@ The default reservation lasts 60 seconds. Choose a longer timeout if processing 
 Consume both configured transports with one native worker:
 
 ```sh
-php bin/console messenger:consume email reports
+	php bin/console messenger:consume email reports
 ```
 
 Leave `--sleep` omitted. If both transports use the same endpoint, the idle worker waits for work on either queue for up to 1,000 milliseconds instead of polling. Dispatch each message through your Messenger bus; its configured transport publishes it to the matching queue. Messenger retains the listed receive priority.
@@ -68,8 +68,8 @@ Leave `--sleep` omitted. If both transports use the same endpoint, the idle work
 Separate workers also use notifications:
 
 ```sh
-php bin/console messenger:consume email
-php bin/console messenger:consume reports
+	php bin/console messenger:consume email
+	php bin/console messenger:consume reports
 ```
 
 Explicit positive `--sleep` retains native polling. `--all` and native selection expansion use notifications when all selected receivers meet the same-broker limit. Mixed transport types, different endpoints, and more than 16 distinct queues use a bounded sleep fallback. See [idle waits](messenger.md#idle-waits).

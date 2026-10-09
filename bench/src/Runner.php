@@ -132,10 +132,8 @@ final class Runner
         };
         $boundary(Phase::Boot);
         $broker = new ChildProcess([\PHP_BINARY, $root.'/bin/sqlite-queue', 'broker', '--database='.$database, '--endpoint='.$short.'/broker.sock', '--redeliver-timeout='.Config::REDELIVER_TIMEOUT_S, '--synchronous='.$this->options->synchronous->value, '--no-ansi'], env: Process::environment(), timeout: $this->options->processTimeoutSeconds());
-        $consumerArguments = [\PHP_BINARY, __DIR__.'/console.php', 'messenger:consume', 'async', '--no-ansi', '--no-interaction'];
-        if (Scenario::MultiQueue === $this->options->scenario) {
-            $consumerArguments[] = 'results';
-        }
+        $receivers = Scenario::MultiQueue === $this->options->scenario ? Scenario::MULTI_QUEUE_RECEIVERS : ['async'];
+        $consumerArguments = [\PHP_BINARY, __DIR__.'/console.php', 'messenger:consume', ...$receivers, '--no-ansi', '--no-interaction'];
         if (Backend::Doctrine === $backend) {
             $consumerArguments[] = '--sleep='.($this->options->doctrinePollingMilliseconds / 1000);
         }
@@ -398,7 +396,7 @@ final class Runner
                 $accounting['pickup'] = ['count' => self::WAKEUP_MESSAGES, 'readiness' => $pickupProofs, 'coverage' => 'isolated arrivals after prior ACK and worker idle; no backlog latency or idle-interval goodput claim'];
                 if (Scenario::MultiQueue === $this->options->scenario) {
                     $accounting['pickup']['mode'] = Backend::Broker === $backend ? 'notification-wait-any' : 'polling';
-                    $accounting['pickup']['queues'] = ['async', 'results'];
+                    $accounting['pickup']['queues'] = Scenario::MULTI_QUEUE_RECEIVERS;
                 }
                 if (IntegrityStatus::Pass->value !== $accounting['idle']['integrity_status']) {
                     $accounting['integrity_status'] = IntegrityStatus::Fail->value;
@@ -841,7 +839,7 @@ final class Runner
         $bus->dispatch(Scenario::Application === $this->options->scenario
             ? new ApplicationMessage($id, $phase, $payload, true, workMilliseconds: RunOptionsDTO::HANDLER_MILLISECONDS)
             : new ProbeMessage($id, $phase, $payload, false),
-            Scenario::MultiQueue === $this->options->scenario ? [new TransportNamesStamp([0 === $index % 2 ? 'async' : 'results'])] : [],
+            Scenario::MultiQueue === $this->options->scenario ? [new TransportNamesStamp([Scenario::MULTI_QUEUE_RECEIVERS[$index % \count(Scenario::MULTI_QUEUE_RECEIVERS)]])] : [],
         );
     }
 

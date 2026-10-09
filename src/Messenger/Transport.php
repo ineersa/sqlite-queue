@@ -141,15 +141,13 @@ final class Transport implements TransportInterface, CloseableTransportInterface
     /**
      * Bounded readiness hint across several queues on this transport's notification owner.
      *
-     * Uses Client::waitAny() from the multi-queue protocol slice. True means try get() on the
-     * selected receivers; false is a normal timeout or empty probe.
+     * True means try get() on the selected receivers; false is a normal timeout or empty probe.
      *
      * @param list<string> $queues
      */
     public function waitAny(array $queues, int $timeoutMilliseconds, Cancellation $cancellation): bool
     {
         try {
-            // Client::waitAny lands with the multi-queue protocol slice.
             return $this->notifications->client($cancellation)->waitAny($queues, $timeoutMilliseconds, $cancellation);
         } catch (CancelledException $error) {
             throw new TransportException('Queue wait was cancelled.', 0, $error);

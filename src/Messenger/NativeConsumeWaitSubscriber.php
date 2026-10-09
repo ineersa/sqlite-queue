@@ -45,7 +45,8 @@ use Symfony\Component\Messenger\Worker;
  * Default wait budget is 1000ms, matching the stock Messenger sleep default. The budget is capped
  * by any native --time-limit deadline. Stop listeners may mark the worker stopped before this
  * callback runs; without a public shouldStop getter the worst-case idle stop latency is one wait
- * budget unless ConsoleEvents::SIGNAL cancels first.
+ * budget. ConsoleEvents::SIGNAL can cancel notification waits, but fallback Clock sleep is not
+ * cancellation-aware and may use the whole remaining budget.
  */
 final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
 {
@@ -330,6 +331,7 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         return function (int $timeoutMilliseconds, Cancellation $cancellation): bool {
             try {
                 $cancellation->throwIfRequested();
+                // NativeClock sleep blocks the stock worker; cancellation is checked on return.
                 $this->clock->sleep($timeoutMilliseconds / 1000);
                 $cancellation->throwIfRequested();
             } catch (CancelledException $error) {

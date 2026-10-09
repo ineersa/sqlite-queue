@@ -316,11 +316,7 @@ final class Client
             if (!\is_string($queue)) {
                 throw new \InvalidArgumentException('WAIT_ANY queue names must be strings.');
             }
-            try {
-                $name = new QueueName($queue);
-            } catch (\InvalidArgumentException $error) {
-                throw new \InvalidArgumentException($error->getMessage(), previous: $error);
-            }
+            $name = new QueueName($queue);
             if (isset($seen[$name->value])) {
                 throw new \InvalidArgumentException('WAIT_ANY queue names must be unique.');
             }

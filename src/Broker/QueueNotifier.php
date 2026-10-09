@@ -168,8 +168,6 @@ final class QueueNotifier
                     } catch (\Throwable $error) {
                         foreach ($waiter->keys as $key) {
                             $this->failQueue($key, $error);
-
-                            return;
                         }
                     }
                 });

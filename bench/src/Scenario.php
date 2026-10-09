@@ -13,6 +13,8 @@ enum Scenario: string
     case Retention = 'retention';
     case Concurrent = 'concurrent';
 
+    public const array MULTI_QUEUE_RECEIVERS = ['async', 'results'];
+
     /** @return list<self> */
     public static function core(): array
     {
