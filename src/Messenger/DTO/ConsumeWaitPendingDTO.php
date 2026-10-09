@@ -5,19 +5,27 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Messenger\DTO;
 
 use Symfony\Component\Console\Command\Command;
+use Symfony\Component\Console\Input\InputInterface;
 
 /**
- * Sleep-default mutation captured on ConsoleEvents::COMMAND before WorkerStartedEvent.
+ * Captured messenger:consume invocation waiting for stock receiver selection.
  *
- * Captures only sleep/default and time-limit configuration. Receiver selection and WAIT
- * versus bounded fallback are decided later from WorkerStartedEvent metadata.
+ * ConsoleEvents::COMMAND stores the live input and sleep mode without changing the command's
+ * sleep default. Activation happens when ConsumeReceiverLocator reports the first selected
+ * sqlite-queue Transport, before Worker options read --sleep.
  */
 final class ConsumeWaitPendingDTO
 {
+    public bool $activated = false;
+
+    public bool $sleepOptionMutated = false;
+
+    public int|string|float|bool|null $originalSleepOption = null;
+
     public function __construct(
         public readonly Command $command,
-        public readonly int|string|float|bool|null $originalSleepDefault,
-        public readonly bool $sleepDefaultMutated,
+        public readonly InputInterface $input,
+        public readonly bool $sleepOmitted,
         public readonly int $waitBudgetMilliseconds,
         public readonly ?int $timeLimitSeconds,
     ) {

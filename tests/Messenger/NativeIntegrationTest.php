@@ -188,7 +188,6 @@ final class NativeIntegrationTest extends TestCase
             if (null !== $idleTimeout) {
                 $this->assertSame(0, $idleTimeout);
             }
-            $this->assertSame(0, $this->consumeCommand()->getDefinition()->getOption('sleep')->getDefault());
             $this->assertSame(1_000, $this->activeWaitDurationMilliseconds());
             $this->assertSame([], $this->clock?->sleepCalls ?? []);
 
@@ -282,7 +281,7 @@ final class NativeIntegrationTest extends TestCase
         });
     }
 
-    public function testUnrelatedReceiverUsesBoundedFallbackAndRestoresSleepDefault(): void
+    public function testForeignOnlyReceiverKeepsNativeSleepAndSkipsFallback(): void
     {
         $this->runAsync(function (): void {
             $this->startBroker();
@@ -294,9 +293,14 @@ final class NativeIntegrationTest extends TestCase
                     $idleTimeout = $event->getIdleTimeout();
                 }
             }, 100);
-            $this->eventDispatcher()->addListener(WorkerRunningEvent::class, static function (WorkerRunningEvent $event): void {
+            $this->eventDispatcher()->addListener(WorkerRunningEvent::class, function (WorkerRunningEvent $event): void {
+                if (!$event->isWorkerIdle()) {
+                    return;
+                }
+                // Simulate an earlier notification listener that already waited and made work ready.
+                $this->clock?->advance(1.5);
                 $event->getWorker()->stop();
-            });
+            }, 0);
 
             $exit = $this->runConsume([
                 'command' => 'messenger:consume',
@@ -306,10 +310,11 @@ final class NativeIntegrationTest extends TestCase
             ]);
             $this->assertSame(0, $exit);
             if (null !== $idleTimeout) {
-                $this->assertSame(0, $idleTimeout);
+                $this->assertSame(1_000_000, $idleTimeout);
             }
             $this->assertSame($original, $command->getDefinition()->getOption('sleep')->getDefault());
             $this->assertSame(0, $this->notifierWaiterCount());
+            $this->assertSame([], $this->clock?->sleepCalls ?? []);
         });
     }
 
@@ -334,7 +339,6 @@ final class NativeIntegrationTest extends TestCase
             if (null !== $idleTimeout) {
                 $this->assertSame(0, $idleTimeout);
             }
-            $this->assertSame(0, $this->consumeCommand()->getDefinition()->getOption('sleep')->getDefault());
             $this->publisher()->send(new Envelope(new NativeProbeMessage('later'), [new DelayStamp(50)]));
             $timerId = $this->awaitNotifierDeadline($this->now + 50);
             $this->assertFalse(EventLoop::isEnabled($timerId));
@@ -368,7 +372,6 @@ final class NativeIntegrationTest extends TestCase
             if (null !== $idleTimeout) {
                 $this->assertSame(0, $idleTimeout);
             }
-            $this->assertSame(0, $this->consumeCommand()->getDefinition()->getOption('sleep')->getDefault());
             $this->assertSame(1_000, $this->activeWaitDurationMilliseconds());
             $this->assertSame([], $this->clock?->sleepCalls ?? []);
 

@@ -30,10 +30,11 @@ use Symfony\Component\Messenger\Worker;
 /**
  * Arms bounded idle waits for stock messenger:consume using the receivers WorkerStarted selected.
  *
- * ConsoleEvents::COMMAND only captures sleep/default and time-limit configuration and, when
- * --sleep is omitted, mutates the sleep InputOption default to 0 so Command::run() rebind yields
- * idleTimeout 0. Explicit --sleep=0 arms the same path without mutating the default. Explicit
- * positive --sleep, including fractional values such as 0.5, keeps native polling.
+ * ConsoleEvents::COMMAND only captures the live input, sleep mode, and time-limit configuration.
+ * It does not mutate the sleep InputOption default. ConsumeReceiverLocator reports each selected
+ * receiver before Worker options read --sleep. The first selected sqlite-queue Transport activates
+ * the wait: omitted --sleep binds input sleep=0, and explicit --sleep=0 arms without mutation.
+ * Foreign-only selections keep native sleep handling.
  *
  * WorkerStartedEvent metadata supplies the actual selected receiver names in native priority
  * order after regex/--all/exclusions/interactive selection. When every selected receiver is our
@@ -99,27 +100,43 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         $explicitSleep = $this->explicitSleepSeconds($input->hasParameterOption(['--sleep'], true)
             ? $input->getParameterOption(['--sleep'], false, true)
             : null);
-        if (ExplicitSleep::Positive === $explicitSleep) {
-            return;
-        }
-        if (ExplicitSleep::Invalid === $explicitSleep) {
+        if (ExplicitSleep::Positive === $explicitSleep || ExplicitSleep::Invalid === $explicitSleep) {
             return;
         }
 
-        $option = $command->getDefinition()->getOption('sleep');
-        $originalDefault = $option->getDefault();
-        $mutateDefault = ExplicitSleep::Omitted === $explicitSleep;
-        $pending = new ConsumeWaitPendingDTO(
+        $this->pendingByCommand[$command] = new ConsumeWaitPendingDTO(
             $command,
-            $originalDefault,
-            $mutateDefault,
+            $input,
+            ExplicitSleep::Omitted === $explicitSleep,
             self::DEFAULT_WAIT_BUDGET_MILLISECONDS,
             $this->timeLimitSeconds($input->getOption('time-limit')),
         );
-        $this->pendingByCommand[$command] = $pending;
-        if ($mutateDefault) {
-            $option->setDefault(0);
+    }
+
+    /**
+     * Called by ConsumeReceiverLocator for each selected receiver before Worker options read sleep.
+     */
+    public function onSelectedReceiver(string $name): void
+    {
+        $pending = $this->currentPending();
+        if (null === $pending || $pending->activated) {
+            return;
         }
+        if (!$this->receiverLocator->has($name)) {
+            return;
+        }
+        if (!$this->receiverLocator->get($name) instanceof Transport) {
+            return;
+        }
+
+        $pending->activated = true;
+        if (!$pending->sleepOmitted || $pending->sleepOptionMutated) {
+            return;
+        }
+
+        $pending->originalSleepOption = $pending->input->getOption('sleep');
+        $pending->input->setOption('sleep', 0);
+        $pending->sleepOptionMutated = true;
     }
 
     public function onWorkerStarted(WorkerStartedEvent $event): void
@@ -128,21 +145,23 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         if (null === $pending) {
             return;
         }
+        if (!$pending->activated) {
+            $this->restorePending($pending);
+
+            return;
+        }
 
         $idleTimeout = $this->idleTimeoutMicroseconds($event);
         if (null !== $idleTimeout && 0 !== $idleTimeout) {
-            $this->restoreSleepDefault($pending);
+            $this->restorePending($pending);
 
             return;
         }
 
         $names = $event->getWorker()->getMetadata()->getTransportNames();
-        $wait = $this->buildWait($names);
         $session = new ConsumeWaitSessionDTO(
             $pending->command,
-            $wait,
-            $pending->originalSleepDefault,
-            $pending->sleepDefaultMutated,
+            $this->buildWait($names),
             new DeferredCancellation(),
             $pending->waitBudgetMilliseconds,
             $this->deadline($event, $pending->timeLimitSeconds),
@@ -150,6 +169,7 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         );
         $this->sessionsByWorker[$event->getWorker()] = $session;
         $this->sessionsByCommand[$pending->command] = $session;
+        $this->restorePending($pending);
     }
 
     public function onWorkerRunning(WorkerRunningEvent $event): void
@@ -207,7 +227,6 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         unset($this->sessionsByWorker[$event->getWorker()]);
         unset($this->sessionsByCommand[$session->command]);
         $session->stop->cancel();
-        $this->restoreSleepDefault($session);
     }
 
     public function onConsoleTerminate(ConsoleTerminateEvent $event): void
@@ -228,6 +247,11 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
     {
         if (null === $command) {
             $this->restoreAllPending();
+            foreach ($this->sessionsByCommand as $sessionCommand => $session) {
+                unset($this->sessionsByCommand[$sessionCommand]);
+                unset($this->sessionsByWorker[$session->worker]);
+                $session->stop->cancel();
+            }
 
             return;
         }
@@ -235,7 +259,7 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         $pending = $this->pendingByCommand[$command] ?? null;
         if (null !== $pending) {
             unset($this->pendingByCommand[$command]);
-            $this->restoreSleepDefault($pending);
+            $this->restorePending($pending);
         }
 
         $session = $this->sessionsByCommand[$command] ?? null;
@@ -245,15 +269,23 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         unset($this->sessionsByCommand[$command]);
         unset($this->sessionsByWorker[$session->worker]);
         $session->stop->cancel();
-        $this->restoreSleepDefault($session);
     }
 
     private function restoreAllPending(): void
     {
         foreach ($this->pendingByCommand as $command => $pending) {
             unset($this->pendingByCommand[$command]);
-            $this->restoreSleepDefault($pending);
+            $this->restorePending($pending);
         }
+    }
+
+    private function currentPending(): ?ConsumeWaitPendingDTO
+    {
+        foreach ($this->pendingByCommand as $pending) {
+            return $pending;
+        }
+
+        return null;
     }
 
     private function takePending(): ?ConsumeWaitPendingDTO
@@ -262,7 +294,7 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
             unset($this->pendingByCommand[$command]);
             foreach ($this->pendingByCommand as $extraCommand => $extraPending) {
                 unset($this->pendingByCommand[$extraCommand]);
-                $this->restoreSleepDefault($extraPending);
+                $this->restorePending($extraPending);
             }
 
             return $pending;
@@ -271,11 +303,14 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         return null;
     }
 
-    private function restoreSleepDefault(ConsumeWaitPendingDTO|ConsumeWaitSessionDTO $state): void
+    private function restorePending(ConsumeWaitPendingDTO $pending): void
     {
-        if ($state->sleepDefaultMutated) {
-            $state->command->getDefinition()->getOption('sleep')->setDefault($state->originalSleepDefault);
+        if (!$pending->sleepOptionMutated) {
+            return;
         }
+        $pending->input->setOption('sleep', $pending->originalSleepOption);
+        $pending->sleepOptionMutated = false;
+        $pending->originalSleepOption = null;
     }
 
     /**

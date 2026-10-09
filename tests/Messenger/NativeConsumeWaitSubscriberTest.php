@@ -111,6 +111,31 @@ final class NativeConsumeWaitSubscriberTest extends TestCase
         $this->assertSame([0.1], $clock->sleepCalls);
     }
 
+    public function testSelectedSqliteQueueReceiverActivatesOmittedSleepBeforeWorkerOptions(): void
+    {
+        $factory = new TransportFactory();
+        $serializer = new PhpSerializer();
+        $transport = $factory->createTransport('sqlite-queue://jobs?endpoint=/tmp/sqlite-queue-wait-a.sock', [], $serializer);
+        $subscriber = new NativeConsumeWaitSubscriber(new ServiceLocator([
+            'async' => static fn (): Transport => $transport,
+            'sync' => static fn (): object => new \stdClass(),
+        ]), new MockClock('2026-10-03 00:00:00 UTC'));
+        $command = new \Symfony\Component\Messenger\Command\ConsumeMessagesCommand(
+            new \Symfony\Component\Messenger\RoutableMessageBus(new ServiceLocator([]), new MessageBus()),
+            new ServiceLocator([]),
+            new \Symfony\Component\EventDispatcher\EventDispatcher(),
+        );
+        $input = new \Symfony\Component\Console\Input\ArrayInput([]);
+        $input->bind($command->getDefinition());
+        $event = new \Symfony\Component\Console\Event\ConsoleCommandEvent($command, $input, new \Symfony\Component\Console\Output\NullOutput());
+        $subscriber->onConsoleCommand($event);
+        $this->assertSame(1, $input->getOption('sleep'));
+        $subscriber->onSelectedReceiver('sync');
+        $this->assertSame(1, $input->getOption('sleep'));
+        $subscriber->onSelectedReceiver('async');
+        $this->assertSame(0, $input->getOption('sleep'));
+    }
+
     private function timeout(int $budget, ?float $deadlineOffset): int
     {
         $clock = new MockClock('2026-10-03 00:00:00 UTC');
@@ -118,8 +143,6 @@ final class NativeConsumeWaitSubscriberTest extends TestCase
         $session = new ConsumeWaitSessionDTO(
             new Command('probe'),
             static fn (int $timeoutMilliseconds, $cancellation): bool => false,
-            1000000,
-            false,
             new DeferredCancellation(),
             $budget,
             null === $deadlineOffset ? null : $clock->now()->getTimestamp() + $deadlineOffset,
