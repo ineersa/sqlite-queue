@@ -56,10 +56,12 @@ This patch also avoids constructing a parent-side `SqliteResult` for successful 
 
 - SQL failure or invalid ID before COMMIT leaves the transaction active. The queue's existing catch path rolls it back before returning the failure.
 - COMMIT failure follows the same active-transaction rollback path when the connection remains usable.
-- A lost or malformed reply triggers the existing fail-close path. The transaction becomes inactive locally; the queue does not issue another rollback or replay on that closed connection.
+- An observed transport failure or malformed reply triggers the existing fail-close path. The transaction becomes inactive locally; the queue does not issue another rollback or replay on that closed connection.
 - A missing confirmation means an unknown outcome. The insert may have committed. Local cleanup callbacks do not prove database rollback.
 
-The lost-response behavior was checked by source inspection, not by fault injection. No new deadline, automatic retry, transaction grouping, or checkpoint operation is introduced.
+At this report's measured build, lost-response behavior was checked by source inspection, not by fault injection. A connected worker that silently withholds its reply still inherits an unbounded operation receive. No new deadline, automatic retry, transaction grouping, or checkpoint operation is introduced.
+
+The [INSERT follow-up](2026-10-10-insert-followup.md) records the subsequent error fixes, deterministic fault tests, raw ACK audit, and separate concurrent diagnostic. This report's throughput results remain those of queue `508c356` and driver `27371fb`; they are not measurements of the later error-fixed build.
 
 ## Measurement method
 

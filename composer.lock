@@ -983,12 +983,12 @@
             "source": {
                 "type": "git",
                 "url": "https://github.com/ineersa/amp-sqlite3.git",
-                "reference": "27371fbdcddb39eed0e4449af467adb4b3b6b2b0"
+                "reference": "bbc1053c4ee4ce630876999414dab1d976547711"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/ineersa/amp-sqlite3/zipball/27371fbdcddb39eed0e4449af467adb4b3b6b2b0",
-                "reference": "27371fbdcddb39eed0e4449af467adb4b3b6b2b0",
+                "url": "https://api.github.com/repos/ineersa/amp-sqlite3/zipball/bbc1053c4ee4ce630876999414dab1d976547711",
+                "reference": "bbc1053c4ee4ce630876999414dab1d976547711",
                 "shasum": ""
             },
             "require": {
