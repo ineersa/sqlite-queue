@@ -149,21 +149,13 @@ final class SqliteQueueStorage
             if ($deadline < 0) {
                 throw new \InvalidArgumentException('Availability deadline must be nonnegative.');
             }
-            $result = $transaction->execute(self::INSERT_SQL, [$queue, new SqliteBlob($body), new SqliteBlob($headers), $deadline]);
-            try {
-                $id = $result->getLastInsertId();
-            } finally {
-                $result->close();
-            }
-            if (null === $id) {
-                throw new \RuntimeException('Insert did not return a message identity.');
-            }
-            if ($id <= 0) {
-                throw new \RuntimeException('Insert did not return a positive message identity.');
+            // Experimental internal driver API; this branch is not a production transport option.
+            if (!$transaction instanceof \Fabpot\Amp\Sqlite\Internal\Transaction) {
+                throw new \LogicException('The insert POC requires the driver root transaction.');
             }
 
-            return $id;
-        });
+            return $transaction->executeInsertAndCommit(self::INSERT_SQL, [$queue, new SqliteBlob($body), new SqliteBlob($headers), $deadline]);
+        }, commitInWorker: true);
     }
 
     /**
@@ -281,17 +273,20 @@ final class SqliteQueueStorage
      *
      * @return T
      */
-    private function transaction(\Closure $operation, bool $rollbackEmpty = false): mixed
+    // Ordinary callbacks leave COMMIT to this method; only the insert POC commits in the worker.
+    private function transaction(\Closure $operation, bool $rollbackEmpty = false, bool $commitInWorker = false): mixed
     {
         $lock = $this->mutex->acquire();
         try {
             $transaction = $this->requireConnection()->beginTransaction();
             try {
                 $value = $operation($transaction);
-                if ($rollbackEmpty && null === $value) {
-                    $transaction->rollback();
-                } else {
-                    $transaction->commit();
+                if (!$commitInWorker) {
+                    if ($rollbackEmpty && null === $value) {
+                        $transaction->rollback();
+                    } else {
+                        $transaction->commit();
+                    }
                 }
 
                 return $value;

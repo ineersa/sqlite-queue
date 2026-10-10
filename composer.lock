@@ -983,12 +983,12 @@
             "source": {
                 "type": "git",
                 "url": "https://github.com/ineersa/amp-sqlite3.git",
-                "reference": "593218d4331c40c3abc6de59528e88ce3417b356"
+                "reference": "27371fbdcddb39eed0e4449af467adb4b3b6b2b0"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/ineersa/amp-sqlite3/zipball/593218d4331c40c3abc6de59528e88ce3417b356",
-                "reference": "593218d4331c40c3abc6de59528e88ce3417b356",
+                "url": "https://api.github.com/repos/ineersa/amp-sqlite3/zipball/27371fbdcddb39eed0e4449af467adb4b3b6b2b0",
+                "reference": "27371fbdcddb39eed0e4449af467adb4b3b6b2b0",
                 "shasum": ""
             },
             "require": {
@@ -1063,7 +1063,7 @@
             "support": {
                 "source": "https://github.com/ineersa/amp-sqlite3/tree/development"
             },
-            "time": "2026-10-08T20:43:10+00:00"
+            "time": "2026-10-09T19:07:24+00:00"
         },
         {
             "name": "kelunik/certificate",
