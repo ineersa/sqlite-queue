@@ -5,7 +5,11 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Tests\Queue;
 
 use Amp\DeferredCancellation;
-use Fabpot\Amp\Sqlite\SqliteConnection;
+use Amp\TimeoutCancellation;
+use Fabpot\Amp\Sqlite\SqliteConfig;
+use Fabpot\Amp\Sqlite\SqliteConnector;
+use Fabpot\Amp\Sqlite\SqliteJournalMode;
+use Fabpot\Amp\Sqlite\SqliteQueryError;
 use Ineersa\SqliteQueue\DTO\DeliveryDTO;
 use Ineersa\SqliteQueue\Exception\ClientContextClosedException;
 use Ineersa\SqliteQueue\Exception\ExpiredReceiptException;
@@ -17,15 +21,29 @@ use Ineersa\SqliteQueue\Exception\ReceiptOwnerMismatchException;
 use Ineersa\SqliteQueue\Exception\ReceiptTokenMismatchException;
 use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Queue;
+use Ineersa\SqliteQueue\Sqlite\QueueWorkerProtocol;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
+use Ineersa\SqliteQueue\Tests\Support\ClockFile;
+use Ineersa\SqliteQueue\Tests\Support\ControlledQueueWorkerOperation;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTestCase;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use PHPUnit\Framework\Attributes\DataProvider;
 
+use function Amp\async;
+use function Amp\Socket\listen;
+
 final class QueueTest extends ProcessTestCase
 {
-    private int $now = 1_700_000_000_000;
+    private const int SQLITE_BUSY_CODE = 5;
+    private const int SQLITE_FULL_CODE = 13;
+    private const int SQLITE_ERROR_CODE = 1;
+    private int $now = 1_700_000_000_000 {
+        set {
+            $this->now = $value;
+            ClockFile::set($this->database->path(), $value);
+        }
+    }
     /** @var list<SqliteQueueStorage> */
     private array $storages = [];
 
@@ -180,7 +198,7 @@ final class QueueTest extends ProcessTestCase
         $queue = $this->open();
         $owner = $this->owner();
         $receipt = $this->prepareOperation($queue, $owner, $operation);
-        $replacement = new Queue($this->latestStorage(), clock: fn (): int => $this->now);
+        $replacement = new Queue($this->latestStorage());
         $this->receiptFailure(
             fn () => $this->mutate($replacement, $owner, $receipt, $operation),
             new ReceiptEpochMismatchException(),
@@ -218,7 +236,7 @@ final class QueueTest extends ProcessTestCase
         $owner = $this->owner();
         $receipt = $this->prepareOperation($queue, $owner, 'acknowledge');
         $wrong = $this->differentToken($receipt);
-        $replacement = new Queue($this->latestStorage(), clock: fn (): int => $this->now);
+        $replacement = new Queue($this->latestStorage());
         $this->now += 50;
         $this->receiptFailure(fn () => $replacement->acknowledge($wrong, $this->owner()), new ReceiptOwnerMismatchException());
         $this->receiptFailure(static fn () => $replacement->acknowledge($wrong, $owner), new ReceiptEpochMismatchException());
@@ -236,7 +254,7 @@ final class QueueTest extends ProcessTestCase
         try {
             $queue->acknowledge($receipt, $owner);
             $this->fail('A matching reservation was not deleted.');
-        } catch (\RuntimeException $error) {
+        } catch (SqliteQueryError $error) {
             $this->assertNotInstanceOf(InvalidReceiptException::class, $error);
             $this->assertSame('Settlement DELETE failed despite a matching active reservation.', $error->getMessage());
         }
@@ -264,7 +282,7 @@ final class QueueTest extends ProcessTestCase
         try {
             $queue->acknowledge($receipt, $owner);
             $this->fail('Invalid stored reservation was accepted.');
-        } catch (\RuntimeException $error) {
+        } catch (SqliteQueryError $error) {
             $this->assertNotInstanceOf(InvalidReceiptException::class, $error);
             $this->assertSame($message, $error->getMessage());
         }
@@ -287,21 +305,13 @@ final class QueueTest extends ProcessTestCase
     public function testCancelledContextDoesNotRevokeAnAlreadyStartedSettlement(): void
     {
         $lifetime = $this->lifetime();
-        $settling = false;
-        $storage = $this->openStorage();
-        $this->storages[] = $storage;
-        $queue = new Queue($storage, clock: function () use (&$settling, $lifetime): int {
-            if ($settling) {
-                // This clock runs after transaction acquisition, before the fenced DELETE.
-                $lifetime->cancel();
-            }
-
-            return $this->now;
-        });
+        $queue = $this->open();
         $owner = $this->owner();
         $receipt = $this->prepareOperation($queue, $owner, 'acknowledge');
-        $settling = true;
-        $queue->acknowledge($receipt, $owner, $lifetime->getCancellation());
+        $this->clockGate(
+            static fn () => $queue->acknowledge($receipt, $owner, $lifetime->getCancellation()),
+            static fn () => $lifetime->cancel(),
+        );
         $this->assertTrue($lifetime->getCancellation()->isRequested());
         $this->assertSame(0, $this->scalar('SELECT count(*) FROM queue_messages'));
     }
@@ -328,14 +338,11 @@ final class QueueTest extends ProcessTestCase
     {
         $queue = $this->open();
         $queue->send($this->queueName('jobs'), 'one');
-        $oversized = str_repeat('x', Limits::MAX_PAYLOAD + 1);
-        $this->bindExec('UPDATE queue_messages SET body = ?', $oversized);
         $this->exec('CREATE TRIGGER lose_claim BEFORE UPDATE ON queue_messages BEGIN SELECT RAISE(IGNORE); END;');
         $session = $this->owner();
         $this->assertNull($queue->receive($this->queueName('jobs'), $session));
         $this->assertNull($this->scalar('SELECT reservation_token FROM queue_messages'));
         $this->exec('DROP TRIGGER lose_claim');
-        $this->bindExec('UPDATE queue_messages SET body = ?', 'one');
         $this->assertSame('one', $queue->receive($this->queueName('jobs'), $session)->body);
     }
 
@@ -431,45 +438,47 @@ final class QueueTest extends ProcessTestCase
     {
         $storage = $this->openStorage();
         $this->storages[] = $storage;
-        $observed = null;
-        $id = $storage->insert('jobs', 'delayed', '', function () use (&$observed): int {
-            $this->now += 25;
-            $observed = $this->now;
-
-            return $this->now + 100;
-        });
-        $this->assertSame($observed + 100, $this->scalar('SELECT available_at FROM queue_messages WHERE id = '.$id));
+        $id = $this->clockGate(
+            static fn (): int => $storage->insert('jobs', 'delayed', '', 100),
+            function (): void {
+                $external = new \SQLite3($this->database->path());
+                $external->enableExceptions(true);
+                $external->busyTimeout(0);
+                try {
+                    try {
+                        $external->exec("INSERT INTO queue_messages (queue, body, headers, available_at) VALUES ('blocked', X'', X'', 0)");
+                        $this->fail('Clock must run while BEGIN IMMEDIATE owns the write transaction.');
+                    } catch (\SQLite3Exception) {
+                        $this->assertSame(self::SQLITE_BUSY_CODE, $external->lastErrorCode());
+                    }
+                } finally {
+                    $external->close();
+                }
+                $this->now += 25;
+            },
+        );
+        $this->assertSame($this->now + 100, $this->scalar('SELECT available_at FROM queue_messages WHERE id = '.$id));
     }
 
     public function testReceiveSamplesVisibilityInsideTransaction(): void
     {
         $storage = $this->openStorage();
         $this->storages[] = $storage;
-        $storage->insert('jobs', 'visible', '', fn (): int => $this->now);
-        $observed = null;
-        $claimed = $storage->claim(
-            'jobs',
-            $this->owner(),
-            str_repeat('e', 64),
-            str_repeat('f', 64),
-            function () use (&$observed): int {
-                $this->now += 40;
-                $observed = $this->now;
-
-                return $this->now;
-            },
-            static fn (int $now): int => $now + 50,
+        $storage->insert('jobs', 'visible', '', 0);
+        $claimed = $this->clockGate(
+            fn (): ?array => $storage->claim('jobs', $this->owner(), str_repeat('e', 64), str_repeat('f', 64), 50),
+            function (): void { $this->now += 40; },
         );
         $this->assertNotNull($claimed);
-        $this->assertSame($observed + 50, $claimed['reserved_until']);
-        $this->assertSame($observed + 50, $this->scalar('SELECT reserved_until FROM queue_messages'));
+        $this->assertSame($this->now + 50, $claimed['reserved_until']);
+        $this->assertSame($this->now + 50, $this->scalar('SELECT reserved_until FROM queue_messages'));
     }
 
     public function testClaimRejectsOversizedStoredPayloadBeforeCommit(): void
     {
         $storage = $this->openStorage();
         $this->storages[] = $storage;
-        $storage->insert('jobs', 'ok', '', fn (): int => $this->now);
+        $storage->insert('jobs', 'ok', '', 0);
         $oversized = str_repeat('x', Limits::MAX_PAYLOAD + 1);
         $this->bindExec('UPDATE queue_messages SET body = ?', $oversized);
         try {
@@ -478,13 +487,116 @@ final class QueueTest extends ProcessTestCase
                 $this->owner(),
                 str_repeat('a', 64),
                 str_repeat('b', 64),
-                fn (): int => $this->now,
-                static fn (int $now): int => $now + 50,
+                50,
             );
             $this->fail('Oversized stored payload must fail before commit.');
-        } catch (\RuntimeException $error) {
+        } catch (SqliteQueryError $error) {
             $this->assertSame('Stored message payload exceeds the supported size.', $error->getMessage());
         }
+        $this->assertNull($this->scalar('SELECT reservation_token FROM queue_messages'));
+        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
+    }
+
+    public function testMaximumPayloadFitsWorkerResultIncludingMetadata(): void
+    {
+        $queue = $this->open();
+        $payload = str_repeat("\x00\xff", intdiv(Limits::MAX_PAYLOAD, 2));
+        $half = intdiv(Limits::MAX_PAYLOAD, 2);
+        $owner = $this->owner();
+        foreach ([[$payload, ''], ['', $payload], [substr($payload, 0, $half), substr($payload, $half)]] as [$body, $headers]) {
+            $queue->send($this->queueName(), $body, $headers);
+            $delivery = $queue->receive($this->queueName(), $owner);
+            $this->assertNotNull($delivery);
+            $this->assertSame($body, $delivery->body);
+            $this->assertSame($headers, $delivery->headers);
+            $this->assertSame(Limits::MAX_PAYLOAD, \strlen($delivery->body) + \strlen($delivery->headers));
+            $queue->acknowledge($delivery->receipt, $owner);
+        }
+    }
+
+    public function testSuccessfulLifecycleUsesThreeCompleteWorkerRequests(): void
+    {
+        $queue = $this->open();
+        $connection = (new \ReflectionProperty($this->latestStorage(), 'connection'))->getValue($this->latestStorage());
+        $channel = (new \ReflectionProperty($connection, 'channel'))->getValue($connection);
+        $counter = new \ReflectionProperty($channel, 'nextRequestId');
+        $before = $counter->getValue($channel);
+        $owner = $this->owner();
+        $queue->send($this->queueName(), 'one transaction per operation');
+        $delivery = $queue->receive($this->queueName(), $owner);
+        $this->assertNotNull($delivery);
+        $queue->acknowledge($delivery->receipt, $owner);
+        $this->assertSame($before + 3, $counter->getValue($channel));
+        $this->assertNull($queue->earliestEligibility($this->queueName()));
+        $this->assertSame($before + 4, $counter->getValue($channel));
+    }
+
+    public function testMalformedCommittedApplicationReplyClosesStorageWithoutReplay(): void
+    {
+        $storage = SqliteQueueStorage::open($this->database->path(), workerOperation: \Ineersa\SqliteQueue\Tests\Support\MalformedQueueWorkerOperation::class);
+        $this->storages[] = $storage;
+        try {
+            $storage->insert('jobs', 'committed once', '', 0);
+            $this->fail('Malformed application data must not confirm the mutation.');
+        } catch (\RuntimeException $error) {
+            $this->assertSame('Worker insert reply must contain an integer identity. Outcome may be unknown; storage is closed.', $error->getMessage());
+        }
+        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
+        $connection = (new \ReflectionProperty($storage, 'connection'))->getValue($storage);
+        $this->assertTrue($connection->isClosed());
+        try {
+            $storage->insert('jobs', 'must not run', '', 0);
+            $this->fail('Closed storage must reject a new mutation.');
+        } catch (\RuntimeException $error) {
+            $this->assertSame('Queue storage is closed.', $error->getMessage());
+        }
+        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
+    }
+
+    public function testCloseInterruptsAWorkerWaitingInsideItsTransaction(): void
+    {
+        $queue = $this->open();
+        $storage = $this->latestStorage();
+        $endpoint = $this->database->path('close-clock.sock');
+        $server = listen('unix://'.$endpoint);
+        file_put_contents($this->database->path().'.clock.gate', $endpoint);
+        $future = async(fn (): int => $queue->send($this->queueName(), 'must roll back'));
+        $future->ignore();
+        $peer = $server->accept(new TimeoutCancellation(5));
+        $this->assertNotNull($peer);
+        try {
+            $this->assertSame("acquired\n", $peer->read(new TimeoutCancellation(5)));
+            $budget = new DeferredCancellation();
+            $budget->cancel();
+            $storage->close($budget->getCancellation());
+            try {
+                $future->await(new TimeoutCancellation(5));
+                $this->fail('Interrupted storage must not confirm the mutation.');
+            } catch (\Fabpot\Amp\Sqlite\SqliteConnectionException) {
+                $this->addToAssertionCount(1);
+            }
+            $this->assertSame(0, $this->scalar('SELECT count(*) FROM queue_messages'));
+            $connection = (new \ReflectionProperty($storage, 'connection'))->getValue($storage);
+            $this->assertTrue($connection->isClosed());
+        } finally {
+            $peer->close();
+            $server->close();
+        }
+    }
+
+    public function testOversizedIntermediateResultRollsBackBeforeIgnoredUpdate(): void
+    {
+        $queue = $this->open();
+        $queue->send($this->queueName(), 'bounded');
+        $this->bindExec('UPDATE queue_messages SET body = ?', str_repeat('x', QueueWorkerProtocol::MAXIMUM_RESULT_BYTES + 1));
+        $this->exec('CREATE TRIGGER suppress_update BEFORE UPDATE ON queue_messages BEGIN SELECT RAISE(IGNORE); END');
+        try {
+            $queue->receive($this->queueName(), $this->owner());
+            $this->fail('Oversized intermediate data must be rejected.');
+        } catch (SqliteQueryError $error) {
+            $this->assertSame('Worker operation result exceeds its byte limit', $error->getMessage());
+        }
+        $this->assertNull($this->scalar('SELECT reserved_until FROM queue_messages'));
         $this->assertNull($this->scalar('SELECT reservation_token FROM queue_messages'));
         $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
     }
@@ -493,10 +605,10 @@ final class QueueTest extends ProcessTestCase
     {
         $storage = $this->openStorage();
         $this->storages[] = $storage;
-        $storage->insert('jobs', str_repeat('p', 1024), str_repeat('h', 128), fn (): int => $this->now);
+        $storage->insert('jobs', str_repeat('p', 1024), str_repeat('h', 128), 0);
         $storage->close();
         $connection = (new \ReflectionProperty($storage, 'connection'))->getValue($storage);
-        $this->assertNull($connection);
+        $this->assertTrue($connection->isClosed());
         $this->expectException(\RuntimeException::class);
         $storage->earliestEligibility('jobs');
     }
@@ -519,16 +631,18 @@ final class QueueTest extends ProcessTestCase
     public function testDatabaseFullLeavesConfirmedDataAndAllowsReopen(): void
     {
         $storage = $this->openStorage();
-        $queue = new Queue($storage, 5_000, fn (): int => $this->now);
+        $queue = new Queue($storage, 5_000);
         $this->storages[] = $storage;
         $queue->send($this->queueName('jobs'), 'confirmed');
-        $connection = (new \ReflectionProperty($storage, 'connection'))->getValue($storage);
-        $this->assertInstanceOf(SqliteConnection::class, $connection);
-        $result = $connection->query('PRAGMA page_count');
-        $row = $result->fetchRow();
-        $result->close();
-        $this->assertNotNull($row);
-        $connection->query('PRAGMA max_page_count='.(int) $row['page_count'])->close();
+        $storage->close();
+        ClockFile::configure($this->database->path(), $this->now);
+        $config = (new SqliteConfig($this->database->path()))
+            ->withJournalMode(SqliteJournalMode::Wal)
+            ->withPragma('max_page_count', (int) $this->scalar('PRAGMA page_count'))
+            ->withWorkerOperations([QueueWorkerProtocol::OPERATION_NAME => ControlledQueueWorkerOperation::class]);
+        $storage = SqliteQueueStorage::fromConnection((new SqliteConnector())->connect($config), SqliteSynchronousMode::Normal);
+        $this->storages[] = $storage;
+        $queue = new Queue($storage);
         $failure = null;
         try {
             $queue->send($this->queueName('jobs'), str_repeat('x', 1_000_000));
@@ -536,11 +650,20 @@ final class QueueTest extends ProcessTestCase
             $failure = $error;
         }
         $this->assertNotNull($failure);
-        $cause = $failure;
-        while (null !== $cause->getPrevious()) {
-            $cause = $cause->getPrevious();
-        }
-        $this->assertStringContainsString('full', strtolower($cause->getMessage()));
+        $this->assertInstanceOf(SqliteQueryError::class, $failure);
+        $this->assertSame(\Ineersa\SqliteQueue\Sqlite\QueueSql::INSERT_SQL, $failure->getQuery());
+        $this->assertSame(self::SQLITE_FULL_CODE, $failure->getResultCode());
+        $this->assertSame(self::SQLITE_FULL_CODE, $failure->getExtendedResultCode());
+        $this->assertStringContainsString('full', strtolower($failure->getMessage()));
+        $cleanup = $failure->getPrevious();
+        $this->assertInstanceOf(SqliteQueryError::class, $cleanup);
+        $this->assertSame('ROLLBACK', $cleanup->getQuery());
+        $this->assertSame(self::SQLITE_ERROR_CODE, $cleanup->getResultCode());
+        $this->assertSame(self::SQLITE_ERROR_CODE, $cleanup->getExtendedResultCode());
+        $connection = (new \ReflectionProperty($storage, 'connection'))->getValue($storage);
+        $executor = (new \ReflectionProperty($storage, 'executor'))->getValue($storage);
+        $this->assertTrue($connection->isClosed());
+        $this->assertTrue($executor->isClosed());
         $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
         $storage->close();
         $reopened = $this->open();
@@ -559,6 +682,27 @@ final class QueueTest extends ProcessTestCase
         yield 'claim' => ['receive'];
         yield 'ack' => ['acknowledge'];
         yield 'reject' => ['reject'];
+    }
+
+    private function clockGate(callable $operation, callable $afterAcquisition): mixed
+    {
+        $endpoint = $this->database->path('clock.sock');
+        $server = listen('unix://'.$endpoint);
+        file_put_contents($this->database->path().'.clock.gate', $endpoint);
+        $future = async($operation);
+        $future->ignore();
+        $peer = $server->accept(new TimeoutCancellation(5));
+        $this->assertNotNull($peer);
+        try {
+            $this->assertSame("acquired\n", $peer->read(new TimeoutCancellation(5)));
+            $afterAcquisition();
+        } finally {
+            $peer->write("release\n");
+            $peer->close();
+            $server->close();
+        }
+
+        return $future->await(new TimeoutCancellation(5));
     }
 
     private function owner(): string
@@ -581,12 +725,14 @@ final class QueueTest extends ProcessTestCase
         $storage = $this->openStorage();
         $this->storages[] = $storage;
 
-        return new Queue($storage, $visibility, fn (): int => $this->now);
+        return new Queue($storage, $visibility);
     }
 
     private function openStorage(SqliteSynchronousMode $mode = SqliteSynchronousMode::Normal): SqliteQueueStorage
     {
-        return SqliteQueueStorage::open($this->database->path(), $mode);
+        ClockFile::configure($this->database->path(), $this->now);
+
+        return SqliteQueueStorage::open($this->database->path(), $mode, workerOperation: ControlledQueueWorkerOperation::class);
     }
 
     private function latestStorage(): SqliteQueueStorage

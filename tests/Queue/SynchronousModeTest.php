@@ -5,8 +5,13 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Tests\Queue;
 
 use Fabpot\Amp\Sqlite\SqliteConnection;
+use Fabpot\Amp\Sqlite\SqliteTransactionError;
+use Fabpot\Amp\Sqlite\Worker\Mode;
+use Fabpot\Amp\Sqlite\Worker\OperationExecutor;
+use Ineersa\SqliteQueue\Sqlite\QueueWorkerProtocol;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
+use Ineersa\SqliteQueue\Tests\Support\ConfigurationWorkerOperation;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTestCase;
 use PHPUnit\Framework\Attributes\DataProvider;
 
@@ -20,10 +25,10 @@ final class SynchronousModeTest extends ProcessTestCase
 
     public function testOpenDefaultsToNormal(): void
     {
-        $storage = SqliteQueueStorage::open($this->database->path());
+        $storage = SqliteQueueStorage::open($this->database->path(), workerOperation: ConfigurationWorkerOperation::class);
         try {
             $this->assertSame(SqliteSynchronousMode::Normal, $storage->synchronousMode());
-            $this->assertSame(1, $this->pragma($storage, 'synchronous'));
+            $this->assertSame(1, $this->synchronousPragma($storage));
         } finally {
             $storage->close();
         }
@@ -32,30 +37,30 @@ final class SynchronousModeTest extends ProcessTestCase
     #[DataProvider('allowedModes')]
     public function testOpenSelectsEffectiveMode(SqliteSynchronousMode $mode, int $expected): void
     {
-        $storage = SqliteQueueStorage::open($this->database->path(), $mode);
+        $storage = SqliteQueueStorage::open($this->database->path(), $mode, workerOperation: ConfigurationWorkerOperation::class);
         try {
             $this->assertSame($mode, $storage->synchronousMode());
-            $this->assertSame($expected, $this->pragma($storage, 'synchronous'));
+            $this->assertSame($expected, $this->synchronousPragma($storage));
         } finally {
             $storage->close();
         }
     }
 
     #[DataProvider('allowedModes')]
-    public function testReadbackRejectsChangedEffectiveMode(SqliteSynchronousMode $mode, int $expected): void
+    public function testExecutorRejectsChangingEffectiveMode(SqliteSynchronousMode $mode, int $expected): void
     {
-        $this->assertSame(SqliteSynchronousMode::Normal === $mode ? 1 : 2, $expected);
-        $storage = SqliteQueueStorage::open($this->database->path(), $mode);
+        $storage = SqliteQueueStorage::open($this->database->path(), $mode, workerOperation: ConfigurationWorkerOperation::class);
         try {
             $connection = (new \ReflectionProperty($storage, 'connection'))->getValue($storage);
             $this->assertInstanceOf(SqliteConnection::class, $connection);
-            $connection->query('PRAGMA synchronous = '.(SqliteSynchronousMode::Normal === $mode ? 'FULL' : 'NORMAL'))->close();
             try {
-                $storage->synchronousMode();
-                $this->fail('Changed effective mode must be rejected.');
-            } catch (\RuntimeException $error) {
-                $this->assertSame('Effective synchronous mode does not match the configured mode.', $error->getMessage());
+                $connection->query('PRAGMA synchronous = '.(SqliteSynchronousMode::Normal === $mode ? 'FULL' : 'NORMAL'))->close();
+                $this->fail('A legacy query must not bypass executor ownership.');
+            } catch (SqliteTransactionError $error) {
+                $this->assertSame('A worker operation executor owns the connection', $error->getMessage());
             }
+            $this->assertSame($mode, $storage->synchronousMode());
+            $this->assertSame($expected, $this->synchronousPragma($storage));
         } finally {
             $storage->close();
         }
@@ -67,18 +72,11 @@ final class SynchronousModeTest extends ProcessTestCase
         SqliteQueueStorage::open(':memory:');
     }
 
-    private function pragma(SqliteQueueStorage $storage, string $name): int
+    private function synchronousPragma(SqliteQueueStorage $storage): int
     {
-        $connection = (new \ReflectionProperty($storage, 'connection'))->getValue($storage);
-        $this->assertInstanceOf(SqliteConnection::class, $connection);
-        $result = $connection->query('PRAGMA '.$name);
-        try {
-            $row = $result->fetchRow();
-            $this->assertNotNull($row);
+        $executor = (new \ReflectionProperty($storage, 'executor'))->getValue($storage);
+        $this->assertInstanceOf(OperationExecutor::class, $executor);
 
-            return (int) $row[$name];
-        } finally {
-            $result->close();
-        }
+        return $executor->run(QueueWorkerProtocol::OPERATION_NAME, [], Mode::ReadOnly)->data['value'];
     }
 }

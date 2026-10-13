@@ -15,6 +15,8 @@ use Ineersa\SqliteQueue\Broker\QueueNotifierWatch;
 use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
+use Ineersa\SqliteQueue\Tests\Support\ClockFile;
+use Ineersa\SqliteQueue\Tests\Support\ControlledQueueWorkerOperation;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTestCase;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use Revolt\EventLoop;
@@ -33,7 +35,12 @@ final class QueueNotifierTest extends ProcessTestCase
     /** @var list<SqliteQueueStorage> */
     private array $storages = [];
     private ?QueueNotifier $notifier = null;
-    private int $now = 1_700_000_000_000;
+    private int $now = 1_700_000_000_000 {
+        set {
+            $this->now = $value;
+            ClockFile::set($this->database->path(), $value);
+        }
+    }
     /** @var list<\Throwable> */
     private array $failures = [];
 
@@ -598,10 +605,11 @@ final class QueueNotifierTest extends ProcessTestCase
 
     private function open(int $visibility = 5000): Queue
     {
-        $storage = SqliteQueueStorage::open($this->database->path());
+        ClockFile::configure($this->database->path(), $this->now);
+        $storage = SqliteQueueStorage::open($this->database->path(), workerOperation: ControlledQueueWorkerOperation::class);
         $this->storages[] = $storage;
 
-        return new Queue($storage, $visibility, fn (): int => $this->now);
+        return new Queue($storage, $visibility);
     }
 
     private function notifier(Queue $queue, ?\Closure $onEligibility = null): QueueNotifier

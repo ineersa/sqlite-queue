@@ -10,6 +10,7 @@ use Ineersa\SqliteQueue\Client;
 use Ineersa\SqliteQueue\Command\BrokerCommand;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeProbeMessage;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\NativeKernel;
+use Ineersa\SqliteQueue\Tests\Support\ClockFile;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -50,6 +51,7 @@ final class BrokerVisibilityTest extends TestCase
         $previousClock = Clock::get();
         Clock::set($clock);
         $now = $clock->now()->getTimestamp() * 1000;
+        ClockFile::configure($fixture->path(), $now);
         $kernel = new NativeKernel($project);
         $kernel->boot();
         $application = new Application($kernel);
@@ -88,9 +90,10 @@ final class BrokerVisibilityTest extends TestCase
                 $this->assertSame($now + $lease, $delivery->reservedUntil);
                 $handled = [];
                 $bus = new MessageBus([new HandleMessageMiddleware(new HandlersLocator([
-                    NativeProbeMessage::class => [function (NativeProbeMessage $message) use ($clock, $competitor, &$handled): void {
+                    NativeProbeMessage::class => [function (NativeProbeMessage $message) use ($clock, $competitor, $fixture, &$handled): void {
                         // Simulate a handler taking longer than the original five-second lease.
                         $clock->modify('+6 seconds');
+                        ClockFile::set($fixture->path(), $clock->now()->getTimestamp() * 1000);
                         $this->assertNull($competitor->receive('jobs'));
                         $handled[] = $message;
                     }],

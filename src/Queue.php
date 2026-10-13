@@ -36,21 +36,14 @@ final class Queue
     private const int RESERVATION_TOKEN_BYTES = 32;
 
     private readonly string $epoch;
-    /** @var \Closure(): int */
-    private readonly \Closure $clock;
 
-    /**
-     * @param \Closure(): int|null $clock wall-clock milliseconds, sampled after transaction acquisition
-     */
     public function __construct(
         private readonly SqliteQueueStorage $storage,
         private readonly int $visibilityTimeout = self::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS,
-        ?\Closure $clock = null,
     ) {
         if ($visibilityTimeout <= 0) {
             throw new \InvalidArgumentException('Visibility timeout must be positive milliseconds.');
         }
-        $this->clock = $clock ?? static fn (): int => (int) floor(microtime(true) * 1000);
         $this->epoch = bin2hex(random_bytes(self::BROKER_EPOCH_BYTES));
     }
 
@@ -70,7 +63,7 @@ final class Queue
             $queue->value,
             $body,
             $headers,
-            fn (): int => $this->deadline($delay),
+            $delay,
         );
     }
 
@@ -87,8 +80,7 @@ final class Queue
             $ownerId,
             $this->epoch,
             $token,
-            $this->now(...),
-            fn (int $now): int => $this->deadline($this->visibilityTimeout, $now),
+            $this->visibilityTimeout,
         );
         if (null === $claimed) {
             return null;
@@ -146,7 +138,6 @@ final class Queue
             $parts[2],
             $ownerId,
             $this->epoch,
-            $this->now(...),
         );
         match ($settled) {
             SettlementResultEnum::Settled => null,
@@ -182,25 +173,5 @@ final class Queue
         ) {
             throw new \InvalidArgumentException('Payload exceeds the supported frame budget.');
         }
-    }
-
-    private function now(): int
-    {
-        $now = ($this->clock)();
-        if ($now < 0) {
-            throw new \InvalidArgumentException('Wall-clock milliseconds must be nonnegative.');
-        }
-
-        return $now;
-    }
-
-    private function deadline(int $milliseconds, ?int $now = null): int
-    {
-        $now ??= $this->now();
-        if ($milliseconds > \PHP_INT_MAX - $now) {
-            throw new \InvalidArgumentException('Deadline exceeds the supported timestamp range.');
-        }
-
-        return $now + $milliseconds;
     }
 }

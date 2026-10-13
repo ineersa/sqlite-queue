@@ -22,6 +22,8 @@ use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\ControllableClock;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Handler\NativeProbeMessageHandler;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeProbeMessage;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\NativeKernel;
+use Ineersa\SqliteQueue\Tests\Support\ClockFile;
+use Ineersa\SqliteQueue\Tests\Support\ControlledQueueWorkerOperation;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -56,7 +58,12 @@ final class NativeIntegrationTest extends TestCase
     private ?Broker $broker = null;
     /** @var Future<int>|null */
     private ?Future $brokerFuture = null;
-    private int $now = 1_700_000_000_000;
+    private int $now = 1_700_000_000_000 {
+        set {
+            $this->now = $value;
+            ClockFile::set($this->database->path(), $value);
+        }
+    }
     private float $workerNow = 1_700_000_000.0;
     private ?ControllableClock $clock = null;
     /** No saved clock exists before setUp acquires the test-only global clock scope. */
@@ -763,11 +770,13 @@ final class NativeIntegrationTest extends TestCase
     {
         $database = $this->database?->path() ?? throw new \LogicException('Missing database.');
         $ready = new DeferredFuture();
+        ClockFile::configure($this->database->path(), $this->now);
         $this->broker = (new BrokerFactory(
             $database,
             $this->endpoint,
             5_000,
             fn (): int => $this->now,
+            workerOperation: ControlledQueueWorkerOperation::class,
         ))->create();
         $this->brokerFuture = async(fn (): int => $this->broker->run(static function (array $event) use ($ready): void {
             if (!$ready->isComplete()) {
