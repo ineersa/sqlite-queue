@@ -747,6 +747,33 @@ final class BrokerTest extends TestCase
         });
     }
 
+    public function testOverflowingDelayEndsOnlyTheInvalidSession(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker(clock: fn (): int => $this->now);
+            $healthy = $this->connectClient();
+            $peer = $this->rawPeer();
+            Frame::write($peer, (new Frame(['v' => Frame::VERSION, 'id' => 0, 'op' => 'hello']))->encode(), new TimeoutCancellation(5));
+            $this->assertNotNull(Frame::read($peer, new TimeoutCancellation(5)));
+            Frame::write($peer, (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'send', 'queue' => 'jobs', 'delay' => \PHP_INT_MAX], 'must not publish'))->encode(), new TimeoutCancellation(5));
+
+            $reply = Frame::read($peer, new TimeoutCancellation(5));
+            $this->assertNotNull($reply);
+            $this->assertSame(1, $reply->control['id']);
+            $this->assertFalse($reply->control['ok']);
+            $this->assertSame(ErrorCode::InvalidRequest->value, $reply->control['error']['code']);
+            $this->assertNull(Frame::read($peer, new TimeoutCancellation(5)));
+
+            $id = $healthy->send('jobs', 'healthy after overflow');
+            $delivery = $healthy->receive('jobs');
+            $this->assertNotNull($delivery);
+            $this->assertSame($id, $delivery->id);
+            $this->assertSame('healthy after overflow', $delivery->body);
+            $healthy->acknowledge($delivery->receipt);
+            $this->assertNull($healthy->receive('jobs'));
+        });
+    }
+
     public function testInvalidQueueNameKeepsSessionAndAdvancesSequence(): void
     {
         $this->runAsync(function (): void {

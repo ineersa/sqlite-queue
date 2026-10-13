@@ -26,18 +26,13 @@ class QueueWorkerOperation implements Operation
     public function run(array $parameters): OperationResultDTO
     {
         $operation = QueueStorageOperation::from(self::string($parameters, 'operation'));
-        $data = match ($operation) {
-            QueueStorageOperation::Insert => ['id' => $this->insert(self::string($parameters, 'queue'), self::string($parameters, 'body'), self::string($parameters, 'headers'), self::integer($parameters, 'delay'))],
-            QueueStorageOperation::Claim => ['message' => $this->claim(self::string($parameters, 'queue'), self::string($parameters, 'owner'), self::string($parameters, 'epoch'), self::string($parameters, 'token'), self::integer($parameters, 'visibility'))],
-            QueueStorageOperation::Settle => ['settlement' => $this->settle(self::integer($parameters, 'id'), self::string($parameters, 'token'), self::string($parameters, 'owner'), self::string($parameters, 'epoch'))->value],
-            QueueStorageOperation::Eligibility => ['ready_at' => $this->eligibility(self::string($parameters, 'queue'))],
-        };
-        $outcome = QueueStorageOperation::Eligibility === $operation ? Outcome::ReadOnly : Outcome::Commit;
-        if (QueueStorageOperation::Claim === $operation && null === $data['message']) {
-            $outcome = Outcome::Rollback;
-        }
 
-        return new OperationResultDTO($outcome, $data);
+        return match ($operation) {
+            QueueStorageOperation::Insert => $this->insert(self::string($parameters, 'queue'), self::string($parameters, 'body'), self::string($parameters, 'headers'), self::integer($parameters, 'delay')),
+            QueueStorageOperation::Claim => $this->claim(self::string($parameters, 'queue'), self::string($parameters, 'owner'), self::string($parameters, 'epoch'), self::string($parameters, 'token'), self::integer($parameters, 'visibility')),
+            QueueStorageOperation::Settle => new OperationResultDTO(Outcome::Commit, ['settlement' => $this->settle(self::integer($parameters, 'id'), self::string($parameters, 'token'), self::string($parameters, 'owner'), self::string($parameters, 'epoch'))->value]),
+            QueueStorageOperation::Eligibility => new OperationResultDTO(Outcome::ReadOnly, ['ready_at' => $this->eligibility(self::string($parameters, 'queue'))]),
+        };
     }
 
     /** @param array<array-key, mixed> $parameters */
@@ -62,9 +57,16 @@ class QueueWorkerOperation implements Operation
         return $value;
     }
 
-    private function insert(string $queue, string $body, string $headers, int $delay): int
+    private function insert(string $queue, string $body, string $headers, int $delay): OperationResultDTO
     {
-        $deadline = DeadlinePolicy::deadline(DeadlinePolicy::now($this->clock), $delay);
+        $now = DeadlinePolicy::now($this->clock);
+        try {
+            $deadline = DeadlinePolicy::deadline($now, $delay);
+        } catch (\InvalidArgumentException) {
+            $error = $delay < 0 ? QueueValidationError::NegativeDelay : QueueValidationError::DeadlineOverflow;
+
+            return new OperationResultDTO(Outcome::Rollback, ['validation_error' => $error->value]);
+        }
         $result = $this->sql->execute(QueueSql::INSERT_SQL, [$queue, new SqliteBlob($body), new SqliteBlob($headers), $deadline]);
         $id = $result['last_insert_id'];
         if (null === $id) {
@@ -74,18 +76,17 @@ class QueueWorkerOperation implements Operation
             throw new \RuntimeException('Insert did not return a positive message identity.');
         }
 
-        return $id;
+        return new OperationResultDTO(Outcome::Commit, ['id' => $id]);
     }
 
-    /** @return ?array{id: int, body: string, headers: string, available_at: int, reserved_until: int} */
-    private function claim(string $queue, string $ownerId, string $epoch, string $token, int $visibility): ?array
+    private function claim(string $queue, string $ownerId, string $epoch, string $token, int $visibility): OperationResultDTO
     {
         $now = DeadlinePolicy::now($this->clock);
         $expires = DeadlinePolicy::deadline($now, $visibility);
         $result = $this->sql->execute(QueueSql::ELIGIBLE_SQL, [$queue, $now, $now]);
         $row = $result['rows'][0] ?? null;
         if (null === $row) {
-            return null;
+            return new OperationResultDTO(Outcome::Rollback, ['message' => null]);
         }
         $body = self::payloadBytes($row['body'] ?? null);
         $headers = self::payloadBytes($row['headers'] ?? null);
@@ -99,7 +100,7 @@ class QueueWorkerOperation implements Operation
         $result = $this->sql->execute(QueueSql::RESERVE_SQL, [$expires, $token, $ownerId, $epoch, $id, $queue, $now, $now]);
         $changed = $result['row_count'];
         if (0 === $changed) {
-            return null;
+            return new OperationResultDTO(Outcome::Rollback, ['message' => null]);
         }
         if (1 !== $changed) {
             throw new \RuntimeException('Reservation UPDATE did not affect exactly one row.');
@@ -112,7 +113,7 @@ class QueueWorkerOperation implements Operation
             throw new \RuntimeException('Stored availability deadline must be nonnegative.');
         }
 
-        return ['id' => $id, 'body' => $body, 'headers' => $headers, 'available_at' => $availableAt, 'reserved_until' => $expires];
+        return new OperationResultDTO(Outcome::Commit, ['message' => ['id' => $id, 'body' => $body, 'headers' => $headers, 'available_at' => $availableAt, 'reserved_until' => $expires]]);
     }
 
     private function settle(int $id, string $token, string $ownerId, string $epoch): SettlementResultEnum

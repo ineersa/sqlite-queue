@@ -11,9 +11,11 @@ use Fabpot\Amp\Sqlite\SqliteJournalMode;
 use Fabpot\Amp\Sqlite\SqliteSynchronousMode as DriverSynchronousMode;
 use Fabpot\Amp\Sqlite\SqliteTransactionMode;
 use Fabpot\Amp\Sqlite\SqliteWorkerOperationConnection;
+use Fabpot\Amp\Sqlite\Worker\DTO\OperationResultDTO;
 use Fabpot\Amp\Sqlite\Worker\Mode;
 use Fabpot\Amp\Sqlite\Worker\Operation;
 use Fabpot\Amp\Sqlite\Worker\OperationExecutor;
+use Fabpot\Amp\Sqlite\Worker\Outcome;
 
 /** Complete queue operations over the driver's exclusively owned serial executor. */
 final class SqliteQueueStorage
@@ -104,7 +106,9 @@ final class SqliteQueueStorage
 
     public function insert(string $queue, string $body, string $headers, int $delay): int
     {
-        $data = $this->run(QueueStorageOperation::Insert, ['queue' => $queue, 'body' => $body, 'headers' => $headers, 'delay' => $delay]);
+        $result = $this->run(QueueStorageOperation::Insert, ['queue' => $queue, 'body' => $body, 'headers' => $headers, 'delay' => $delay]);
+        $this->requireOutcome($result, Outcome::Commit, 'Worker insert reply');
+        $data = $result->data;
         if (!\is_int($data['id'] ?? null)) {
             $this->invalidReply('Worker insert reply must contain an integer identity.');
         }
@@ -115,14 +119,18 @@ final class SqliteQueueStorage
     /** @return ?array{id: int, body: string, headers: string, available_at: int, reserved_until: int} */
     public function claim(string $queue, string $ownerId, string $epoch, string $token, int $visibility): ?array
     {
-        $data = $this->run(QueueStorageOperation::Claim, ['queue' => $queue, 'owner' => $ownerId, 'epoch' => $epoch, 'token' => $token, 'visibility' => $visibility]);
+        $result = $this->run(QueueStorageOperation::Claim, ['queue' => $queue, 'owner' => $ownerId, 'epoch' => $epoch, 'token' => $token, 'visibility' => $visibility]);
+        $data = $result->data;
         if (!\array_key_exists('message', $data)) {
             $this->invalidReply('Worker claim reply is missing its message field.');
         }
         $message = $data['message'];
         if (null === $message) {
+            $this->requireOutcome($result, Outcome::Rollback, 'Worker empty claim reply');
+
             return null;
         }
+        $this->requireOutcome($result, Outcome::Commit, 'Worker populated claim reply');
         if (!\is_array($message)) {
             $this->invalidReply('Worker claim reply must contain a message or null.');
         }
@@ -142,7 +150,9 @@ final class SqliteQueueStorage
 
     public function settle(int $id, string $token, string $ownerId, string $epoch): SettlementResultEnum
     {
-        $data = $this->run(QueueStorageOperation::Settle, ['id' => $id, 'token' => $token, 'owner' => $ownerId, 'epoch' => $epoch]);
+        $result = $this->run(QueueStorageOperation::Settle, ['id' => $id, 'token' => $token, 'owner' => $ownerId, 'epoch' => $epoch]);
+        $this->requireOutcome($result, Outcome::Commit, 'Worker settlement reply');
+        $data = $result->data;
         if (!\is_string($data['settlement'] ?? null)) {
             $this->invalidReply('Worker settlement reply must contain a status.');
         }
@@ -156,7 +166,9 @@ final class SqliteQueueStorage
 
     public function earliestEligibility(string $queue): ?int
     {
-        $data = $this->run(QueueStorageOperation::Eligibility, ['queue' => $queue]);
+        $result = $this->run(QueueStorageOperation::Eligibility, ['queue' => $queue]);
+        $this->requireOutcome($result, Outcome::ReadOnly, 'Worker eligibility reply');
+        $data = $result->data;
         if (!\array_key_exists('ready_at', $data)) {
             $this->invalidReply('Worker eligibility reply is missing its ready_at field.');
         }
@@ -175,6 +187,7 @@ final class SqliteQueueStorage
             return;
         }
         $this->closed = true;
+        $this->executor->close();
         $this->connection->close($cancellation);
     }
 
@@ -184,16 +197,42 @@ final class SqliteQueueStorage
         throw new \RuntimeException($message.' Outcome may be unknown; storage is closed.');
     }
 
-    /** @param array<string, mixed> $parameters
-     * @return array<array-key, mixed>
-     */
-    private function run(QueueStorageOperation $operation, array $parameters): array
+    private function requireOutcome(OperationResultDTO $result, Outcome $expected, string $description): void
+    {
+        if ($result->outcome !== $expected) {
+            $this->invalidReply($description.' must have '.$expected->value.' outcome.');
+        }
+    }
+
+    /** @param array<string, mixed> $parameters */
+    private function run(QueueStorageOperation $operation, array $parameters): OperationResultDTO
     {
         if ($this->closed) {
             throw new \RuntimeException('Queue storage is closed.');
         }
 
-        return $this->executor->run(QueueWorkerProtocol::OPERATION_NAME, ['operation' => $operation->value, ...$parameters], QueueStorageOperation::Eligibility === $operation ? Mode::ReadOnly : Mode::Transaction)->data;
+        $result = $this->executor->run(QueueWorkerProtocol::OPERATION_NAME, ['operation' => $operation->value, ...$parameters], QueueStorageOperation::Eligibility === $operation ? Mode::ReadOnly : Mode::Transaction);
+        if (\array_key_exists('validation_error', $result->data)) {
+            $this->requireOutcome($result, Outcome::Rollback, 'Worker validation reply');
+            if (QueueStorageOperation::Insert !== $operation) {
+                $this->invalidReply('Worker validation reply is only supported for insert.');
+            }
+            if (['validation_error'] !== array_keys($result->data)) {
+                $this->invalidReply('Worker validation reply must not contain success data.');
+            }
+            $code = $result->data['validation_error'];
+            if (!\is_string($code)) {
+                $this->invalidReply('Worker validation error code must be a string.');
+            }
+            $error = QueueValidationError::tryFrom($code);
+            if (null === $error) {
+                $this->invalidReply('Worker validation error code is unknown.');
+            }
+
+            throw new \InvalidArgumentException($error->message());
+        }
+
+        return $result;
     }
 
     private static function scalar(SqliteWorkerOperationConnection $connection, string $sql): mixed
