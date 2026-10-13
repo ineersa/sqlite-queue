@@ -4,7 +4,7 @@
         "Read more about it at https://getcomposer.org/doc/01-basic-usage.md#installing-dependencies",
         "This file is @generated automatically"
     ],
-    "content-hash": "053b32a0b418dac81932ca279292bb30",
+    "content-hash": "3a793723a3e1217b2aaeb44128467569",
     "packages": [
         {
             "name": "amphp/amp",
@@ -979,16 +979,16 @@
         },
         {
             "name": "fabpot/amphp-sqlite3",
-            "version": "dev-experiment/worker-transaction-serial",
+            "version": "dev-development",
             "source": {
                 "type": "git",
                 "url": "https://github.com/ineersa/amp-sqlite3.git",
-                "reference": "cab0a7c550c22ee8e4cd5cdaeddb68f722a62e38"
+                "reference": "2cf3d23e6a4645133954052d7356c19c30a2a7d8"
             },
             "dist": {
                 "type": "zip",
-                "url": "https://api.github.com/repos/ineersa/amp-sqlite3/zipball/cab0a7c550c22ee8e4cd5cdaeddb68f722a62e38",
-                "reference": "cab0a7c550c22ee8e4cd5cdaeddb68f722a62e38",
+                "url": "https://api.github.com/repos/ineersa/amp-sqlite3/zipball/2cf3d23e6a4645133954052d7356c19c30a2a7d8",
+                "reference": "2cf3d23e6a4645133954052d7356c19c30a2a7d8",
                 "shasum": ""
             },
             "require": {
@@ -1061,9 +1061,9 @@
                 "sqlite"
             ],
             "support": {
-                "source": "https://github.com/ineersa/amp-sqlite3/tree/experiment/worker-transaction-serial"
+                "source": "https://github.com/ineersa/amp-sqlite3/tree/development"
             },
-            "time": "2026-10-13T17:35:37+00:00"
+            "time": "2026-10-13T23:34:52+00:00"
         },
         {
             "name": "kelunik/certificate",
