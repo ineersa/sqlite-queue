@@ -167,13 +167,8 @@ final class Runner
                 if (!\is_array($readyData)) {
                     throw new \RuntimeException('Broker readiness lacks resource identities.');
                 }
-                if (($readyData['synchronous_effective'] ?? null) !== $this->options->synchronous->value) {
-                    throw new \RuntimeException('Broker owning connection synchronous readback does not match the selected mode.');
-                }
+                BrokerReadiness::validate($readyData, $this->options);
                 $resources->registerBroker($readyData);
-                if (($readyData['storage_pipeline_depth'] ?? null) !== $this->options->pipelineDepth) {
-                    throw new \RuntimeException('Broker storage pipeline depth does not match the selected depth.');
-                }
                 Runtime::saveJson($directory.'/broker.ready.json', $readyData);
             }
             $environment = ['BENCH_PROJECT' => $directory, 'BENCH_DATABASE' => $database, 'BENCH_DSN' => Backend::Broker === $backend ? 'sqlite-queue://async?endpoint='.$short.'/broker.sock' : 'doctrine-benchmark://async', 'BENCH_CONTROL' => $short.'/control.sock', 'BENCH_RUN' => basename(\dirname($directory)), 'BENCH_ROLE' => 'consumer', 'BENCH_TELEMETRY' => $directory.'/consumer.operations.jsonl'];
@@ -865,9 +860,10 @@ final class Runner
         $desired = $this->options->synchronous->value;
         if (Backend::Broker === $backend) {
             $ready = json_decode((string) file_get_contents($directory.'/broker.ready.json'), true, flags: \JSON_THROW_ON_ERROR);
-            if (($ready['synchronous_effective'] ?? null) !== $desired) {
-                throw new \RuntimeException('Broker owning connection readback mismatch.');
+            if (!\is_array($ready)) {
+                throw new \RuntimeException('Broker owning connection readback must contain an object.');
             }
+            BrokerReadiness::validate($ready, $this->options);
 
             $execution = $ready['storage_execution'] ?? null;
             $authority = match ($execution) {
@@ -877,7 +873,7 @@ final class Runner
                 default => throw new \RuntimeException('Unknown broker storage execution topology.'),
             };
 
-            return ['desired' => $desired, 'effective' => $desired, 'authority' => $authority, 'pid' => $resources->registeredPid('in_process' === $execution ? Role::Broker : Role::Persistence)];
+            return ['desired' => $desired, 'effective' => $desired, 'storage_pipeline_depth' => $ready['storage_pipeline_depth'], 'authority' => $authority, 'pid' => $resources->registeredPid('in_process' === $execution ? Role::Broker : Role::Persistence)];
         }
         $expected = ['publisher.operations.jsonl.async.durability.json', 'consumer.operations.jsonl.async.durability.json'];
         if (Scenario::Application === $this->options->scenario) {

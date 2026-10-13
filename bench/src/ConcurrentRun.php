@@ -53,7 +53,7 @@ final readonly class ConcurrentRun
         try {
             $resources->capture($stage->value);
             if (Backend::Broker === $backend) {
-                $broker = new ChildProcess([\PHP_BINARY, $root.'/bin/sqlite-queue', 'broker', '--database='.$database, '--endpoint='.$short.'/broker.sock', '--redeliver-timeout='.Config::REDELIVER_TIMEOUT_S, '--synchronous='.$this->options->synchronous->value, '--no-ansi'], env: Process::environment(), timeout: Config::STARTUP_TIMEOUT_S);
+                $broker = new ChildProcess([\PHP_BINARY, $root.'/bin/sqlite-queue', 'broker', '--database='.$database, '--endpoint='.$short.'/broker.sock', '--redeliver-timeout='.Config::REDELIVER_TIMEOUT_S, '--synchronous='.$this->options->synchronous->value, '--storage-pipeline-depth='.$this->options->pipelineDepth, '--no-ansi'], env: Process::environment(), timeout: Config::STARTUP_TIMEOUT_S);
                 $processes['broker'] = $broker;
                 $broker->start();
                 if (!$broker->waitUntil(static fn (string $type, string $data): bool => str_contains($data, '"event":"ready"'))) {
@@ -63,9 +63,7 @@ final readonly class ConcurrentRun
                 foreach (explode("\n", $broker->getOutput()) as $line) {
                     $ready = json_decode($line, true);
                     if (\is_array($ready) && 'ready' === ($ready['event'] ?? null)) {
-                        if (($ready['synchronous_effective'] ?? null) !== $this->options->synchronous->value) {
-                            throw new \RuntimeException('Broker durability mismatch.');
-                        }
+                        BrokerReadiness::validate($ready, $this->options);
                         $resources->registerBroker($ready);
                         $durability['broker'] = $ready;
                         Runtime::saveJson($directory.'/broker.ready.json', $ready);
@@ -282,6 +280,9 @@ final readonly class ConcurrentRun
             $accounting['audit_remaining'] = $auditResult['remaining'];
         }
         $accounting['owning_connection_durability'] = [] === $durability ? [] : ['desired' => $this->options->synchronous->value, 'effective' => $this->options->synchronous->value, 'connections' => $durability, 'authority' => 'actual owning connections before cohort release'];
+        if (isset($durability['broker'])) {
+            $accounting['owning_connection_durability']['storage_pipeline_depth'] = $durability['broker']['storage_pipeline_depth'];
+        }
         $accounting['configuration'] = $this->options->configuration();
         $accounting['cleanup'] = $cleanup;
         $accounting['failure'] = $failure;
