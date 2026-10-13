@@ -31,12 +31,14 @@ if ('' === $database || '' === $endpoint || '' === $control || $now < 0) {
     exit(1);
 }
 
+Ineersa\SqliteQueue\Tests\Support\ClockFile::configure($database, $now);
 $broker = (new BrokerFactory(
     $database,
     $endpoint,
     clock: static function () use (&$now): int {
         return $now;
     },
+    workerOperation: Ineersa\SqliteQueue\Tests\Support\ControlledQueueWorkerOperation::class,
 ))->create();
 
 $controlServer = listen('unix://'.$control);
@@ -95,6 +97,7 @@ function controlReply(Broker $broker, int &$now, array $command): array
 function setNow(int &$now, int $value): array
 {
     $now = $value;
+    Ineersa\SqliteQueue\Tests\Support\ClockFile::set($GLOBALS['database'], $value);
 
     return ['now' => $now];
 }

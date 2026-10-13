@@ -21,6 +21,8 @@ use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Tests\Broker\Fixtures\GatingServerSocket;
 use Ineersa\SqliteQueue\Tests\Broker\Fixtures\WriteGate;
+use Ineersa\SqliteQueue\Tests\Support\ClockFile;
+use Ineersa\SqliteQueue\Tests\Support\ControlledQueueWorkerOperation;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\DataProviderExternal;
@@ -46,7 +48,12 @@ final class BrokerTest extends TestCase
     private array $clients = [];
     /** @var list<Socket> */
     private array $peers = [];
-    private int $now = 1_700_000_000_000;
+    private int $now = 1_700_000_000_000 {
+        set {
+            $this->now = $value;
+            ClockFile::set($this->database->path(), $value);
+        }
+    }
 
     protected function setUp(): void
     {
@@ -823,6 +830,7 @@ final class BrokerTest extends TestCase
             $this->endpoint = $database->path('queue.sock');
             $during = null;
             $failure = new \RuntimeException('Readiness callback failure sentinel.');
+            ClockFile::configure($this->database->path(), $this->now);
             $broker = (new BrokerFactory($database->path(), $this->endpoint, 5000, fn (): int => $this->now))->create();
             $future = async(static function () use ($broker, &$during, $failure): int {
                 return $broker->run(static function (array $event) use (&$during, $failure): void {
@@ -1117,11 +1125,13 @@ final class BrokerTest extends TestCase
     {
         $database = $this->database ?? throw new \LogicException('Missing test database.');
         $this->endpoint = $database->path('queue.sock');
+        ClockFile::configure($this->database->path(), $this->now);
         $this->broker = (new BrokerFactory(
             $database->path(),
             $this->endpoint,
             $visibilityTimeout,
             $clock ?? (fn (): int => $this->now),
+            workerOperation: ControlledQueueWorkerOperation::class,
         ))->create();
         $ready = new DeferredFuture();
         $this->brokerFuture = async(fn (): int => $this->broker->run(static function (array $event) use ($ready): void {
@@ -1141,10 +1151,12 @@ final class BrokerTest extends TestCase
     {
         $database = $this->database ?? throw new \LogicException('Missing test database.');
         $this->endpoint = $database->path('queue.sock');
+        ClockFile::configure($this->database->path(), $this->now);
         $original = (new BrokerFactory(
             $database->path(),
             $this->endpoint,
             clock: fn (): int => $this->now,
+            workerOperation: ControlledQueueWorkerOperation::class,
         ))->create();
         $constructor = (new \ReflectionClass(Broker::class))->getConstructor() ?? throw new \LogicException('Missing Broker constructor.');
         $arguments = [];
