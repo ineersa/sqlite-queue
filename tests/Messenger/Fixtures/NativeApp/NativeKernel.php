@@ -65,6 +65,10 @@ final class NativeKernel extends Kernel
                     '$clock',
                     new Reference('ineersa.sqlite_queue.test_clock'),
                 );
+                $container->getDefinition(BrokerCommand::class)->setArgument(
+                    '$workerOperation',
+                    \Ineersa\SqliteQueue\Tests\Support\ControlledQueueWorkerOperation::class,
+                );
                 // Use Symfony's durable, listable failure receiver without an application Doctrine bundle.
                 $dbal = (new \Symfony\Component\DependencyInjection\Definition(\Doctrine\DBAL\Connection::class))
                     ->setFactory([\Doctrine\DBAL\DriverManager::class, 'getConnection'])

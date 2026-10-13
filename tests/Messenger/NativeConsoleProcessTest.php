@@ -14,6 +14,8 @@ use Ineersa\SqliteQueue\Broker\BrokerFactory;
 use Ineersa\SqliteQueue\Broker\QueueNotifier;
 use Ineersa\SqliteQueue\Client;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeProbeMessage;
+use Ineersa\SqliteQueue\Tests\Support\ClockFile;
+use Ineersa\SqliteQueue\Tests\Support\ControlledQueueWorkerOperation;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
 use PHPUnit\Framework\Attributes\RequiresOperatingSystem;
@@ -32,7 +34,12 @@ final class NativeConsoleProcessTest extends TestCase
     private const int SAFETY_SECONDS = 15;
     // Keep reservations live until explicit settlement, independent of subprocess scheduling.
     private const int BROKER_NOW_MILLISECONDS = 1_700_000_000_000;
-    private int $now = self::BROKER_NOW_MILLISECONDS;
+    private int $now = self::BROKER_NOW_MILLISECONDS {
+        set {
+            $this->now = $value;
+            ClockFile::set($this->database(), $value);
+        }
+    }
 
     // Resources may be absent after failed setup; the CLI-broker case has no in-process broker.
     private ?IsolatedDatabase $fixture = null;
@@ -53,6 +60,7 @@ final class NativeConsoleProcessTest extends TestCase
         }
         $this->fixture = new IsolatedDatabase();
         (new Filesystem())->mirror(__DIR__.'/Fixtures/NativeApp/config', $this->project().'/config');
+        ClockFile::configure($this->database(), $this->now);
     }
 
     protected function tearDown(): void
@@ -245,10 +253,12 @@ final class NativeConsoleProcessTest extends TestCase
     private function startBroker(): void
     {
         $database = $this->database();
+        ClockFile::configure($this->database(), $this->now);
         $broker = (new BrokerFactory(
             $database,
             $this->endpoint(),
             clock: fn (): int => $this->now,
+            workerOperation: ControlledQueueWorkerOperation::class,
         ))->create();
         $this->broker = $broker;
         $ready = new DeferredFuture();

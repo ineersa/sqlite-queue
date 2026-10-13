@@ -18,6 +18,8 @@ use Ineersa\SqliteQueue\Messenger\Stamp\DeliveryReceiptStamp;
 use Ineersa\SqliteQueue\Messenger\Transport;
 use Ineersa\SqliteQueue\Protocol\Frame;
 use Ineersa\SqliteQueue\Protocol\Limits;
+use Ineersa\SqliteQueue\Tests\Support\ClockFile;
+use Ineersa\SqliteQueue\Tests\Support\ControlledQueueWorkerOperation;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use PHPUnit\Framework\TestCase;
@@ -46,7 +48,12 @@ final class TransportTest extends TestCase
     private string $endpoint = '';
     /** @var list<Client> */
     private array $clients = [];
-    private int $now = 1_700_000_000_000;
+    private int $now = 1_700_000_000_000 {
+        set {
+            $this->now = $value;
+            ClockFile::set($this->database->path(), $value);
+        }
+    }
 
     protected function setUp(): void
     {
@@ -628,11 +635,13 @@ final class TransportTest extends TestCase
     {
         $database = $this->database ?? throw new \LogicException('Missing test database.');
         $this->endpoint = $database->path('queue.sock');
+        ClockFile::configure($this->database->path(), $this->now);
         $this->broker = (new BrokerFactory(
             $database->path(),
             $this->endpoint,
             $visibilityTimeout,
             clock: fn (): int => $this->now,
+            workerOperation: ControlledQueueWorkerOperation::class,
         ))->create();
         $ready = new DeferredFuture();
         $this->brokerFuture = async(fn (): int => $this->broker->run(static function (array $event) use ($ready): void {

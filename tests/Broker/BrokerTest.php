@@ -21,6 +21,8 @@ use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Tests\Broker\Fixtures\GatingServerSocket;
 use Ineersa\SqliteQueue\Tests\Broker\Fixtures\WriteGate;
+use Ineersa\SqliteQueue\Tests\Support\ClockFile;
+use Ineersa\SqliteQueue\Tests\Support\ControlledQueueWorkerOperation;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\DataProviderExternal;
@@ -46,7 +48,12 @@ final class BrokerTest extends TestCase
     private array $clients = [];
     /** @var list<Socket> */
     private array $peers = [];
-    private int $now = 1_700_000_000_000;
+    private int $now = 1_700_000_000_000 {
+        set {
+            $this->now = $value;
+            ClockFile::set($this->database->path(), $value);
+        }
+    }
 
     protected function setUp(): void
     {
@@ -740,6 +747,33 @@ final class BrokerTest extends TestCase
         });
     }
 
+    public function testOverflowingDelayEndsOnlyTheInvalidSession(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker(clock: fn (): int => $this->now);
+            $healthy = $this->connectClient();
+            $peer = $this->rawPeer();
+            Frame::write($peer, (new Frame(['v' => Frame::VERSION, 'id' => 0, 'op' => 'hello']))->encode(), new TimeoutCancellation(5));
+            $this->assertNotNull(Frame::read($peer, new TimeoutCancellation(5)));
+            Frame::write($peer, (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'send', 'queue' => 'jobs', 'delay' => \PHP_INT_MAX], 'must not publish'))->encode(), new TimeoutCancellation(5));
+
+            $reply = Frame::read($peer, new TimeoutCancellation(5));
+            $this->assertNotNull($reply);
+            $this->assertSame(1, $reply->control['id']);
+            $this->assertFalse($reply->control['ok']);
+            $this->assertSame(ErrorCode::InvalidRequest->value, $reply->control['error']['code']);
+            $this->assertNull(Frame::read($peer, new TimeoutCancellation(5)));
+
+            $id = $healthy->send('jobs', 'healthy after overflow');
+            $delivery = $healthy->receive('jobs');
+            $this->assertNotNull($delivery);
+            $this->assertSame($id, $delivery->id);
+            $this->assertSame('healthy after overflow', $delivery->body);
+            $healthy->acknowledge($delivery->receipt);
+            $this->assertNull($healthy->receive('jobs'));
+        });
+    }
+
     public function testInvalidQueueNameKeepsSessionAndAdvancesSequence(): void
     {
         $this->runAsync(function (): void {
@@ -823,6 +857,7 @@ final class BrokerTest extends TestCase
             $this->endpoint = $database->path('queue.sock');
             $during = null;
             $failure = new \RuntimeException('Readiness callback failure sentinel.');
+            ClockFile::configure($this->database->path(), $this->now);
             $broker = (new BrokerFactory($database->path(), $this->endpoint, 5000, fn (): int => $this->now))->create();
             $future = async(static function () use ($broker, &$during, $failure): int {
                 return $broker->run(static function (array $event) use (&$during, $failure): void {
@@ -1117,11 +1152,13 @@ final class BrokerTest extends TestCase
     {
         $database = $this->database ?? throw new \LogicException('Missing test database.');
         $this->endpoint = $database->path('queue.sock');
+        ClockFile::configure($this->database->path(), $this->now);
         $this->broker = (new BrokerFactory(
             $database->path(),
             $this->endpoint,
             $visibilityTimeout,
             $clock ?? (fn (): int => $this->now),
+            workerOperation: ControlledQueueWorkerOperation::class,
         ))->create();
         $ready = new DeferredFuture();
         $this->brokerFuture = async(fn (): int => $this->broker->run(static function (array $event) use ($ready): void {
@@ -1141,10 +1178,12 @@ final class BrokerTest extends TestCase
     {
         $database = $this->database ?? throw new \LogicException('Missing test database.');
         $this->endpoint = $database->path('queue.sock');
+        ClockFile::configure($this->database->path(), $this->now);
         $original = (new BrokerFactory(
             $database->path(),
             $this->endpoint,
             clock: fn (): int => $this->now,
+            workerOperation: ControlledQueueWorkerOperation::class,
         ))->create();
         $constructor = (new \ReflectionClass(Broker::class))->getConstructor() ?? throw new \LogicException('Missing Broker constructor.');
         $arguments = [];

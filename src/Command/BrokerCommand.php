@@ -5,9 +5,11 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Command;
 
 use Amp\DeferredCancellation;
+use Fabpot\Amp\Sqlite\Worker\Operation;
 use Ineersa\SqliteQueue\Broker\BrokerEventEnum;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
 use Ineersa\SqliteQueue\Queue;
+use Ineersa\SqliteQueue\Sqlite\QueueWorkerOperation;
 use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 use Revolt\EventLoop;
 use Symfony\Component\Clock\Clock;
@@ -36,11 +38,14 @@ final class BrokerCommand extends BaseCommand
      */
     private const float SIGNAL_DISPATCH_INTERVAL_SECONDS = 1.0;
 
-    /** Standalone defaults match queue policy and use the wall clock; injection supports controlled runtime clocks. */
+    /** Standalone defaults use native worker time. The parent clock controls notifier timers.
+     * @param class-string<Operation> $workerOperation
+     */
     public function __construct(
         private readonly int $redeliverTimeoutSeconds = self::DEFAULT_REDELIVER_TIMEOUT_SECONDS,
         private readonly ClockInterface $clock = new Clock(),
         private readonly SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal,
+        private readonly string $workerOperation = QueueWorkerOperation::class,
     ) {
         if ($redeliverTimeoutSeconds <= 0) {
             throw new \InvalidArgumentException('Redelivery timeout must be positive seconds.');
@@ -109,6 +114,7 @@ final class BrokerCommand extends BaseCommand
                 clock: fn (): int => $this->nowMilliseconds(),
                 cancellation: $shutdown->getCancellation(),
                 synchronous: $synchronous,
+                workerOperation: $this->workerOperation,
             ))->create();
             $code = $broker->run(function (array $event) use ($output): void {
                 $this->write($event, $output);
