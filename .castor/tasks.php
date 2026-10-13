@@ -6,6 +6,7 @@ namespace SqliteQueueTasks;
 
 use Castor\Attribute\AsOption;
 use Castor\Attribute\AsTask;
+use Ineersa\SqliteQueue\Sqlite\QueuePipeline;
 use Symfony\Component\Filesystem\Filesystem;
 
 #[AsTask(name: 'composer:validate', namespace: '', description: 'Validate Composer metadata; save output under var/qa.')]
@@ -74,8 +75,9 @@ function bench(
     #[AsOption(description: 'Measured window in seconds.')] float $duration = 60,
     #[AsOption(description: 'WAL synchronous mode for both backends: normal or full.')] string $synchronous = 'normal',
     #[AsOption(description: 'Doctrine idle poll interval in milliseconds; broker uses WAIT.')] string $pollingMs = '50',
+    #[AsOption(description: 'Broker storage pipeline depth, 1..4.')] int $pipelineDepth = QueuePipeline::DEFAULT_DEPTH,
 ): int {
-    $command = [\PHP_BINARY, 'bin/benchmark', 'run', '--no-ansi', '--no-interaction', '--workload='.$workload, '--duration='.$duration, '--synchronous='.$synchronous, '--polling-ms='.$pollingMs];
+    $command = [\PHP_BINARY, 'bin/benchmark', 'run', '--no-ansi', '--no-interaction', '--workload='.$workload, '--duration='.$duration, '--synchronous='.$synchronous, '--polling-ms='.$pollingMs, '--pipeline-depth='.$pipelineDepth];
     if ($smoke) {
         $command[] = '--smoke';
     }

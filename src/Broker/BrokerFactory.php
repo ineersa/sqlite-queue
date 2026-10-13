@@ -7,6 +7,7 @@ namespace Ineersa\SqliteQueue\Broker;
 use Amp\Cancellation;
 use Fabpot\Amp\Sqlite\Worker\Operation;
 use Ineersa\SqliteQueue\Queue;
+use Ineersa\SqliteQueue\Sqlite\QueuePipeline;
 use Ineersa\SqliteQueue\Sqlite\QueueWorkerOperation;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
@@ -40,7 +41,9 @@ final class BrokerFactory
         private readonly ?Cancellation $cancellation = null,
         private readonly SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal,
         private readonly string $workerOperation = QueueWorkerOperation::class,
+        private readonly int $pipelineDepth = QueuePipeline::DEFAULT_DEPTH,
     ) {
+        QueuePipeline::validateDepth($pipelineDepth);
         if ($visibilityTimeout <= 0) {
             throw new \InvalidArgumentException('Visibility timeout must be positive milliseconds.');
         }
@@ -71,7 +74,7 @@ final class BrokerFactory
             }
 
             $this->assertNotCancelled();
-            $storage = SqliteQueueStorage::open($locks->database, $this->synchronous, $this->cancellation, $this->workerOperation);
+            $storage = SqliteQueueStorage::open($locks->database, $this->synchronous, $this->cancellation, $this->workerOperation, $this->pipelineDepth);
             $release[] = $storage->close(...);
             $clock = $this->clock ?? static fn (): int => (int) floor(microtime(true) * 1000);
             $queue = new Queue($storage, $this->visibilityTimeout);

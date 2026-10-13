@@ -9,6 +9,7 @@ use Ineersa\SqliteQueue\Bench\ConcurrentCohort;
 use Ineersa\SqliteQueue\Bench\Config;
 use Ineersa\SqliteQueue\Bench\Runner;
 use Ineersa\SqliteQueue\Bench\Scenario;
+use Ineersa\SqliteQueue\Sqlite\QueuePipeline;
 use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 
 final readonly class RunOptionsDTO
@@ -30,7 +31,9 @@ final readonly class RunOptionsDTO
         public float $durationSeconds,
         public SqliteSynchronousMode $synchronous,
         public int $doctrinePollingMilliseconds = self::DEFAULT_DOCTRINE_POLLING_MILLISECONDS,
+        public int $pipelineDepth = QueuePipeline::DEFAULT_DEPTH,
     ) {
+        QueuePipeline::validateDepth($pipelineDepth);
         if ($doctrinePollingMilliseconds <= 0) {
             throw new \InvalidArgumentException('Doctrine polling interval must be positive milliseconds.');
         }
@@ -60,7 +63,7 @@ final readonly class RunOptionsDTO
     /** @return array<string, mixed> */
     public function configuration(): array
     {
-        $settings = ['workload' => $this->scenario->value, 'mode' => $this->smoke ? 'smoke' : 'measured', 'smoke' => $this->smoke, 'duration_seconds' => $this->durationSeconds, 'synchronous_desired' => $this->synchronous->value, 'doctrine_polling_milliseconds' => $this->doctrinePollingMilliseconds, 'clock_basis' => 'same-host hrtime nanoseconds; elapsed spans, not wall time'];
+        $settings = ['workload' => $this->scenario->value, 'mode' => $this->smoke ? 'smoke' : 'measured', 'smoke' => $this->smoke, 'duration_seconds' => $this->durationSeconds, 'synchronous_desired' => $this->synchronous->value, 'doctrine_polling_milliseconds' => $this->doctrinePollingMilliseconds, 'storage_pipeline_depth' => $this->pipelineDepth, 'clock_basis' => 'same-host hrtime nanoseconds; elapsed spans, not wall time'];
 
         return $settings + match ($this->scenario) {
             Scenario::MultiQueue => ['queues' => Scenario::MULTI_QUEUE_RECEIVERS, 'consumers' => 1, 'pickup_modes' => [Backend::Broker->value => 'notification-wait-any', Backend::Doctrine->value => 'polling'], 'method_change' => 'two selected queues on one stock worker; not comparable to earlier single-queue polling captures'],

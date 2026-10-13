@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Tests\Queue;
 
+use Amp\CancelledException;
 use Amp\DeferredCancellation;
+use Amp\DeferredFuture;
 use Amp\TimeoutCancellation;
 use Fabpot\Amp\Sqlite\SqliteConfig;
 use Fabpot\Amp\Sqlite\SqliteConnector;
@@ -27,6 +29,7 @@ use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 use Ineersa\SqliteQueue\Tests\Support\ClockFile;
 use Ineersa\SqliteQueue\Tests\Support\ControlledQueueWorkerOperation;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTestCase;
+use Ineersa\SqliteQueue\Tests\Support\SubscriptionCancellation;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use PHPUnit\Framework\Attributes\DataProvider;
 
@@ -334,6 +337,47 @@ final class QueueTest extends ProcessTestCase
         $this->assertCount(1, $deliveries);
     }
 
+    public function testQueuedPublicSendCancellationDoesNotReachSqlite(): void
+    {
+        ClockFile::configure($this->database->path(), $this->now);
+        $storage = SqliteQueueStorage::open($this->database->path(), workerOperation: ControlledQueueWorkerOperation::class, pipelineDepth: 1);
+        $this->storages[] = $storage;
+        $queue = new Queue($storage);
+        $this->clockGate(
+            fn (): int => $queue->send($this->queueName(), 'first'),
+            function () use ($queue): void {
+                $cancel = new DeferredCancellation();
+                $subscribed = new DeferredFuture();
+                $cancellation = new SubscriptionCancellation($cancel->getCancellation(), $subscribed);
+                $queued = async(fn (): int => $queue->send($this->queueName(), 'must not run', cancellation: $cancellation));
+                $queued->ignore();
+                $subscribed->getFuture()->await(new TimeoutCancellation(5));
+                $cancel->cancel();
+                try {
+                    $queued->await(new TimeoutCancellation(5));
+                    $this->fail('Queued cancellation must prevent execution.');
+                } catch (CancelledException) {
+                    $this->assertSame(0, $this->scalar('SELECT count(*) FROM queue_messages'));
+                }
+            },
+        );
+        $this->assertSame(1, $this->scalar('SELECT count(*) FROM queue_messages'));
+        $this->assertSame('first', $queue->receive($this->queueName(), $this->owner())->body);
+    }
+
+    public function testDispatchedSendCancellationStillReportsTheKnownCommit(): void
+    {
+        $queue = $this->open();
+        $cancel = new DeferredCancellation();
+        $id = $this->clockGate(
+            fn (): int => $queue->send($this->queueName(), 'committed', cancellation: $cancel->getCancellation()),
+            static fn () => $cancel->cancel(),
+        );
+        $this->assertTrue($cancel->getCancellation()->isRequested());
+        $this->assertSame($id, $this->scalar('SELECT id FROM queue_messages'));
+        $this->assertSame('committed', $queue->receive($this->queueName(), $this->owner())->body);
+    }
+
     public function testZeroRowClaimRollsBack(): void
     {
         $queue = $this->open();
@@ -519,16 +563,17 @@ final class QueueTest extends ProcessTestCase
         $queue = $this->open();
         $connection = (new \ReflectionProperty($this->latestStorage(), 'connection'))->getValue($this->latestStorage());
         $channel = (new \ReflectionProperty($connection, 'channel'))->getValue($connection);
-        $counter = new \ReflectionProperty($channel, 'nextRequestId');
-        $before = $counter->getValue($channel);
+        $pipeline = (new \ReflectionProperty($channel, 'pipelines'))->getValue($channel)[0];
+        $counter = new \ReflectionProperty($pipeline, 'nextId');
+        $before = $counter->getValue($pipeline);
         $owner = $this->owner();
         $queue->send($this->queueName(), 'one transaction per operation');
         $delivery = $queue->receive($this->queueName(), $owner);
         $this->assertNotNull($delivery);
         $queue->acknowledge($delivery->receipt, $owner);
-        $this->assertSame($before + 3, $counter->getValue($channel));
+        $this->assertSame($before + 3, $counter->getValue($pipeline));
         $this->assertNull($queue->earliestEligibility($this->queueName()));
-        $this->assertSame($before + 4, $counter->getValue($channel));
+        $this->assertSame($before + 4, $counter->getValue($pipeline));
     }
 
     public function testMalformedCommittedApplicationReplyClosesStorageWithoutReplay(): void
@@ -797,7 +842,7 @@ final class QueueTest extends ProcessTestCase
             $operation();
             $this->fail('Cancelled client context was accepted.');
         } catch (ClientContextClosedException $error) {
-            $this->assertInstanceOf(\Amp\CancelledException::class, $error->getPrevious());
+            $this->assertInstanceOf(CancelledException::class, $error->getPrevious());
         }
     }
 

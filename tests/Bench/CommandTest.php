@@ -25,7 +25,7 @@ final class CommandTest extends TestCase
         $this->assertStringContainsString('--smoke', $tester->getDisplay());
         $this->assertStringContainsString('--workload', $tester->getDisplay());
         $this->assertStringContainsString('roundtrip', $tester->getDisplay());
-        $this->assertSame(['workload', 'smoke', 'duration', 'polling-ms', 'synchronous'], array_keys((new RunCommand())->getDefinition()->getOptions()));
+        $this->assertSame(['workload', 'smoke', 'duration', 'polling-ms', 'pipeline-depth', 'synchronous'], array_keys((new RunCommand())->getDefinition()->getOptions()));
     }
 
     public function testRemovedWorkloadsAreRejectedBeforeAcquisition(): void
@@ -48,6 +48,7 @@ final class CommandTest extends TestCase
         $this->assertSame(60.0, $options->durationSeconds);
         $this->assertSame('normal', $options->synchronous->value);
         $this->assertSame(50, $options->doctrinePollingMilliseconds);
+        $this->assertSame(4, $options->pipelineDepth);
         $this->assertCount(2, $options->schedule());
         $this->assertSame(['doctrine', 'broker'], array_column($options->schedule(), 'backend'));
     }
@@ -57,6 +58,17 @@ final class CommandTest extends TestCase
         $tester = new CommandTester(new RunCommand());
         $this->expectException(\InvalidArgumentException::class);
         $tester->execute(['--smoke' => true, '--workload' => 'unknown-workload']);
+    }
+
+    public function testPipelineDepthIsReportedWithoutChangingDoctrineSettings(): void
+    {
+        $command = new RunCommand();
+        foreach ([1, 4] as $depth) {
+            $options = RunCommand::options(new \Symfony\Component\Console\Input\ArrayInput(['--pipeline-depth' => (string) $depth], $command->getDefinition()));
+            $this->assertSame($depth, $options->pipelineDepth);
+            $this->assertSame($depth, $options->configuration()['storage_pipeline_depth']);
+            $this->assertSame(50, $options->doctrinePollingMilliseconds);
+        }
     }
 
     public function testSymfonyProcessDoesNotInheritApplicationEnvironment(): void

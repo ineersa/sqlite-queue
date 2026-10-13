@@ -9,6 +9,7 @@ use Fabpot\Amp\Sqlite\Worker\Operation;
 use Ineersa\SqliteQueue\Broker\BrokerEventEnum;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
 use Ineersa\SqliteQueue\Queue;
+use Ineersa\SqliteQueue\Sqlite\QueuePipeline;
 use Ineersa\SqliteQueue\Sqlite\QueueWorkerOperation;
 use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 use Revolt\EventLoop;
@@ -46,7 +47,9 @@ final class BrokerCommand extends BaseCommand
         private readonly ClockInterface $clock = new Clock(),
         private readonly SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal,
         private readonly string $workerOperation = QueueWorkerOperation::class,
+        private readonly int $pipelineDepth = QueuePipeline::DEFAULT_DEPTH,
     ) {
+        QueuePipeline::validateDepth($pipelineDepth);
         if ($redeliverTimeoutSeconds <= 0) {
             throw new \InvalidArgumentException('Redelivery timeout must be positive seconds.');
         }
@@ -63,6 +66,7 @@ final class BrokerCommand extends BaseCommand
             ->addOption('endpoint', null, InputOption::VALUE_REQUIRED, 'Absolute path to the private Unix socket file.')
             ->addOption('redeliver-timeout', null, InputOption::VALUE_REQUIRED, 'Reservation redelivery timeout in seconds.', (string) $this->redeliverTimeoutSeconds)
             ->addOption('synchronous', null, InputOption::VALUE_REQUIRED, 'SQLite WAL synchronous mode: normal or full.', $this->synchronous->value)
+            ->addOption('storage-pipeline-depth', null, InputOption::VALUE_REQUIRED, 'Maximum in-flight storage operations, 1..4.', (string) $this->pipelineDepth)
             ->setHelp('Readiness, framing bounds, lifetime locks, failure handling, and client recovery are documented in docs/broker-protocol.md.');
     }
 
@@ -71,6 +75,11 @@ final class BrokerCommand extends BaseCommand
         $errors = $output instanceof ConsoleOutputInterface ? $output->getErrorOutput() : $output;
         $watchers = [];
         try {
+            $pipelineDepth = filter_var($input->getOption('storage-pipeline-depth'), \FILTER_VALIDATE_INT);
+            if (false === $pipelineDepth) {
+                throw new \InvalidArgumentException('--storage-pipeline-depth must be an integer.');
+            }
+            QueuePipeline::validateDepth($pipelineDepth);
             $synchronousValue = $input->getOption('synchronous');
             if (!\is_string($synchronousValue)) {
                 throw new \InvalidArgumentException('--synchronous must be normal or full.');
@@ -115,6 +124,7 @@ final class BrokerCommand extends BaseCommand
                 cancellation: $shutdown->getCancellation(),
                 synchronous: $synchronous,
                 workerOperation: $this->workerOperation,
+                pipelineDepth: $pipelineDepth,
             ))->create();
             $code = $broker->run(function (array $event) use ($output): void {
                 $this->write($event, $output);

@@ -14,6 +14,7 @@ use Ineersa\SqliteQueue\Broker\QueueNotifierWaiter;
 use Ineersa\SqliteQueue\Broker\QueueNotifierWatch;
 use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Queue;
+use Ineersa\SqliteQueue\Sqlite\QueuePipeline;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\Tests\Support\ClockFile;
 use Ineersa\SqliteQueue\Tests\Support\ControlledQueueWorkerOperation;
@@ -88,6 +89,30 @@ final class QueueNotifierTest extends ProcessTestCase
             $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
             $this->assertSame([], $this->failures);
         });
+    }
+
+    public function testSelectedQueueFanoutDoesNotExhaustMutationAdmission(): void
+    {
+        $queue = $this->open();
+        $notifier = $this->notifier($queue);
+        $waiting = [];
+        $groups = intdiv(QueuePipeline::ADMITTED_OPERATIONS, Limits::MAX_WAIT_QUEUES) + 1;
+        for ($group = 0; $group < $groups; ++$group) {
+            $names = [];
+            for ($member = 0; $member < Limits::MAX_WAIT_QUEUES; ++$member) {
+                $names[] = new QueueName('group'.$group.'queue'.$member);
+            }
+            $future = async(static fn (): bool => $notifier->waitAny($names, 0, new TimeoutCancellation(5)));
+            $future->ignore();
+            $waiting[] = $future;
+        }
+        foreach ($waiting as $future) {
+            $this->assertFalse($future->await(new TimeoutCancellation(5)));
+        }
+        $this->assertSame([], $this->failures);
+        $this->assertSame([], $this->waiterNames($notifier));
+        $queue->send(new QueueName('after-fanout'), 'still usable');
+        $this->assertNotNull($queue->receive(new QueueName('after-fanout'), 'owner'));
     }
 
     public function testWaitAnyWakesForEitherSelectedQueueAndDetachesFromAll(): void

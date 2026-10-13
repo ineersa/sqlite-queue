@@ -93,6 +93,7 @@ final class Broker
                     'event' => BrokerEventEnum::Ready->value,
                     'pid' => getmypid(),
                     'storage_execution' => 'fabpot',
+                    'storage_pipeline_depth' => $this->storage->pipelineDepth(),
                     'synchronous_effective' => $this->storage->synchronousMode()->value,
                     'database' => $this->locks->database,
                     'endpoint' => $this->locks->endpoint,
@@ -239,7 +240,7 @@ final class Broker
                 } else {
                     try {
                         $response = $this->dispatch($request, $operation, $ownerId, $lifetime, $expected, $socket);
-                    } catch (ClientContextClosedException) {
+                    } catch (ClientContextClosedException|CancelledException) {
                         // Disconnect and shutdown cancellation end the session, not the broker.
                         return;
                     } catch (InvalidReceiptException $error) {

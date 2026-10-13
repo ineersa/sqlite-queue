@@ -131,7 +131,7 @@ final class Runner
             return $timestamp;
         };
         $boundary(Phase::Boot);
-        $broker = new ChildProcess([\PHP_BINARY, $root.'/bin/sqlite-queue', 'broker', '--database='.$database, '--endpoint='.$short.'/broker.sock', '--redeliver-timeout='.Config::REDELIVER_TIMEOUT_S, '--synchronous='.$this->options->synchronous->value, '--no-ansi'], env: Process::environment(), timeout: $this->options->processTimeoutSeconds());
+        $broker = new ChildProcess([\PHP_BINARY, $root.'/bin/sqlite-queue', 'broker', '--database='.$database, '--endpoint='.$short.'/broker.sock', '--redeliver-timeout='.Config::REDELIVER_TIMEOUT_S, '--synchronous='.$this->options->synchronous->value, '--storage-pipeline-depth='.$this->options->pipelineDepth, '--no-ansi'], env: Process::environment(), timeout: $this->options->processTimeoutSeconds());
         $receivers = Scenario::MultiQueue === $this->options->scenario ? Scenario::MULTI_QUEUE_RECEIVERS : ['async'];
         $consumerArguments = [\PHP_BINARY, __DIR__.'/console.php', 'messenger:consume', ...$receivers, '--no-ansi', '--no-interaction'];
         if (Backend::Doctrine === $backend) {
@@ -171,6 +171,9 @@ final class Runner
                     throw new \RuntimeException('Broker owning connection synchronous readback does not match the selected mode.');
                 }
                 $resources->registerBroker($readyData);
+                if (($readyData['storage_pipeline_depth'] ?? null) !== $this->options->pipelineDepth) {
+                    throw new \RuntimeException('Broker storage pipeline depth does not match the selected depth.');
+                }
                 Runtime::saveJson($directory.'/broker.ready.json', $readyData);
             }
             $environment = ['BENCH_PROJECT' => $directory, 'BENCH_DATABASE' => $database, 'BENCH_DSN' => Backend::Broker === $backend ? 'sqlite-queue://async?endpoint='.$short.'/broker.sock' : 'doctrine-benchmark://async', 'BENCH_CONTROL' => $short.'/control.sock', 'BENCH_RUN' => basename(\dirname($directory)), 'BENCH_ROLE' => 'consumer', 'BENCH_TELEMETRY' => $directory.'/consumer.operations.jsonl'];

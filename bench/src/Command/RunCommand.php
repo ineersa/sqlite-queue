@@ -7,6 +7,7 @@ namespace Ineersa\SqliteQueue\Bench\Command;
 use Ineersa\SqliteQueue\Bench\DTO\RunOptionsDTO;
 use Ineersa\SqliteQueue\Bench\Runner;
 use Ineersa\SqliteQueue\Bench\Scenario;
+use Ineersa\SqliteQueue\Sqlite\QueuePipeline;
 use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 use Symfony\Component\Console\Command\Command;
 use Symfony\Component\Console\Input\InputInterface;
@@ -41,7 +42,12 @@ final class RunCommand extends Command
             throw new \InvalidArgumentException('Doctrine polling interval must be integer milliseconds.');
         }
 
-        return new RunOptionsDTO($scenario, true === $input->getOption('smoke'), (float) $duration, $synchronous, $polling);
+        $pipelineDepth = filter_var($input->getOption('pipeline-depth'), \FILTER_VALIDATE_INT);
+        if (false === $pipelineDepth) {
+            throw new \InvalidArgumentException('Pipeline depth must be an integer.');
+        }
+
+        return new RunOptionsDTO($scenario, true === $input->getOption('smoke'), (float) $duration, $synchronous, $polling, $pipelineDepth);
     }
 
     protected function configure(): void
@@ -51,6 +57,7 @@ final class RunCommand extends Command
             ->addOption('smoke', null, InputOption::VALUE_NONE, 'Tiny control-path checks, not performance evidence.')
             ->addOption('duration', null, InputOption::VALUE_REQUIRED, 'Measured window in seconds.', (string) RunOptionsDTO::DEFAULT_DURATION_SECONDS)
             ->addOption('polling-ms', null, InputOption::VALUE_REQUIRED, 'Doctrine idle poll interval, 1..1000 milliseconds. Broker uses WAIT.', (string) RunOptionsDTO::DEFAULT_DOCTRINE_POLLING_MILLISECONDS)
+            ->addOption('pipeline-depth', null, InputOption::VALUE_REQUIRED, 'Broker storage pipeline depth, 1..4.', (string) QueuePipeline::DEFAULT_DEPTH)
             ->addOption('synchronous', null, InputOption::VALUE_REQUIRED, 'WAL synchronous mode for both backends: normal or full.', 'normal');
     }
 

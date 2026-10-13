@@ -109,11 +109,81 @@ final class BrokerTest extends TestCase
         yield 'payload remains bounded' => [true, -1, self::FRAME_READ_TIMEOUT_SECONDS];
     }
 
+    public function testDisconnectedPublisherStillWakesWaiterAfterKnownCommit(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker();
+            $publisher = $this->connectClient();
+            $consumer = $this->connectClient();
+            $waiting = async(static fn (): bool => $consumer->wait('jobs', 5_000));
+            $waiting->ignore();
+            $this->awaitNotifierWaiters(1);
+            $server = \Amp\Socket\listen('unix://'.$this->database->path('clock.sock'));
+            file_put_contents($this->database->path().'.clock.gate', $this->database->path('clock.sock'));
+            $sending = async(static fn (): int => $publisher->send('jobs', 'known commit'));
+            $sending->ignore();
+            $peer = $server->accept(new TimeoutCancellation(5));
+            $this->assertNotNull($peer);
+            try {
+                $this->assertSame("acquired\n", $peer->read(new TimeoutCancellation(5)));
+                $publisher->close();
+                try {
+                    $sending->await(new TimeoutCancellation(5));
+                    $this->fail('Disconnected publisher cannot receive confirmation.');
+                } catch (TransportException) {
+                    $this->assertFalse($waiting->isComplete());
+                }
+            } finally {
+                $peer->write("release\n");
+                $peer->close();
+                $server->close();
+            }
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $delivery = $consumer->receive('jobs');
+            $this->assertNotNull($delivery);
+            $this->assertSame('known commit', $delivery->body);
+            $consumer->acknowledge($delivery->receipt);
+        });
+    }
+
+    public function testExternalWriteLockDoesNotBlockANewHello(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker();
+            $publisher = $this->connectClient();
+            $external = new \SQLite3($this->database->path());
+            $external->enableExceptions(true);
+            $external->exec('BEGIN IMMEDIATE');
+            $sending = async(static fn (): int => $publisher->send('jobs', 'blocked insert'));
+            $sending->ignore();
+            try {
+                $storage = (new \ReflectionProperty(Broker::class, 'storage'))->getValue($this->broker);
+                $connection = (new \ReflectionProperty($storage, 'connection'))->getValue($storage);
+                $channel = (new \ReflectionProperty($connection, 'channel'))->getValue($connection);
+                $pipeline = (new \ReflectionProperty($channel, 'pipelines'))->getValue($channel)[0];
+                $flight = new \ReflectionProperty($pipeline, 'flightCount');
+                $safety = new TimeoutCancellation(5);
+                while (0 === $flight->getValue($pipeline)) {
+                    $safety->throwIfRequested();
+                    $this->turn();
+                }
+                $this->connectClient();
+                $this->assertFalse($sending->isComplete(), 'HELLO completes while the write lock still prevents mutation.');
+            } finally {
+                $external->exec('ROLLBACK');
+                $external->close();
+            }
+            $this->assertGreaterThan(0, $sending->await(new TimeoutCancellation(5)));
+        });
+    }
+
     #[DataProvider('incompleteRequests')]
     public function testIncompleteRequestsRetainTheirReadDeadline(bool $established, int $bytes, int $seconds): void
     {
         $this->runAsync(function () use ($established, $bytes, $seconds): void {
             $this->startBroker();
+            // Only inspect this session's timers, not unrelated budgets with the same interval.
+            $existingTimers = $this->readTimeoutTimers($seconds);
             $peer = $this->rawPeer();
             if ($established) {
                 Frame::write($peer, (new Frame(['v' => Frame::VERSION, 'id' => 0, 'op' => 'hello']))->encode(), new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS));
@@ -125,7 +195,7 @@ final class BrokerTest extends TestCase
             }
             $deadline = microtime(true) + self::SHUTDOWN_BOUND_SECONDS;
             do {
-                $timers = $this->readTimeoutTimers($seconds);
+                $timers = array_diff_key($this->readTimeoutTimers($seconds), $existingTimers);
                 if ([] !== $timers) {
                     break;
                 }

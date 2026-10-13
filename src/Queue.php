@@ -64,6 +64,7 @@ final class Queue
             $body,
             $headers,
             $delay,
+            $cancellation,
         );
     }
 
@@ -81,6 +82,7 @@ final class Queue
             $this->epoch,
             $token,
             $this->visibilityTimeout,
+            $cancellation,
         );
         if (null === $claimed) {
             return null;
@@ -117,7 +119,7 @@ final class Queue
     {
         $this->assertActive($cancellation ?? new NullCancellation());
 
-        return $this->storage->earliestEligibility($queue->value);
+        return $this->storage->earliestEligibility($queue->value, $cancellation);
     }
 
     private function settle(string $receipt, string $ownerId, ?Cancellation $cancellation): void
@@ -138,6 +140,7 @@ final class Queue
             $parts[2],
             $ownerId,
             $this->epoch,
+            $cancellation,
         );
         match ($settled) {
             SettlementResultEnum::Settled => null,
