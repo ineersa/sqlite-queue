@@ -32,7 +32,7 @@ Start the broker with `vendor/bin/sqlite-queue broker`, then connect with `Clien
 
 - A successful send or settlement is confirmed only after SQLite commits, using WAL and synchronous NORMAL by default. Choose FULL for stronger durability across OS crashes or power loss. See [durability guarantees](docs/contracts.md#storage-and-durability).
 - Delivery is at least once, not exactly once. Make external effects safe to repeat.
-- Reservations expire after 60 seconds by default. Configure `--redeliver-timeout` for your handlers. There is no automatic lease renewal.
+- Reservations expire after 60 seconds by default. Native Messenger consumers can renew them with `--keepalive`, whose default tick is 5 seconds. Processing can continue for hours while renewals succeed; configure handler execution limits separately.
 - A connection failure can hide a committed operation. The client does not reconnect or replay it automatically.
 - A receipt belongs to the connection that received it. A replacement connection cannot acknowledge an old receipt.
 - Cancellation can stop an operation before storage begins. Dispatched mutations may commit after disconnect. Send delay starts after transaction acquisition. Waiting for SQLite suspends a fiber without blocking the broker's event loop.

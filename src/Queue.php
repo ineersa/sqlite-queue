@@ -107,6 +107,23 @@ final class Queue
         $this->settle($receipt, $ownerId, $cancellation);
     }
 
+    /** Zero minimum uses the configured reservation duration; cancellation is optional for direct callers. */
+    public function keepalive(string $receipt, string $ownerId, int $minimumMilliseconds = 0, ?Cancellation $cancellation = null): int
+    {
+        if ($minimumMilliseconds < 0) {
+            throw new \InvalidArgumentException('Keepalive duration must be nonnegative milliseconds.');
+        }
+        [$id, $token] = $this->receiptParts($receipt, $ownerId);
+        $this->assertActive($cancellation ?? new NullCancellation());
+        $result = $this->storage->keepalive($id, $token, $ownerId, $this->epoch, $this->visibilityTimeout, $minimumMilliseconds);
+        if ($result instanceof SettlementResultEnum) {
+            $this->requireReceiptSuccess($result);
+            throw new \LogicException('Keepalive cannot return a settlement success.');
+        }
+
+        return $result;
+    }
+
     /**
      * Earliest effective eligibility deadline for one queue, or null when the queue has no rows.
      *
@@ -122,6 +139,14 @@ final class Queue
 
     private function settle(string $receipt, string $ownerId, ?Cancellation $cancellation): void
     {
+        [$id, $token] = $this->receiptParts($receipt, $ownerId);
+        $this->assertActive($cancellation ?? new NullCancellation());
+        $this->requireReceiptSuccess($this->storage->settle($id, $token, $ownerId, $this->epoch));
+    }
+
+    /** @return array{int, string} */
+    private function receiptParts(string $receipt, string $ownerId): array
+    {
         if ('' === $ownerId) {
             throw new \InvalidArgumentException('Owner identity must be a non-empty string.');
         }
@@ -132,13 +157,12 @@ final class Queue
         if (false === $id) {
             throw new MalformedReceiptException();
         }
-        $this->assertActive($cancellation ?? new NullCancellation());
-        $settled = $this->storage->settle(
-            $id,
-            $parts[2],
-            $ownerId,
-            $this->epoch,
-        );
+
+        return [$id, $parts[2]];
+    }
+
+    private function requireReceiptSuccess(SettlementResultEnum $settled): void
+    {
         match ($settled) {
             SettlementResultEnum::Settled => null,
             SettlementResultEnum::NoActiveReservation => throw new NoActiveReservationException(),

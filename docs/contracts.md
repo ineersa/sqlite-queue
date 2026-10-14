@@ -39,7 +39,7 @@ The default reservation duration is **60 seconds**. `--redeliver-timeout` and bu
 The PHP engine and `BrokerFactory::visibilityTimeout` use milliseconds, default **60,000**. Client communication timeouts are separate from reservations.
 
 - The claim persists its expiry. Disconnect does not release it early; restart does not reset or extend it.
-- There is no lease renewal or maximum receive count. A message is not deleted because it was received too often.
+- The original connection can renew an unexpired reservation with KEEPALIVE. Renewal retains its receipt, validates every ownership field and never shortens the deadline. There is no maximum receive count or cumulative processing lifetime.
 - A receipt is tied to the delivery token, owning connection, and issuing engine epoch.
 - ACK and reject check every reservation field and require an unexpired receipt. An expired receipt fails even before another worker reclaims the message.
 - ACK deletes the delivery. Reject is also terminal. Messenger owns retry publication and backoff.
@@ -48,6 +48,8 @@ The PHP engine and `BrokerFactory::visibilityTimeout` use milliseconds, default 
 Receipt failures distinguish malformed syntax, no active reservation, owner mismatch, epoch mismatch, token mismatch, and expiry. They leave the client session usable. See [receipt errors](broker-protocol.md#receipt-errors) for wire codes and failure precedence.
 
 Delivery is at least once, not exactly once. Receipt checks protect queue state, but cannot undo an external effect performed by a slow or stale worker. Make external effects safe to repeat.
+
+Renewal is consumer-initiated. Native Messenger `--keepalive` uses a 5-second tick by default; the broker's default lease remains 60 seconds. A 30-minute or longer handler needs successful renewals, not a 30-minute communication allowance. Handler execution budgets, individual communication bounds and storage-operation deadlines are separate. Losing renewal does not itself stop application code. After the last committed deadline expires, another consumer may claim the message.
 
 ## Uncertain operations and cancellation
 

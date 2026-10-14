@@ -44,6 +44,7 @@ final class QueueStorageReplyTest extends ProcessTestCase
         yield 'insert' => [QueueStorageOperation::Insert, 'Worker insert reply must have commit outcome.'];
         yield 'populated claim' => [QueueStorageOperation::Claim, 'Worker populated claim reply must have commit outcome.'];
         yield 'settled' => [QueueStorageOperation::Settle, 'Worker settlement reply must have commit outcome.'];
+        yield 'renewed' => [QueueStorageOperation::Keepalive, 'Worker keepalive reply must have commit outcome.'];
     }
 
     #[DataProvider('successfulMutations')]
@@ -52,7 +53,7 @@ final class QueueStorageReplyTest extends ProcessTestCase
         $seed = $this->seed();
         try {
             $id = QueueStorageOperation::Insert === $operation ? 0 : $seed->insert('jobs', 'payload', '', 0);
-            if (QueueStorageOperation::Settle === $operation) {
+            if (QueueStorageOperation::Settle === $operation || QueueStorageOperation::Keepalive === $operation) {
                 $this->assertNotNull($seed->claim('jobs', self::OWNER, self::EPOCH, self::TOKEN, self::VISIBILITY_MILLISECONDS));
             }
         } finally {
@@ -66,6 +67,7 @@ final class QueueStorageReplyTest extends ProcessTestCase
                     QueueStorageOperation::Insert => $storage->insert('jobs', 'must roll back', '', 0),
                     QueueStorageOperation::Claim => $storage->claim('jobs', self::OWNER, self::EPOCH, self::TOKEN, self::VISIBILITY_MILLISECONDS),
                     QueueStorageOperation::Settle => $storage->settle($id, self::TOKEN, self::OWNER, self::EPOCH),
+                    QueueStorageOperation::Keepalive => $storage->keepalive($id, self::TOKEN, self::OWNER, self::EPOCH, self::VISIBILITY_MILLISECONDS, 10_000),
                     default => throw new \LogicException('Expected a mutation.'),
                 };
                 $this->fail('Rollback success data must not confirm a mutation.');
@@ -74,6 +76,45 @@ final class QueueStorageReplyTest extends ProcessTestCase
             }
             $this->assertFailedWithoutReplay($storage, $connection, $requestBaseline);
             $this->assertSame($before, $this->rows(), 'Real INSERT, reservation UPDATE or DELETE must have rolled back.');
+        } finally {
+            $storage->close();
+        }
+    }
+
+    public function testCommitCannotConfirmRejectedKeepalive(): void
+    {
+        $seed = $this->seed();
+        $seed->close();
+        [$storage, $context, $connection, $requestBaseline] = $this->openWithSpy(OutcomeMismatchQueueWorkerOperation::class);
+        try {
+            try {
+                $storage->keepalive(1, self::TOKEN, self::OWNER, self::EPOCH, self::VISIBILITY_MILLISECONDS, 0);
+                $this->fail('Rejected renewal must have rollback outcome.');
+            } catch (\RuntimeException $error) {
+                $this->assertSame('Worker rejected keepalive reply must have rollback outcome. Outcome may be unknown; storage is closed.', $error->getMessage());
+            }
+            $this->assertFailedWithoutReplay($storage, $connection, $requestBaseline);
+            $this->assertSame([], $this->rows());
+        } finally {
+            $storage->close();
+        }
+    }
+
+    public function testNegativeKeepaliveAtStorageBoundaryRollsBackWithoutClosing(): void
+    {
+        $storage = $this->seed();
+        try {
+            $id = $storage->insert('jobs', 'payload', '', 0);
+            $storage->claim('jobs', self::OWNER, self::EPOCH, self::TOKEN, self::VISIBILITY_MILLISECONDS);
+            $before = $this->rows();
+            try {
+                $storage->keepalive($id, self::TOKEN, self::OWNER, self::EPOCH, self::VISIBILITY_MILLISECONDS, -1);
+                $this->fail('Negative duration must be an application validation failure.');
+            } catch (\InvalidArgumentException $error) {
+                $this->assertSame(QueueValidationError::NegativeKeepalive->message(), $error->getMessage());
+            }
+            $this->assertSame($before, $this->rows());
+            $this->assertSame(self::NOW_MILLISECONDS + self::VISIBILITY_MILLISECONDS, $storage->keepalive($id, self::TOKEN, self::OWNER, self::EPOCH, self::VISIBILITY_MILLISECONDS, 0));
         } finally {
             $storage->close();
         }
@@ -104,7 +145,7 @@ final class QueueStorageReplyTest extends ProcessTestCase
         yield 'unknown code' => [ValidationReplyCase::UnknownCode, 'Worker validation error code is unknown.'];
         yield 'non-string code' => [ValidationReplyCase::NonStringCode, 'Worker validation error code must be a string.'];
         yield 'validation plus success data' => [ValidationReplyCase::SuccessData, 'Worker validation reply must not contain success data.'];
-        yield 'validation on claim' => [ValidationReplyCase::NonInsert, 'Worker validation reply is only supported for insert.'];
+        yield 'validation on claim' => [ValidationReplyCase::NonInsert, 'Worker validation reply is only supported for insert or keepalive.'];
     }
 
     #[DataProvider('malformedValidationReplies')]

@@ -164,6 +164,30 @@ final class SqliteQueueStorage
         return $settlement;
     }
 
+    public function keepalive(int $id, string $token, string $ownerId, string $epoch, int $visibility, int $minimum): int|SettlementResultEnum
+    {
+        $result = $this->run(QueueStorageOperation::Keepalive, ['id' => $id, 'token' => $token, 'owner' => $ownerId, 'epoch' => $epoch, 'visibility' => $visibility, 'minimum' => $minimum]);
+        if (\array_key_exists('reserved_until', $result->data)) {
+            $this->requireOutcome($result, Outcome::Commit, 'Worker keepalive reply');
+            $deadline = $result->data['reserved_until'];
+            if (['reserved_until'] !== array_keys($result->data) || !\is_int($deadline) || $deadline < 0) {
+                $this->invalidReply('Worker keepalive reply must contain only a nonnegative integer expiry.');
+            }
+
+            return $deadline;
+        }
+        $this->requireOutcome($result, Outcome::Rollback, 'Worker rejected keepalive reply');
+        if (['settlement'] !== array_keys($result->data) || !\is_string($result->data['settlement'])) {
+            $this->invalidReply('Worker rejected keepalive reply must contain only a receipt failure.');
+        }
+        $failure = SettlementResultEnum::tryFrom($result->data['settlement']);
+        if (null === $failure || SettlementResultEnum::Settled === $failure) {
+            $this->invalidReply('Worker rejected keepalive receipt status is invalid.');
+        }
+
+        return $failure;
+    }
+
     public function earliestEligibility(string $queue): ?int
     {
         $result = $this->run(QueueStorageOperation::Eligibility, ['queue' => $queue]);
@@ -214,8 +238,8 @@ final class SqliteQueueStorage
         $result = $this->executor->run(QueueWorkerProtocol::OPERATION_NAME, ['operation' => $operation->value, ...$parameters], QueueStorageOperation::Eligibility === $operation ? Mode::ReadOnly : Mode::Transaction);
         if (\array_key_exists('validation_error', $result->data)) {
             $this->requireOutcome($result, Outcome::Rollback, 'Worker validation reply');
-            if (QueueStorageOperation::Insert !== $operation) {
-                $this->invalidReply('Worker validation reply is only supported for insert.');
+            if (QueueStorageOperation::Insert !== $operation && QueueStorageOperation::Keepalive !== $operation) {
+                $this->invalidReply('Worker validation reply is only supported for insert or keepalive.');
             }
             if (['validation_error'] !== array_keys($result->data)) {
                 $this->invalidReply('Worker validation reply must not contain success data.');
@@ -227,6 +251,12 @@ final class SqliteQueueStorage
             $error = QueueValidationError::tryFrom($code);
             if (null === $error) {
                 $this->invalidReply('Worker validation error code is unknown.');
+            }
+            if (QueueValidationError::NegativeKeepalive === $error && QueueStorageOperation::Keepalive !== $operation) {
+                $this->invalidReply('Worker keepalive validation category requires a keepalive operation.');
+            }
+            if (QueueValidationError::NegativeDelay === $error && QueueStorageOperation::Insert !== $operation) {
+                $this->invalidReply('Worker delay validation category requires an insert operation.');
             }
 
             throw new \InvalidArgumentException($error->message());

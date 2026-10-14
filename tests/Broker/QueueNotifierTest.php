@@ -313,6 +313,31 @@ final class QueueNotifierTest extends ProcessTestCase
         });
     }
 
+    public function testObsoleteVisibilityTimerRechecksRenewalBeforeReportingReadiness(): void
+    {
+        $this->runAsync(function (): void {
+            $queue = $this->open(visibility: 200);
+            $notifier = $this->notifier($queue);
+            $name = new QueueName('jobs');
+            $owner = bin2hex(random_bytes(32));
+            $queue->send($name, 'long handler');
+            $delivery = $queue->receive($name, $owner);
+            $waiting = async(static fn (): bool => $notifier->wait($name, 5_000, new TimeoutCancellation(5)));
+            $obsoleteTimer = $this->awaitDeadlineTimer($notifier, $name->value, $delivery->reservedUntil);
+            $this->now += 100;
+            $renewedExpiry = $queue->keepalive($delivery->receipt, $owner, 1000);
+            $this->now = $delivery->reservedUntil;
+            $this->fireTimer($obsoleteTimer);
+            $renewedTimer = $this->awaitDeadlineTimer($notifier, $name->value, $renewedExpiry);
+            $this->assertFalse($waiting->isComplete());
+            $this->assertNull($queue->receive($name, $owner));
+            $this->now = $renewedExpiry;
+            $this->fireTimer($renewedTimer);
+            $this->assertTrue($waiting->await(new TimeoutCancellation(5)));
+            $this->assertSame([], $this->failures);
+        });
+    }
+
     public function testRestartRebuildsDeadlineFromPersistedState(): void
     {
         $this->runAsync(function (): void {

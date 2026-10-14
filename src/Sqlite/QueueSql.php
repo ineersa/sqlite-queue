@@ -12,6 +12,8 @@ final class QueueSql
     public const string RESERVE_SQL = 'UPDATE queue_messages SET reserved_until = ?, reservation_token = ?, owner_id = ?, broker_epoch = ?
                      WHERE id = ? AND queue = ? AND available_at <= ? AND (reserved_until IS NULL OR reserved_until <= ?)';
     public const string DELETE_SQL = 'DELETE FROM queue_messages WHERE id = ? AND reservation_token = ? AND owner_id = ? AND broker_epoch = ? AND reserved_until > ?';
+    public const string KEEPALIVE_SQL = 'UPDATE queue_messages SET reserved_until = max(reserved_until, ?)
+                     WHERE id = ? AND reservation_token = ? AND owner_id = ? AND broker_epoch = ? AND reserved_until > ?';
     public const string DIAGNOSE_SQL = 'SELECT owner_id, typeof(owner_id) AS owner_id_type,
                             broker_epoch, typeof(broker_epoch) AS broker_epoch_type,
                             reservation_token, typeof(reservation_token) AS reservation_token_type,
