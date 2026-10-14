@@ -10,7 +10,7 @@ use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\KeepalivePeerReply;
 require dirname(__DIR__, 3).'/vendor/autoload.php';
 
 $endpoint = $argv[1];
-$gate = $argv[2];
+$gates = array_map(Operation::from(...), explode(',', $argv[2]));
 $mode = KeepalivePeerReply::from($argv[3]);
 $server = stream_socket_server('unix://'.$endpoint);
 if (false === $server) {
@@ -30,7 +30,7 @@ try {
     })) {
         $operation = Operation::from($request->control['op']);
         fwrite(\STDOUT, json_encode($request->control, \JSON_THROW_ON_ERROR)."\n");
-        if ($operation->value === $gate && "release\n" !== fgets(\STDIN)) {
+        if (in_array($operation, $gates, true) && "release\n" !== fgets(\STDIN)) {
             throw new RuntimeException('Keepalive peer gate was not released.');
         }
         if (Operation::Keepalive === $operation && KeepalivePeerReply::Disconnect === $mode) {

@@ -168,7 +168,7 @@ final class Client
         if ($this->closed) {
             throw new TransportException('Client is closed; create a new connection explicitly.');
         }
-        if ($this->busy) {
+        if ($this->busy || $this->flushingKeepalives) {
             // A prefix preserves opaque numeric strings instead of coercing them to integer keys.
             $key = self::RECEIPT_KEY_PREFIX.$receipt;
             $minimum = max($minimumMilliseconds, $this->pendingKeepalives[$key]['minimum'] ?? 0);
@@ -176,16 +176,8 @@ final class Client
 
             return null;
         }
-        if (!$this->socket instanceof ResourceStream) {
-            throw new TransportException('Signal-safe keepalive requires a resource-backed operations socket.');
-        }
 
-        return $this->exchange(
-            Operation::Keepalive,
-            self::keepaliveDeadline(...),
-            [ControlField::Receipt->value => $receipt, ControlField::KeepaliveMilliseconds->value => $minimumMilliseconds],
-            keepaliveIo: new KeepaliveStream($this->socket, $this->timeout),
-        );
+        return $this->keepaliveWithoutSuspending($receipt, $minimumMilliseconds);
     }
 
     public function reject(string $receipt, ?Cancellation $cancellation = null): void
@@ -271,6 +263,20 @@ final class Client
         $this->socket->close();
     }
 
+    private function keepaliveWithoutSuspending(string $receipt, int $minimumMilliseconds): int
+    {
+        if (!$this->socket instanceof ResourceStream) {
+            throw new TransportException('Signal-safe keepalive requires a resource-backed operations socket.');
+        }
+
+        return $this->exchange(
+            Operation::Keepalive,
+            self::keepaliveDeadline(...),
+            [ControlField::Receipt->value => $receipt, ControlField::KeepaliveMilliseconds->value => $minimumMilliseconds],
+            keepaliveIo: new KeepaliveStream($this->socket, $this->timeout),
+        );
+    }
+
     private static function keepaliveDeadline(Frame $reply): int
     {
         $deadline = self::readInteger($reply->control[ControlField::Result->value], 'KEEPALIVE result');
@@ -289,14 +295,17 @@ final class Client
         }
         $this->flushingKeepalives = true;
         try {
-            while ([] !== $this->pendingKeepalives) {
-                $key = array_key_first($this->pendingKeepalives);
-                $pending = $this->pendingKeepalives[$key];
+            // Detach in one operation so a signal cannot clear or replace half a dequeue.
+            // New ticks stay in the live queue and cannot extend this caller's drain.
+            $snapshot = array_splice($this->pendingKeepalives, 0);
+            foreach ($snapshot as $pending) {
+                if ($this->closed) {
+                    break;
+                }
                 $receipt = $pending['receipt'];
-                unset($this->pendingKeepalives[$key]);
                 try {
                     if ($signalSafe) {
-                        $this->keepaliveSignalSafe($receipt, $pending['minimum'], $pending['error']);
+                        $this->keepaliveWithoutSuspending($receipt, $pending['minimum']);
                     } else {
                         // Ordinary API completion stays on Amp, including deferred renewal I/O.
                         $this->keepalive($receipt, $pending['minimum']);

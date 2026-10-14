@@ -7,6 +7,8 @@ namespace Ineersa\SqliteQueue\Tests\Messenger;
 use Amp\ByteStream\BufferedReader;
 use Amp\ByteStream\ResourceStream;
 use Amp\Cancellation;
+use Amp\CancelledException;
+use Amp\DeferredCancellation;
 use Amp\Future;
 use Amp\Process\Process;
 use Amp\TimeoutCancellation;
@@ -32,6 +34,7 @@ use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 
 use function Amp\async;
 use function Amp\ByteStream\buffer;
+use function Amp\Future\awaitFirst;
 
 final class KeepaliveTest extends TestCase
 {
@@ -286,12 +289,111 @@ final class KeepaliveTest extends TestCase
         $transport->close();
     }
 
-    /** @return array{Transport, Client, Process, BufferedReader} */
-    private function peer(KeepalivePeerReply $reply, Operation $gate): array
+    #[DataProvider('dequeueOperations')]
+    public function testSignalAtAtomicDequeueCannotLoseAConfirmedResult(Operation $operation): void
+    {
+        $process = Process::start([\PHP_BINARY, __DIR__.'/Fixtures/keepalive-dequeue-boundary.php', $operation->value]);
+        $stdout = async(static fn (): string => buffer($process->getStdout()));
+        $stderr = async(static fn (): string => buffer($process->getStderr()));
+        try {
+            $this->assertSame(0, $process->join(new TimeoutCancellation(self::SAFETY_SECONDS)), $stderr->await());
+            $result = json_decode($stdout->await(), true, 16, \JSON_THROW_ON_ERROR);
+            $this->assertTrue($result['original_confirmed'], json_encode($result));
+            $this->assertSame(Operation::Send === $operation ? 42 : null, $result['original_result']);
+            $this->assertSame('array_splice', $result['boundary']);
+            $this->assertFalse($result['busy_at_boundary']);
+            $this->assertTrue($result['flushing_at_boundary']);
+            $this->assertNull($result['signal_result'], 'A signal during drain must defer without entering native I/O.');
+            $this->assertSame([], $result['signal_errors']);
+            $this->assertSame([], $result['warnings']);
+            $this->assertCount(1, $result['errors']);
+            $this->assertSame(ProtocolException::class, $result['errors'][0]['class']);
+            $this->assertStringContainsString('KEEPALIVE result', $result['errors'][0]['message']);
+            $this->assertSame(0, $result['peer_exit']);
+            $this->assertSame('', $result['peer_stderr']);
+        } finally {
+            if ($process->isRunning()) {
+                $process->kill();
+            }
+        }
+    }
+
+    /** @return iterable<string, array{Operation}> */
+    public static function dequeueOperations(): iterable
+    {
+        yield 'confirmed send' => [Operation::Send];
+        yield 'confirmed ACK' => [Operation::Acknowledge];
+    }
+
+    public function testRepeatedTicksCannotExtendTheOriginalAmpDrain(): void
+    {
+        [$transport, $client, $peer, $reader] = $this->peer(KeepalivePeerReply::Success, [Operation::Send, Operation::Keepalive]);
+        $delivery = $this->delivery($transport);
+        $sibling = new Envelope(new \stdClass(), [new DeliveryReceiptStamp('sibling', $transport)]);
+        $send = async(static fn (): Envelope => $transport->send(new Envelope(new \stdClass())));
+        $this->assertSame(Operation::Send->value, $this->packet($reader)['op']);
+        $this->alarm(static fn () => $transport->keepalive($delivery, 5));
+        $peer->getStdin()->write("release\n");
+        $firstRenewal = $this->packet($reader);
+        $this->assertSame(Operation::Keepalive->value, $firstRenewal['op']);
+        $this->assertSame(5000, $firstRenewal['keepalive_ms']);
+        $this->alarm(static fn () => $transport->keepalive($delivery, 30));
+        $this->alarm(static fn () => $transport->keepalive($sibling, 15));
+        $this->alarm(static fn () => $transport->keepalive($delivery, 10));
+        $cancellation = new DeferredCancellation();
+        $nextPacket = async(static fn (): ?string => $reader->readUntil("\n", $cancellation->getCancellation()));
+        $nextPacket->ignore();
+        $competingPacket = $nextPacket->map(static fn (): string => 'another renewal dispatched');
+        $competingPacket->ignore();
+        $confirmed = $send->map(static fn (): string => 'confirmed');
+        $confirmed->ignore();
+        try {
+            $peer->getStdin()->write("release\n");
+            $winner = awaitFirst([
+                $confirmed,
+                $competingPacket,
+            ], new TimeoutCancellation(self::SAFETY_SECONDS));
+            $this->assertSame('confirmed', $winner, 'A second gated renewal must not hold the original send hostage.');
+            $this->assertSame(42, $send->await()->last(TransportMessageIdStamp::class)->getId());
+            $pending = array_values((new \ReflectionProperty(Client::class, 'pendingKeepalives'))->getValue($client));
+            $this->assertSame([self::RECEIPT, 'sibling'], array_column($pending, 'receipt'));
+            $this->assertSame([30_000, 15_000], array_column($pending, 'minimum'));
+        } finally {
+            $cancellation->cancel();
+            try {
+                $nextPacket->await();
+            } catch (CancelledException) {
+                // Release BufferedReader's pending read before the next control assertion.
+            }
+            if (!$send->isComplete()) {
+                $send->ignore();
+                $client->close();
+                $peer->getStdin()->write("release\n");
+            }
+        }
+        // Settlement cancels its own queued tick, while a sibling remains real active work.
+        $ack = async(static fn () => $transport->ack($delivery));
+        $this->assertSame(Operation::Acknowledge->value, $this->packet($reader)['op']);
+        $siblingRenewal = $this->packet($reader);
+        $this->assertSame('sibling', $siblingRenewal['receipt']);
+        $this->assertSame(15_000, $siblingRenewal['keepalive_ms']);
+        $peer->getStdin()->write("release\n");
+        $ack->await(new TimeoutCancellation(self::SAFETY_SECONDS));
+        $this->assertSame([], (new \ReflectionProperty(Client::class, 'pendingKeepalives'))->getValue($client));
+        $transport->close();
+    }
+
+    /**
+     * @param Operation|list<Operation> $gate
+     *
+     * @return array{Transport, Client, Process, BufferedReader}
+     */
+    private function peer(KeepalivePeerReply $reply, Operation|array $gate): array
     {
         $directory = new IsolatedDatabase();
         $endpoint = $directory->path('heartbeat.sock');
-        $peer = Process::start([\PHP_BINARY, __DIR__.'/Fixtures/keepalive-peer.php', $endpoint, $gate->value, $reply->value]);
+        $gates = $gate instanceof Operation ? [$gate] : $gate;
+        $peer = Process::start([\PHP_BINARY, __DIR__.'/Fixtures/keepalive-peer.php', $endpoint, implode(',', array_map(static fn (Operation $operation): string => $operation->value, $gates)), $reply->value]);
         $errors = async(static fn (): string => buffer($peer->getStderr()));
         $errors->ignore();
         $reader = new BufferedReader($peer->getStdout());
