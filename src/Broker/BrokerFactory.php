@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Broker;
 
 use Amp\Cancellation;
+use Amp\CompositeCancellation;
+use Amp\TimeoutCancellation;
 use Fabpot\Amp\Sqlite\Worker\Operation;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Sqlite\QueueWorkerOperation;
@@ -26,11 +28,12 @@ use function Amp\Socket\listen;
 final class BrokerFactory
 {
     /**
-     * @param SqliteSynchronousMode   $synchronous       NORMAL is the product default; FULL enables stronger commit durability
-     * @param int                     $visibilityTimeout redelivery delay in milliseconds; defaults to Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS
-     * @param (\Closure(): int)|null  $clock             notifier wall-clock milliseconds; mutation clocks run in the worker
-     * @param ?Cancellation           $cancellation      cooperative cancellation for the blocking startup only; serving cancellation stays on Broker::run()
-     * @param class-string<Operation> $workerOperation   worker implementation with its own injected clock
+     * @param SqliteSynchronousMode   $synchronous                    NORMAL is the product default; FULL enables stronger commit durability
+     * @param int                     $visibilityTimeout              redelivery delay in milliseconds; defaults to Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS
+     * @param (\Closure(): int)|null  $clock                          notifier wall-clock milliseconds; mutation clocks run in the worker
+     * @param ?Cancellation           $cancellation                   cooperative cancellation for the blocking startup only; serving cancellation stays on Broker::run()
+     * @param class-string<Operation> $workerOperation                worker implementation with its own injected clock
+     * @param float                   $storageOperationTimeoutSeconds overall storage startup and per-operation budgets in seconds
      */
     public function __construct(
         private readonly string $database,
@@ -40,9 +43,16 @@ final class BrokerFactory
         private readonly ?Cancellation $cancellation = null,
         private readonly SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal,
         private readonly string $workerOperation = QueueWorkerOperation::class,
+        private readonly float $storageOperationTimeoutSeconds = Broker::STORAGE_OPERATION_TIMEOUT_SECONDS,
     ) {
         if ($visibilityTimeout <= 0) {
             throw new \InvalidArgumentException('Visibility timeout must be positive milliseconds.');
+        }
+        if (!is_finite($storageOperationTimeoutSeconds)) {
+            throw new \InvalidArgumentException('Storage operation timeout must be finite seconds.');
+        }
+        if ($storageOperationTimeoutSeconds <= 0) {
+            throw new \InvalidArgumentException('Storage operation timeout must be positive seconds.');
         }
     }
 
@@ -71,7 +81,10 @@ final class BrokerFactory
             }
 
             $this->assertNotCancelled();
-            $storage = SqliteQueueStorage::open($locks->database, $this->synchronous, $this->cancellation, $this->workerOperation);
+            $startupDeadline = new TimeoutCancellation($this->storageOperationTimeoutSeconds, 'Broker storage startup deadline expired.');
+            $startupCancellation = null === $this->cancellation ? $startupDeadline : new CompositeCancellation($this->cancellation, $startupDeadline);
+            $storage = SqliteQueueStorage::open($locks->database, $this->synchronous, $startupCancellation, $this->workerOperation);
+            unset($startupCancellation, $startupDeadline);
             $release[] = $storage->close(...);
             $clock = $this->clock ?? static fn (): int => (int) floor(microtime(true) * 1000);
             $queue = new Queue($storage, $this->visibilityTimeout);
@@ -100,7 +113,7 @@ final class BrokerFactory
             $this->yieldToEventLoop();
             $this->assertNotCancelled();
 
-            return new Broker($server, $queue, $storage, $locks, $socketIdentity, $clock);
+            return new Broker($server, $queue, $storage, $locks, $socketIdentity, $clock, $this->storageOperationTimeoutSeconds);
         } catch (\Throwable $error) {
             foreach (array_reverse($release) as $step) {
                 try {
