@@ -17,6 +17,8 @@ use Fabpot\Amp\Sqlite\Worker\Operation;
 use Fabpot\Amp\Sqlite\Worker\OperationExecutor;
 use Fabpot\Amp\Sqlite\Worker\Outcome;
 
+use function Amp\async;
+
 /** Complete queue operations over the driver's exclusively owned serial executor. */
 final class SqliteQueueStorage
 {
@@ -34,7 +36,8 @@ final class SqliteQueueStorage
     }
 
     /**
-     * Cancellation applies to acquisition. The operation class injects its worker clock.
+     * Cancellation covers acquisition, configuration readback and schema setup.
+     * The operation class injects its worker clock.
      *
      * @param class-string<Operation> $workerOperation
      */
@@ -54,13 +57,13 @@ final class SqliteQueueStorage
             ->withPragma('wal_autocheckpoint', self::WAL_AUTOCHECKPOINT_PAGES)
             ->withWorkerOperations([QueueWorkerProtocol::OPERATION_NAME => $workerOperation]);
 
-        return self::fromConnection((new SqliteConnector())->connect($config, $cancellation), $synchronous);
+        return self::fromConnection((new SqliteConnector())->connect($config, $cancellation), $synchronous, $cancellation);
     }
 
-    /** Transfers an acquired connection, including cleanup on startup failure. */
-    public static function fromConnection(SqliteWorkerOperationConnection $connection, SqliteSynchronousMode $synchronous): self
+    /** Transfers an acquired connection. Optional cancellation also bounds readback/schema initialization. */
+    public static function fromConnection(SqliteWorkerOperationConnection $connection, SqliteSynchronousMode $synchronous, ?Cancellation $cancellation = null): self
     {
-        try {
+        $initialization = async(static function () use ($connection, $synchronous): self {
             $configuration = [
                 'journal_mode' => (string) self::scalar($connection, 'PRAGMA journal_mode'),
                 'synchronous' => match (self::scalar($connection, 'PRAGMA synchronous')) {
@@ -85,9 +88,17 @@ final class SqliteQueueStorage
             $executor = $connection->createWorkerOperationExecutor(QueueWorkerProtocol::MAXIMUM_RESULT_BYTES, QueueWorkerProtocol::MAXIMUM_RESULT_ROWS);
 
             return new self($connection, $executor, $configuration);
+        });
+        $initialization->ignore();
+        try {
+            return $initialization->await($cancellation);
         } catch (\Throwable $error) {
-            $connection->close();
-            throw $error;
+            try {
+                $connection->close($cancellation);
+            } finally {
+                // Cleanup must not replace the original initialization failure.
+                throw $error;
+            }
         }
     }
 

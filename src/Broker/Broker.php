@@ -31,6 +31,8 @@ use function Amp\async;
 final class Broker
 {
     public const int MAX_CONNECTIONS = Limits::MAX_CONNECTIONS;
+    /** Whole storage call, including serial-executor ownership and worker reply, in seconds. */
+    public const float STORAGE_OPERATION_TIMEOUT_SECONDS = 10;
     private const int HANDSHAKE_TIMEOUT = 5;
     private const int OPERATION_TIMEOUT = 30;
     private const int WRITE_TIMEOUT = 5;
@@ -39,6 +41,8 @@ final class Broker
     private const int SHUTDOWN_BUDGET_SECONDS = 5;
     /** @var array<int, array{socket: Socket, ownerId: string, lifetime: DeferredCancellation, future: Future<void>}> */
     private array $clients = [];
+    /** @var list<Future<void>> Close work admitted once, when the first stop request starts shutdown. */
+    private array $shutdownTasks = [];
     private bool $stopping = false;
     private bool $started = false;
     private bool $failed = false;
@@ -60,10 +64,17 @@ final class Broker
         private readonly BrokerLifetimeLocks $locks,
         private readonly SocketIdentity $socketIdentity,
         private readonly \Closure $clock,
+        private readonly float $storageOperationTimeoutSeconds,
     ) {
+        if (!is_finite($storageOperationTimeoutSeconds)) {
+            throw new \InvalidArgumentException('Storage operation timeout must be finite seconds.');
+        }
+        if ($storageOperationTimeoutSeconds <= 0) {
+            throw new \InvalidArgumentException('Storage operation timeout must be positive seconds.');
+        }
         $this->deadline = new DeferredCancellation();
         $this->notifier = new QueueNotifier(
-            $this->queue->earliestEligibility(...),
+            fn (QueueName $name, ?Cancellation $cancellation): ?int => $this->storageOperation(fn (): ?int => $this->queue->earliestEligibility($name, $cancellation)),
             $this->clock,
             function (\Throwable $error): void {
                 $this->failed = true;
@@ -127,17 +138,24 @@ final class Broker
             // budget already covers every step below and this path must never arm a second timer.
             $this->stop();
             $budget = $this->deadline->getCancellation();
+            // Close before draining sessions: pending SQL does not accept session cancellation.
+            // Closing the executor blocks queued work and the driver releases stalled callers.
+            foreach ($this->shutdownTasks as $task) {
+                try {
+                    // Driver close enforces the shared budget itself. Observe its completion
+                    // before releasing locks, rather than abandoning close at that same deadline.
+                    $task->await();
+                } catch (\Throwable $error) {
+                    $failure ??= $error;
+                }
+            }
+            $this->shutdownTasks = [];
             foreach ($this->clients as $client) {
                 try {
                     $client['future']->await($budget);
                 } catch (\Throwable $error) {
                     $failure ??= $error;
                 }
-            }
-            try {
-                $this->storage->close($budget);
-            } catch (\Throwable $error) {
-                $failure ??= $error;
             }
             $this->disarmShutdownDeadline();
             if (null !== $subscription) {
@@ -164,6 +182,9 @@ final class Broker
             // socket closes, so the budget covers every step that follows. Later requests, including
             // the serving loop's own stop() in its finally, share that one deadline and never rearm it.
             $this->armShutdownDeadline();
+            $close = async(fn () => $this->storage->close($this->deadline->getCancellation()));
+            $close->ignore();
+            $this->shutdownTasks[] = $close;
         }
         $this->server->close();
         $this->notifier->close();
@@ -238,7 +259,10 @@ final class Broker
                     $response = new Frame(['v' => Frame::VERSION, 'id' => 0, 'ok' => true, 'result' => ['max_payload' => Frame::MAX_PAYLOAD]]);
                 } else {
                     try {
-                        $response = $this->dispatch($request, $operation, $ownerId, $lifetime, $expected, $socket);
+                        $response = match ($operation) {
+                            Operation::Wait, Operation::WaitAny => $this->dispatch($request, $operation, $ownerId, $lifetime, $expected, $socket),
+                            default => $this->storageOperation(fn (): Frame => $this->dispatch($request, $operation, $ownerId, $lifetime, $expected, $socket)),
+                        };
                     } catch (ClientContextClosedException) {
                         // Disconnect and shutdown cancellation end the session, not the broker.
                         return;
@@ -291,6 +315,36 @@ final class Broker
             Frame::write($socket, $response->encode(), new TimeoutCancellation(self::WRITE_TIMEOUT));
         } catch (\Throwable) {
             // A malformed or disconnected peer may be unable to receive its error.
+        }
+    }
+
+    /**
+     * @template T
+     *
+     * @param \Closure(): T $operation
+     *
+     * @return T
+     */
+    private function storageOperation(\Closure $operation): mixed
+    {
+        $this->assertRunning();
+        $timeout = new TimeoutCancellation($this->storageOperationTimeoutSeconds, 'Broker storage operation deadline expired; outcome may be unknown.');
+        // Expiry fails the broker even if the operation and cancellation complete together.
+        $subscription = $timeout->subscribe(function (): void {
+            $this->failed = true;
+            $this->stop();
+        });
+        $future = async(function () use ($operation): mixed {
+            $this->assertRunning();
+
+            return $operation();
+        });
+        // Expiry abandons this await, not SQL. Driver close settles and observes the operation.
+        $future->ignore();
+        try {
+            return $future->await($timeout);
+        } finally {
+            $timeout->unsubscribe($subscription);
         }
     }
 

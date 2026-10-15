@@ -101,7 +101,7 @@ Send SIGTERM or SIGINT, or press Ctrl-C in the foreground terminal. Wait for pro
 
 Shutdown shares one five-second budget across client draining and driver close. The broker passes the remaining budget to the driver, which terminates an unresponsive child. Cleanup removes only the broker's own socket and then releases the database and endpoint locks.
 
-SQLite's 5,000-millisecond busy timeout does not bound a whole operation. Waiting for SQL does not block socket or signal handling. Use an external supervisor for a hard process-exit deadline. See [cancellation and budgets](sqlite-worker.md#cancellation-and-budgets).
+The broker bounds each storage operation, including serial ownership waiting, by 10 seconds. Expiry stops service and closes the driver; unconfirmed writes remain uncertain and are never replayed. This budget also covers notifier eligibility lookups, but not WAIT durations or idle connections. The `BrokerFactory` constructor's `storageOperationTimeoutSeconds` argument configures the serving and storage-startup budgets. SQLite's separate 5,000-millisecond busy timeout does not bound a whole operation. Waiting for SQL does not block socket or signal handling. Use an external supervisor for a hard process-exit deadline. See [cancellation and budgets](sqlite-worker.md#cancellation-and-budgets).
 
 If an endpoint remains after an abrupt exit, do not delete it just because a connection attempt fails. Verify that no broker or other listener owns it before removal, or choose another endpoint. Startup refuses existing sockets, regular files, and symlinks.
 
