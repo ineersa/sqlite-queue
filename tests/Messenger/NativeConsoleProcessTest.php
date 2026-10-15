@@ -18,6 +18,7 @@ use Ineersa\SqliteQueue\Tests\Support\ClockFile;
 use Ineersa\SqliteQueue\Tests\Support\ControlledQueueWorkerOperation;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
 use Ineersa\SqliteQueue\Tests\Support\ProcessTree;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\RequiresOperatingSystem;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
@@ -219,6 +220,48 @@ final class NativeConsoleProcessTest extends TestCase
         }
     }
 
+    /** @return iterable<string, array{int}> */
+    public static function keepaliveLeases(): iterable
+    {
+        yield 'default sixty seconds' => [\Ineersa\SqliteQueue\Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS];
+        yield 'more than twenty-four hours' => [25 * 60 * 60 * 1000];
+    }
+
+    #[DataProvider('keepaliveLeases')]
+    public function testNativeKeepaliveRenewsWhileHandlerRemainsActive(int $leaseMilliseconds): void
+    {
+        $this->startBroker($leaseMilliseconds);
+        $publisher = (new \Ineersa\SqliteQueue\Messenger\TransportFactory())->createTransport(
+            'sqlite-queue://jobs?endpoint='.rawurlencode($this->endpoint()), [], new PhpSerializer(),
+        );
+        try {
+            $publisher->send(new Envelope(new Fixtures\NativeApp\Message\NativeKeepaliveMessage()));
+        } finally {
+            $publisher->close();
+        }
+        // Omit the value to exercise stock Messenger's five-second keepalive interval.
+        $consumer = $this->console(['messenger:consume', 'async', '--keepalive', '--limit=1', '--quiet']);
+        $reader = new BufferedReader($consumer->getStdout());
+        $this->assertSame('handler-ready', $reader->readUntil("\n", new TimeoutCancellation(self::SAFETY_SECONDS)));
+        $initialNow = $this->now;
+        foreach ([1, 2] as $round) {
+            $this->setNow($initialNow + $round * ($leaseMilliseconds - 1000));
+            $consumer->getStdin()->write("keepalive\n");
+            $this->assertSame('keepalive-complete', $reader->readUntil("\n", new TimeoutCancellation(self::SAFETY_SECONDS)));
+            $database = new \SQLite3($this->database());
+            try {
+                $this->assertSame($this->now + $leaseMilliseconds, $database->querySingle('SELECT reserved_until FROM queue_messages'));
+            } finally {
+                $database->close();
+            }
+            $this->assertTrue($consumer->isRunning(), 'A renewal must not complete the handler.');
+        }
+        $consumer->getStdin()->write("release\n");
+        $this->assertExit($consumer, 0);
+        $this->assertOwnedGone();
+        $this->assertSame(0, $this->messageCount());
+    }
+
     /** @param list<string> $arguments */
     private function console(array $arguments): Process
     {
@@ -250,13 +293,14 @@ final class NativeConsoleProcessTest extends TestCase
         $this->now = $value;
     }
 
-    private function startBroker(): void
+    private function startBroker(int $leaseMilliseconds = \Ineersa\SqliteQueue\Queue::DEFAULT_VISIBILITY_TIMEOUT_MILLISECONDS): void
     {
         $database = $this->database();
         ClockFile::configure($this->database(), $this->now);
         $broker = (new BrokerFactory(
             $database,
             $this->endpoint(),
+            visibilityTimeout: $leaseMilliseconds,
             clock: fn (): int => $this->now,
             workerOperation: ControlledQueueWorkerOperation::class,
         ))->create();

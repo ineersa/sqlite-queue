@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue;
 
+use Amp\ByteStream\ResourceStream;
 use Amp\Cancellation;
 use Amp\CompositeCancellation;
 use Amp\Socket\ConnectContext;
@@ -15,6 +16,7 @@ use Ineersa\SqliteQueue\Exception\TransportException;
 use Ineersa\SqliteQueue\Protocol\ControlField;
 use Ineersa\SqliteQueue\Protocol\ErrorCode;
 use Ineersa\SqliteQueue\Protocol\Frame;
+use Ineersa\SqliteQueue\Protocol\KeepaliveStream;
 use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Protocol\Operation;
 use Ineersa\SqliteQueue\Protocol\ProtocolException;
@@ -32,9 +34,14 @@ use function Amp\Socket\connect;
  */
 final class Client
 {
+    private const string RECEIPT_KEY_PREFIX = 'receipt:';
+
     private int $nextId = 0;
     private bool $busy = false;
     private bool $closed = false;
+    /** @var array<string, array{receipt: string, minimum: int, error: \Closure(\Throwable): void}> Coalesced only until the active exchange completes. */
+    private array $pendingKeepalives = [];
+    private bool $flushingKeepalives = false;
 
     private function __construct(private readonly Socket $socket, private readonly float $timeout)
     {
@@ -130,6 +137,49 @@ final class Client
         $this->settle(Operation::Acknowledge, $receipt, $cancellation);
     }
 
+    /** Zero minimum selects the broker's reservation duration; cancellation is optional for callers. */
+    public function keepalive(string $receipt, int $minimumMilliseconds = 0, ?Cancellation $cancellation = null): int
+    {
+        if ($minimumMilliseconds < 0) {
+            throw new \InvalidArgumentException('Keepalive duration must be nonnegative milliseconds.');
+        }
+
+        return $this->exchange(
+            Operation::Keepalive,
+            self::keepaliveDeadline(...),
+            [ControlField::Receipt->value => $receipt, ControlField::KeepaliveMilliseconds->value => $minimumMilliseconds],
+            cancellation: $cancellation,
+        );
+    }
+
+    /**
+     * Native SIGALRM callbacks cannot switch fibers. Borrow this same socket for a bounded
+     * renewal, or coalesce it until the interrupted exchange completes. Null means deferred.
+     * The observer records deferred failures without throwing, so a confirmed exchange stays successful.
+     * Closing discards coalesced renewals without notifying observers.
+     *
+     * @param \Closure(\Throwable): void $onDeferredError
+     */
+    public function keepaliveSignalSafe(string $receipt, int $minimumMilliseconds, \Closure $onDeferredError): ?int
+    {
+        if ($minimumMilliseconds < 0) {
+            throw new \InvalidArgumentException('Keepalive duration must be nonnegative milliseconds.');
+        }
+        if ($this->closed) {
+            throw new TransportException('Client is closed; create a new connection explicitly.');
+        }
+        if ($this->busy || $this->flushingKeepalives) {
+            // A prefix preserves opaque numeric strings instead of coercing them to integer keys.
+            $key = self::RECEIPT_KEY_PREFIX.$receipt;
+            $minimum = max($minimumMilliseconds, $this->pendingKeepalives[$key]['minimum'] ?? 0);
+            $this->pendingKeepalives[$key] = ['receipt' => $receipt, 'minimum' => $minimum, 'error' => $onDeferredError];
+
+            return null;
+        }
+
+        return $this->keepaliveWithoutSuspending($receipt, $minimumMilliseconds);
+    }
+
     public function reject(string $receipt, ?Cancellation $cancellation = null): void
     {
         $this->settle(Operation::Reject, $receipt, $cancellation);
@@ -209,7 +259,64 @@ final class Client
     public function close(): void
     {
         $this->closed = true;
+        $this->pendingKeepalives = [];
         $this->socket->close();
+    }
+
+    private function keepaliveWithoutSuspending(string $receipt, int $minimumMilliseconds): int
+    {
+        if (!$this->socket instanceof ResourceStream) {
+            throw new TransportException('Signal-safe keepalive requires a resource-backed operations socket.');
+        }
+
+        return $this->exchange(
+            Operation::Keepalive,
+            self::keepaliveDeadline(...),
+            [ControlField::Receipt->value => $receipt, ControlField::KeepaliveMilliseconds->value => $minimumMilliseconds],
+            keepaliveIo: new KeepaliveStream($this->socket, $this->timeout),
+        );
+    }
+
+    private static function keepaliveDeadline(Frame $reply): int
+    {
+        $deadline = self::readInteger($reply->control[ControlField::Result->value], 'KEEPALIVE result');
+        if ($deadline < 0) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'KEEPALIVE result must be nonnegative Unix milliseconds.');
+        }
+        self::assertNoPayload($reply, 'KEEPALIVE');
+
+        return $deadline;
+    }
+
+    private function flushKeepalives(bool $signalSafe): void
+    {
+        if ($this->flushingKeepalives || $this->busy) {
+            return;
+        }
+        $this->flushingKeepalives = true;
+        try {
+            // Detach in one operation so a signal cannot clear or replace half a dequeue.
+            // New ticks stay in the live queue and cannot extend this caller's drain.
+            $snapshot = array_splice($this->pendingKeepalives, 0);
+            foreach ($snapshot as $pending) {
+                if ($this->closed) {
+                    break;
+                }
+                $receipt = $pending['receipt'];
+                try {
+                    if ($signalSafe) {
+                        $this->keepaliveWithoutSuspending($receipt, $pending['minimum']);
+                    } else {
+                        // Ordinary API completion stays on Amp, including deferred renewal I/O.
+                        $this->keepalive($receipt, $pending['minimum']);
+                    }
+                } catch (\Throwable $error) {
+                    ($pending['error'])($error);
+                }
+            }
+        } finally {
+            $this->flushingKeepalives = false;
+        }
     }
 
     private function settle(Operation $operation, string $receipt, ?Cancellation $cancellation): void
@@ -237,11 +344,12 @@ final class Client
      *
      * @param \Closure(Frame): T   $decode
      * @param array<string, mixed> $params
-     * @param float|null           $timeout null uses the normal transport bound; WAIT adds its requested duration
+     * @param float|null           $timeout     null uses the normal transport bound; WAIT adds its requested duration
+     * @param KeepaliveStream|null $keepaliveIo null selects Amp I/O; native signal renewal borrows the stream
      *
      * @return T
      */
-    private function exchange(Operation $operation, \Closure $decode, array $params = [], string $body = '', string $headers = '', ?Cancellation $cancellation = null, ?float $timeout = null): mixed
+    private function exchange(Operation $operation, \Closure $decode, array $params = [], string $body = '', string $headers = '', ?Cancellation $cancellation = null, ?float $timeout = null, ?KeepaliveStream $keepaliveIo = null): mixed
     {
         if ($this->closed) {
             throw new TransportException('Client is closed; create a new connection explicitly.');
@@ -249,6 +357,30 @@ final class Client
         if ($this->busy) {
             throw new \LogicException('Only one outstanding request is permitted per client.');
         }
+        // Protect encoding, sequence allocation, decoding and cleanup, not just socket I/O.
+        $this->busy = true;
+        try {
+            return $this->performExchange($operation, $decode, $params, $body, $headers, $cancellation, $timeout, $keepaliveIo);
+        } finally {
+            if (Operation::Acknowledge === $operation || Operation::Reject === $operation) {
+                unset($this->pendingKeepalives[self::RECEIPT_KEY_PREFIX.$params[ControlField::Receipt->value]]);
+            }
+            $this->busy = false;
+            $this->flushKeepalives(null !== $keepaliveIo);
+        }
+    }
+
+    /**
+     * @template T
+     *
+     * @param \Closure(Frame): T   $decode
+     * @param array<string, mixed> $params
+     * @param ?KeepaliveStream     $keepaliveIo only the signal-safe renewal supplies native I/O
+     *
+     * @return T
+     */
+    private function performExchange(Operation $operation, \Closure $decode, array $params, string $body, string $headers, ?Cancellation $cancellation, ?float $timeout, ?KeepaliveStream $keepaliveIo): mixed
+    {
         $id = $this->nextId;
         // Local encoding never consumes the sequence. An oversize payload throws ProtocolException
         // with the connection usable. Unencodable control is also a local validation failure:
@@ -263,18 +395,21 @@ final class Client
             throw new ProtocolException(ErrorCode::InvalidRequest, 'Request control is not valid UTF-8 JSON.');
         }
         ++$this->nextId;
-        $deadline = new TimeoutCancellation($timeout ?? $this->timeout);
-        $cancellation = null === $cancellation ? $deadline : new CompositeCancellation($deadline, $cancellation);
-        $this->busy = true;
         $reply = null;
         $ioFailure = null;
         try {
-            Frame::write($this->socket, $bytes, $cancellation);
-            $reply = Frame::read($this->socket, $cancellation);
+            if (null === $keepaliveIo) {
+                $deadline = new TimeoutCancellation($timeout ?? $this->timeout);
+                $cancellation = null === $cancellation ? $deadline : new CompositeCancellation($deadline, $cancellation);
+                Frame::write($this->socket, $bytes, $cancellation);
+                $reply = Frame::read($this->socket, $cancellation);
+            } else {
+                $keepaliveIo->write($bytes);
+                $reply = Frame::readUsing($keepaliveIo->read(...));
+            }
         } catch (\Throwable $error) {
             $ioFailure = $error;
         }
-        $this->busy = false;
         if (null !== $ioFailure) {
             $this->close();
             if ($ioFailure instanceof TransportException || $ioFailure instanceof ProtocolException) {

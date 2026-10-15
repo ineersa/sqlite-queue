@@ -81,6 +81,106 @@ final class QueueTest extends ProcessTestCase
         $this->assertSame('wal', $this->scalar('PRAGMA journal_mode'));
     }
 
+    public function testRepeatedKeepaliveHasNoTotalLifetimeAndRedeliversOnlyAtLastExpiry(): void
+    {
+        $queue = $this->open();
+        $owner = $this->owner();
+        $queue->send($this->queueName(), 'long handler');
+        $delivery = $queue->receive($this->queueName(), $owner);
+        $originalExpiry = $delivery->reservedUntil;
+        for ($renewal = 0; $renewal < 4; ++$renewal) {
+            $this->now += 0 === $renewal ? 4000 : 3_599_000;
+            $deadline = $queue->keepalive($delivery->receipt, $owner, 3_600_000);
+            $this->assertSame($this->now + 3_600_000, $deadline);
+            $this->assertNull($queue->receive($this->queueName(), $this->owner()));
+        }
+        $this->assertGreaterThan($originalExpiry, $this->now);
+        $this->now = $deadline - 1;
+        $this->assertNull($queue->receive($this->queueName(), $this->owner()));
+        $this->now = $deadline;
+        $this->receiptFailure(static fn () => $queue->keepalive($delivery->receipt, $owner), new ExpiredReceiptException());
+        $replacement = $queue->receive($this->queueName(), $owner);
+        $this->assertSame($delivery->id, $replacement->id);
+        $this->assertNotSame($delivery->receipt, $replacement->receipt);
+        $this->receiptFailure(static fn () => $queue->keepalive($delivery->receipt, $owner), new ReceiptTokenMismatchException());
+        $queue->acknowledge($replacement->receipt, $owner);
+    }
+
+    public function testKeepaliveDefaultMinimumNeverShortensAndOriginalReceiptCanSettle(): void
+    {
+        $queue = $this->open();
+        $owner = $this->owner();
+        foreach (['acknowledge', 'reject'] as $settlement) {
+            $queue->send($this->queueName(), 'payload');
+            $delivery = $queue->receive($this->queueName(), $owner);
+            $this->now += 1000;
+            $this->assertSame($this->now + 5000, $queue->keepalive($delivery->receipt, $owner));
+            $extended = $queue->keepalive($delivery->receipt, $owner, 10_000);
+            $this->assertSame($extended, $queue->keepalive($delivery->receipt, $owner));
+            $this->now += 5000;
+            $this->mutate($queue, $owner, $delivery->receipt, $settlement);
+            $this->receiptFailure(static fn () => $queue->keepalive($delivery->receipt, $owner), new NoActiveReservationException());
+        }
+        $this->assertSame(0, $this->scalar('SELECT count(*) FROM queue_messages'));
+    }
+
+    public function testKeepaliveInvalidDurationAndOverflowLeaveReservationAndStorageHealthy(): void
+    {
+        $queue = $this->open();
+        $owner = $this->owner();
+        $queue->send($this->queueName(), 'payload');
+        $delivery = $queue->receive($this->queueName(), $owner);
+        foreach ([-1, \PHP_INT_MAX] as $minimum) {
+            try {
+                $queue->keepalive($delivery->receipt, $owner, $minimum);
+                $this->fail('Invalid duration must fail without renewing.');
+            } catch (\InvalidArgumentException) {
+                $this->assertSame($delivery->reservedUntil, $this->scalar('SELECT reserved_until FROM queue_messages'));
+            }
+        }
+        $this->assertSame($delivery->reservedUntil, $queue->keepalive($delivery->receipt, $owner));
+        $queue->acknowledge($delivery->receipt, $owner);
+    }
+
+    public function testMalformedKeepaliveReceiptIsNotAReservationMismatch(): void
+    {
+        $queue = $this->open();
+        foreach (self::malformedReceipts() as [$receipt]) {
+            $this->receiptFailure(static fn () => $queue->keepalive($receipt, 'owner'), new MalformedReceiptException());
+        }
+    }
+
+    public function testKeepaliveSamplesClockAfterTransactionAcquisition(): void
+    {
+        $queue = $this->open();
+        $owner = $this->owner();
+        $queue->send($this->queueName(), 'payload');
+        $delivery = $queue->receive($this->queueName(), $owner);
+        $deadline = $this->clockGate(
+            static fn () => $queue->keepalive($delivery->receipt, $owner),
+            function (): void { $this->now += 1000; },
+        );
+        $this->assertSame($this->now + 5000, $deadline);
+    }
+
+    public function testIgnoredMatchingKeepaliveIsStorageFailureWithoutNativeCodes(): void
+    {
+        $queue = $this->open();
+        $owner = $this->owner();
+        $receipt = $this->prepareOperation($queue, $owner, 'keepalive');
+        $this->exec('CREATE TRIGGER ignore_keepalive BEFORE UPDATE ON queue_messages BEGIN SELECT RAISE(IGNORE); END');
+        try {
+            $queue->keepalive($receipt, $owner);
+            $this->fail('A matching reservation was not renewed.');
+        } catch (SqliteQueryError $error) {
+            $this->assertSame('Keepalive UPDATE failed despite a matching active reservation.', $error->getMessage());
+            $this->assertNull($error->getResultCode());
+            $this->assertNull($error->getExtendedResultCode());
+        }
+        $this->exec('DROP TRIGGER ignore_keepalive');
+        $queue->acknowledge($receipt, $owner);
+    }
+
     public function testDelayedOrderingAndRestartPreserveOriginalDeadlines(): void
     {
         $queue = $this->open();
@@ -674,6 +774,7 @@ final class QueueTest extends ProcessTestCase
     {
         yield 'ack' => ['acknowledge'];
         yield 'reject' => ['reject'];
+        yield 'keepalive' => ['keepalive'];
     }
 
     public static function mutations(): iterable
@@ -682,6 +783,7 @@ final class QueueTest extends ProcessTestCase
         yield 'claim' => ['receive'];
         yield 'ack' => ['acknowledge'];
         yield 'reject' => ['reject'];
+        yield 'keepalive' => ['keepalive'];
     }
 
     private function clockGate(callable $operation, callable $afterAcquisition): mixed
@@ -836,6 +938,7 @@ final class QueueTest extends ProcessTestCase
             'receive' => $queue->receive($this->queueName(), $ownerId, $cancellation),
             'acknowledge' => $queue->acknowledge($receipt, $ownerId, $cancellation),
             'reject' => $queue->reject($receipt, $ownerId, $cancellation),
+            'keepalive' => $queue->keepalive($receipt, $ownerId, cancellation: $cancellation),
         };
     }
 }

@@ -61,7 +61,27 @@ Both broker commands accept `--redeliver-timeout` in positive integer **seconds*
 
 The PHP engine and `BrokerFactory::visibilityTimeout` use **milliseconds**, default **60,000**. Transport `options.timeout` remains a separate communication setting.
 
-There is no lease renewal. Choose a reservation duration that covers your handler, including deferred batch processing. After expiry, another worker can reclaim the message and the original ACK fails, even if no worker has reclaimed it yet. A 60-second lease is not safe for every handler. Make external effects idempotent.
+Without keepalive, choose a reservation duration that covers your handler, including deferred batch processing. After expiry, another worker can reclaim the message and the original ACK fails, even if no worker has reclaimed it yet.
+
+## Keep long-running handlers alive
+
+Enable Symfony's native keepalive for consumers whose handlers can outlive one reservation:
+
+```sh
+	php bin/console messenger:consume email reports --keepalive
+```
+
+The stock keepalive interval is **5 seconds**. Use `--keepalive=15` for a 15-second interval. Choose an interval comfortably shorter than the broker's reservation duration, which remains **60 seconds** by default. Native scheduling requires `pcntl` signal support.
+
+The consumer initiates each renewal. The broker validates the existing receipt, connection owner, epoch, token and unexpired reservation, then commits an extended deadline without changing the receipt. Renewals never shorten a lease. The transport uses the same operations connection that received the message, never its notification connection. ACK, reject and close end pending renewal work.
+
+A handler can run for 30 minutes, 24 hours or longer while renewals succeed. There is no cumulative processing cap. `--keepalive` does not enforce or extend a handler execution budget; the application owns that budget. Each renewal remains a bounded communication exchange, separate from storage-operation deadlines and reservation expiry.
+
+Symfony invokes keepalive from `SIGALRM`. For that call only, the client performs bounded native socket I/O without switching fibers. If a signal interrupts an exchange or deferred drain, it coalesces one pending renewal per active receipt. After the exchange finishes, the client drains a fixed snapshot of pending renewals. Ticks arriving during that drain remain queued for a later exchange or keepalive tick; they cannot keep the current caller draining indefinitely. A deferred renewal failure does not erase an already confirmed send or settlement. It surfaces on the next transport operation or close, with its original exception preserved.
+
+An expired or reclaimed reservation cannot be revived. A broker restart or replacement connection also loses receipt ownership. A failed renewal can leave its outcome unknown; the transport does not reconnect or replay it. Symfony reports keepalive failures, but a failed heartbeat does not itself terminate a running handler. Decide how your application stops work after losing ownership.
+
+Make external effects idempotent. A disconnected consumer can continue processing after its lease expires while another worker claims the message. Renewal and receipt fencing do not guarantee exactly-once effects.
 
 ## Failures and recovery
 

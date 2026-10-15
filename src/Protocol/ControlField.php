@@ -19,6 +19,7 @@ enum ControlField: string
     case Queue = 'queue';
     case Delay = 'delay';
     case Receipt = 'receipt';
+    case KeepaliveMilliseconds = 'keepalive_ms';
     case WaitMilliseconds = 'wait_ms';
     case Queues = 'queues';
     case MaxPayload = 'max_payload';

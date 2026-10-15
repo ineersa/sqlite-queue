@@ -19,6 +19,7 @@ use Symfony\Component\Messenger\Exception\TransportException;
 use Symfony\Component\Messenger\Stamp\DelayStamp;
 use Symfony\Component\Messenger\Stamp\TransportMessageIdStamp;
 use Symfony\Component\Messenger\Transport\CloseableTransportInterface;
+use Symfony\Component\Messenger\Transport\Receiver\KeepaliveReceiverInterface;
 use Symfony\Component\Messenger\Transport\Serialization\SerializerInterface;
 use Symfony\Component\Messenger\Transport\TransportInterface;
 
@@ -30,11 +31,15 @@ use Symfony\Component\Messenger\Transport\TransportInterface;
  * NUL is preserved, invalid UTF-8 is rejected. get() claims at most one committed
  * delivery. ACK and reject settle the original receipt only and never retry.
  */
-final class Transport implements TransportInterface, CloseableTransportInterface
+final class Transport implements TransportInterface, CloseableTransportInterface, KeepaliveReceiverInterface
 {
     /** Failure-envelope header that preserves opaque broker header bytes when they are not a JSON object. */
     public const string RAW_HEADERS_HEADER = 'x-sqlite-queue-raw-headers';
     private const int JSON_DEPTH = 32;
+    /** @var list<\Throwable> Retain only the first unobserved failure, not historical receipts. */
+    private array $keepaliveErrors = [];
+    /** @var \WeakMap<DeliveryReceiptStamp, true> Terminal requests end heartbeats before Symfony removes its envelope. */
+    private readonly \WeakMap $settledReceipts;
 
     /**
      * Owners must acquire distinct broker Clients. Cancelling notification WAIT closes that
@@ -49,6 +54,7 @@ final class Transport implements TransportInterface, CloseableTransportInterface
         private readonly BrokerConnection $notifications,
         private readonly string $brokerEndpoint,
     ) {
+        $this->settledReceipts = new \WeakMap();
         if ($operations === $notifications) {
             throw new \InvalidArgumentException('Operation and notification connection owners must be distinct.');
         }
@@ -71,6 +77,7 @@ final class Transport implements TransportInterface, CloseableTransportInterface
      */
     public function get(int $fetchSize = 1): iterable
     {
+        $this->throwDeferredKeepaliveError();
         if ($fetchSize < 1) {
             throw new \InvalidArgumentException('fetchSize must be a positive integer.');
         }
@@ -98,8 +105,44 @@ final class Transport implements TransportInterface, CloseableTransportInterface
         $this->settle($envelope, acknowledge: false);
     }
 
+    /** Null and zero select the broker's configured lease; seconds are a minimum, not a handler budget. */
+    public function keepalive(Envelope $envelope, ?int $seconds = null): void
+    {
+        $stamp = $this->receiptStamp($envelope);
+        $this->throwDeferredKeepaliveError();
+        $minimum = $seconds ?? 0;
+        if ($minimum < 0) {
+            throw new \InvalidArgumentException('Keepalive seconds must be nonnegative.');
+        }
+        if ($minimum > intdiv(\PHP_INT_MAX, 1000)) {
+            throw new \InvalidArgumentException('Keepalive seconds exceed the supported milliseconds range.');
+        }
+        if (isset($this->settledReceipts[$stamp])) {
+            // SIGALRM can interrupt terminal settlement, before Worker clears its keepalive list.
+            return;
+        }
+
+        try {
+            $this->operations->client()->keepaliveSignalSafe(
+                $stamp->receipt,
+                $minimum * 1000,
+                function (\Throwable $error): void {
+                    // Do not throw across the completion of an already confirmed send or ACK.
+                    if ([] === $this->keepaliveErrors) {
+                        $this->keepaliveErrors = [$error];
+                    }
+                },
+            );
+        } catch (InvalidReceiptException $error) {
+            throw new TransportException('The delivery receipt is no longer valid.', 0, $error);
+        } catch (ClientTransportException|ProtocolException $error) {
+            throw new TransportException('Could not keep the queue delivery alive.', 0, $error);
+        }
+    }
+
     public function send(Envelope $envelope): Envelope
     {
+        $this->throwDeferredKeepaliveError();
         $envelope = $envelope
             ->withoutAll(DeliveryReceiptStamp::class)
             ->withoutAll(TransportMessageIdStamp::class);
@@ -129,6 +172,7 @@ final class Transport implements TransportInterface, CloseableTransportInterface
      */
     public function wait(int $timeoutMilliseconds, Cancellation $cancellation): bool
     {
+        $this->throwDeferredKeepaliveError();
         try {
             return $this->notifications->client($cancellation)->wait($this->queue->value, $timeoutMilliseconds, $cancellation);
         } catch (CancelledException $error) {
@@ -147,6 +191,7 @@ final class Transport implements TransportInterface, CloseableTransportInterface
      */
     public function waitAny(array $queues, int $timeoutMilliseconds, Cancellation $cancellation): bool
     {
+        $this->throwDeferredKeepaliveError();
         try {
             return $this->notifications->client($cancellation)->waitAny($queues, $timeoutMilliseconds, $cancellation);
         } catch (CancelledException $error) {
@@ -173,17 +218,23 @@ final class Transport implements TransportInterface, CloseableTransportInterface
         } finally {
             $this->operations->close();
         }
+        $this->throwDeferredKeepaliveError();
+    }
+
+    private function throwDeferredKeepaliveError(): void
+    {
+        foreach ($this->keepaliveErrors as $error) {
+            $this->keepaliveErrors = [];
+
+            throw new TransportException('Deferred queue keepalive failed: '.$error->getMessage(), 0, $error);
+        }
     }
 
     private function settle(Envelope $envelope, bool $acknowledge): void
     {
-        $stamp = $envelope->last(DeliveryReceiptStamp::class);
-        if (!$stamp instanceof DeliveryReceiptStamp) {
-            throw new LogicException(\sprintf('No %s found on the Envelope.', DeliveryReceiptStamp::class));
-        }
-        if ($stamp->transport !== $this) {
-            throw new LogicException('The envelope was not received by this transport instance.');
-        }
+        $stamp = $this->receiptStamp($envelope);
+        $this->throwDeferredKeepaliveError();
+        $this->settledReceipts[$stamp] = true;
 
         try {
             if ($acknowledge) {
@@ -195,7 +246,24 @@ final class Transport implements TransportInterface, CloseableTransportInterface
             throw new TransportException('The delivery receipt is no longer valid.', 0, $error);
         } catch (ClientTransportException|ProtocolException $error) {
             throw new TransportException($acknowledge ? 'Could not acknowledge the delivery.' : 'Could not reject the delivery.', 0, $error);
+        } catch (\Throwable $error) {
+            unset($this->settledReceipts[$stamp]);
+
+            throw $error;
         }
+    }
+
+    private function receiptStamp(Envelope $envelope): DeliveryReceiptStamp
+    {
+        $stamp = $envelope->last(DeliveryReceiptStamp::class);
+        if (!$stamp instanceof DeliveryReceiptStamp) {
+            throw new LogicException(\sprintf('No %s found on the Envelope.', DeliveryReceiptStamp::class));
+        }
+        if ($stamp->transport !== $this) {
+            throw new LogicException('The envelope was not received by this transport instance.');
+        }
+
+        return $stamp;
     }
 
     private function createEnvelopeFromDelivery(DeliveryDTO $delivery): Envelope

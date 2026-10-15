@@ -101,6 +101,42 @@ final class BrokerTest extends TestCase
         });
     }
 
+    public function testKeepaliveExtendsExistingReceiptAndOverflowDoesNotStopBroker(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker();
+            $client = $this->connectClient();
+            $other = $this->connectClient();
+            $client->send('jobs', 'long handler');
+            $delivery = $client->receive('jobs');
+            $this->now += 1000;
+            $deadline = $client->keepalive($delivery->receipt, 10_000);
+            $this->assertSame($this->now + 10_000, $deadline);
+            $this->assertSame($deadline, $client->keepalive($delivery->receipt));
+            try {
+                $other->keepalive($delivery->receipt);
+                $this->fail('A foreign connection cannot renew.');
+            } catch (\Ineersa\SqliteQueue\Exception\ReceiptOwnerMismatchException) {
+                $this->addToAssertionCount(1);
+            }
+            $overflowClient = $this->connectClient();
+            $overflowClient->send('overflow', 'invalid duration');
+            $overflowDelivery = $overflowClient->receive('overflow');
+            try {
+                $overflowClient->keepalive($overflowDelivery->receipt, \PHP_INT_MAX);
+                $this->fail('Overflow must fail as application validation.');
+            } catch (\Ineersa\SqliteQueue\Protocol\ProtocolException $error) {
+                $this->assertSame(ErrorCode::InvalidRequest, $error->errorCode);
+                $this->assertFalse($this->brokerFuture->isComplete());
+            }
+            $this->now = $delivery->reservedUntil;
+            $this->assertFalse($other->wait('jobs', 0));
+            $this->assertNull($other->receive('jobs'));
+            $client->acknowledge($delivery->receipt);
+            $this->assertNull($other->receive('jobs'));
+        });
+    }
+
     public static function incompleteRequests(): iterable
     {
         yield 'handshake has no first byte' => [false, 0, self::HANDSHAKE_READ_TIMEOUT_SECONDS];
@@ -688,6 +724,13 @@ final class BrokerTest extends TestCase
         yield 'string delay' => ['string delay', 'invalid_request'];
         yield 'missing receipt' => ['missing receipt', 'invalid_request'];
         yield 'non-string receipt' => ['non-string receipt', 'invalid_request'];
+        yield 'negative keepalive' => ['negative keepalive', 'invalid_request'];
+        yield 'string keepalive' => ['string keepalive', 'invalid_request'];
+        yield 'missing keepalive duration' => ['missing keepalive duration', 'invalid_request'];
+        yield 'keepalive body' => ['keepalive body', 'invalid_request'];
+        yield 'keepalive headers' => ['keepalive headers', 'invalid_request'];
+        yield 'keepalive missing receipt' => ['keepalive missing receipt', 'invalid_request'];
+        yield 'keepalive non-string receipt' => ['keepalive non-string receipt', 'invalid_request'];
     }
 
     #[DataProvider('malformedTraffic')]
@@ -729,6 +772,13 @@ final class BrokerTest extends TestCase
                 'string delay' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'send', 'queue' => 'jobs', 'delay' => '5']))->encode(),
                 'missing receipt' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'acknowledge']))->encode(),
                 'non-string receipt' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'reject', 'receipt' => 7]))->encode(),
+                'negative keepalive' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'keepalive', 'receipt' => 'r', 'keepalive_ms' => -1]))->encode(),
+                'string keepalive' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'keepalive', 'receipt' => 'r', 'keepalive_ms' => '5']))->encode(),
+                'missing keepalive duration' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'keepalive', 'receipt' => 'r']))->encode(),
+                'keepalive body' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'keepalive', 'receipt' => 'r', 'keepalive_ms' => 0], 'body'))->encode(),
+                'keepalive headers' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'keepalive', 'receipt' => 'r', 'keepalive_ms' => 0], '', 'headers'))->encode(),
+                'keepalive missing receipt' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'keepalive', 'keepalive_ms' => 0]))->encode(),
+                'keepalive non-string receipt' => (new Frame(['v' => Frame::VERSION, 'id' => 1, 'op' => 'keepalive', 'receipt' => 7, 'keepalive_ms' => 0]))->encode(),
             };
             Frame::write($peer, $bytes, new TimeoutCancellation(5));
 

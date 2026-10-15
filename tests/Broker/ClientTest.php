@@ -110,6 +110,88 @@ final class ClientTest extends TestCase
         $this->assertSame(2, $received, 'The failed call must not be replayed on the wire.');
     }
 
+    public function testKeepaliveLocalValidationPreservesSequenceAndSendsDuration(): void
+    {
+        $endpoint = $this->serve(function (Socket $socket): void {
+            Frame::read($socket, new TimeoutCancellation(3));
+            $socket->write(self::helloReply());
+            foreach ([0, 10_000] as $index => $duration) {
+                $request = Frame::read($socket, new TimeoutCancellation(3));
+                $this->assertSame($index + 1, $request->control['id']);
+                $this->assertSame('keepalive', $request->control['op']);
+                $this->assertSame('receipt', $request->control['receipt']);
+                $this->assertSame($duration, $request->control['keepalive_ms']);
+                $this->assertSame('', $request->body);
+                $this->assertSame('', $request->headers);
+                $socket->write((new Frame(['v' => Frame::VERSION, 'id' => $index + 1, 'ok' => true, 'result' => 60_000 + $duration]))->encode());
+            }
+        });
+        $client = Client::connect($endpoint);
+        $this->clients[] = $client;
+        try {
+            $client->keepalive('receipt', -1);
+            $this->fail('Negative duration must fail before dispatch.');
+        } catch (\InvalidArgumentException) {
+            $this->addToAssertionCount(1);
+        }
+        $this->assertSame(60_000, $client->keepalive('receipt'));
+        $this->assertSame(70_000, $client->keepalive('receipt', 10_000));
+        $this->awaitBackground();
+    }
+
+    public function testLostKeepaliveReplyNeverReplays(): void
+    {
+        $requests = 0;
+        $endpoint = $this->serve(function (Socket $socket) use (&$requests): void {
+            Frame::read($socket, new TimeoutCancellation(3));
+            $socket->write(self::helloReply());
+            $request = Frame::read($socket, new TimeoutCancellation(3));
+            $this->assertSame('keepalive', $request->control['op']);
+            ++$requests;
+        });
+        $client = Client::connect($endpoint);
+        $this->clients[] = $client;
+        for ($attempt = 0; $attempt < 2; ++$attempt) {
+            try {
+                $client->keepalive('receipt');
+                $this->fail('A missing confirmation must not succeed.');
+            } catch (TransportException) {
+                $this->addToAssertionCount(1);
+            }
+        }
+        $this->awaitBackground();
+        $this->assertSame(1, $requests);
+    }
+
+    public static function malformedKeepaliveReplies(): iterable
+    {
+        yield 'string' => ['60000', '', 'KEEPALIVE result must be an integer.'];
+        yield 'negative' => [-1, '', 'KEEPALIVE result must be nonnegative Unix milliseconds.'];
+        yield 'payload' => [60_000, 'unexpected', 'KEEPALIVE must not include a payload.'];
+    }
+
+    #[DataProvider('malformedKeepaliveReplies')]
+    public function testMalformedKeepaliveReplyClosesClient(mixed $deadline, string $body, string $diagnostic): void
+    {
+        $endpoint = $this->serve(static function (Socket $socket) use ($deadline, $body): void {
+            Frame::read($socket, new TimeoutCancellation(3));
+            $socket->write(self::helloReply());
+            Frame::read($socket, new TimeoutCancellation(3));
+            $socket->write((new Frame(['v' => Frame::VERSION, 'id' => 1, 'ok' => true, 'result' => $deadline], $body))->encode());
+        });
+        $client = Client::connect($endpoint);
+        $this->clients[] = $client;
+        try {
+            $client->keepalive('receipt');
+            $this->fail('Malformed renewal confirmation must fail.');
+        } catch (ProtocolException $error) {
+            $this->assertSame($diagnostic, $error->getMessage());
+        }
+        $this->awaitBackground();
+        $this->expectException(TransportException::class);
+        $client->keepalive('receipt');
+    }
+
     public function testConcurrentCallIsRejectedAndCancellationEndsPendingCallAtPeerEof(): void
     {
         $requestSeen = new DeferredFuture();

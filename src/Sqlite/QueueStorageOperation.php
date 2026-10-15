@@ -9,5 +9,6 @@ enum QueueStorageOperation: string
     case Insert = 'insert';
     case Claim = 'claim';
     case Settle = 'settle';
+    case Keepalive = 'keepalive';
     case Eligibility = 'eligibility';
 }

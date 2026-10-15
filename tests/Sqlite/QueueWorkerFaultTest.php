@@ -37,7 +37,7 @@ final class QueueWorkerFaultTest extends ProcessTestCase
 
     public static function faults(): iterable
     {
-        foreach ([QueueStorageOperation::Claim, QueueStorageOperation::Settle] as $operation) {
+        foreach ([QueueStorageOperation::Claim, QueueStorageOperation::Settle, QueueStorageOperation::Keepalive] as $operation) {
             foreach ([WorkerFaultAction::ExitBeforeCommit, WorkerFaultAction::LostReply, WorkerFaultAction::MalformedReply] as $action) {
                 yield $operation->value.' '.$action->value => [$operation, $action];
             }
@@ -52,7 +52,7 @@ final class QueueWorkerFaultTest extends ProcessTestCase
         $seed = SqliteQueueStorage::open($path, workerOperation: ControlledQueueWorkerOperation::class);
         try {
             $id = $seed->insert('jobs', 'payload', '', 0);
-            if (QueueStorageOperation::Settle === $operation) {
+            if (QueueStorageOperation::Settle === $operation || QueueStorageOperation::Keepalive === $operation) {
                 $this->assertNotNull($seed->claim('jobs', self::OWNER, self::EPOCH, self::TOKEN, self::VISIBILITY_MILLISECONDS));
             }
         } finally {
@@ -74,6 +74,7 @@ final class QueueWorkerFaultTest extends ProcessTestCase
                 $invoke = static fn () => match ($operation) {
                     QueueStorageOperation::Claim => $storage->claim('jobs', self::OWNER, self::EPOCH, self::TOKEN, self::VISIBILITY_MILLISECONDS),
                     QueueStorageOperation::Settle => $storage->settle($id, self::TOKEN, self::OWNER, self::EPOCH),
+                    QueueStorageOperation::Keepalive => $storage->keepalive($id, self::TOKEN, self::OWNER, self::EPOCH, self::VISIBILITY_MILLISECONDS, self::VISIBILITY_MILLISECONDS * 2),
                     default => throw new \LogicException('Fault fixture requires claim or settlement.'),
                 };
                 $future = async(static function () use ($invoke, &$confirmations): void {
@@ -137,11 +138,12 @@ final class QueueWorkerFaultTest extends ProcessTestCase
                 $this->assertSame(1, $rows);
                 $row = $observer->querySingle('SELECT body, owner_id, broker_epoch, reservation_token, reserved_until FROM queue_messages', true);
                 $this->assertSame('payload', $row['body']);
-                $reserved = QueueStorageOperation::Settle === $operation || $committed;
+                $reserved = QueueStorageOperation::Settle === $operation || QueueStorageOperation::Keepalive === $operation || $committed;
                 $this->assertSame($reserved ? self::OWNER : null, $row['owner_id']);
                 $this->assertSame($reserved ? self::EPOCH : null, $row['broker_epoch']);
                 $this->assertSame($reserved ? self::TOKEN : null, $row['reservation_token']);
-                $this->assertSame($reserved ? self::NOW_MILLISECONDS + self::VISIBILITY_MILLISECONDS : null, $row['reserved_until']);
+                $duration = QueueStorageOperation::Keepalive === $operation && $committed ? self::VISIBILITY_MILLISECONDS * 2 : self::VISIBILITY_MILLISECONDS;
+                $this->assertSame($reserved ? self::NOW_MILLISECONDS + $duration : null, $row['reserved_until']);
             }
             if ($acquireWrite) {
                 $observer->exec('ROLLBACK');

@@ -31,6 +31,7 @@ class QueueWorkerOperation implements Operation
             QueueStorageOperation::Insert => $this->insert(self::string($parameters, 'queue'), self::string($parameters, 'body'), self::string($parameters, 'headers'), self::integer($parameters, 'delay')),
             QueueStorageOperation::Claim => $this->claim(self::string($parameters, 'queue'), self::string($parameters, 'owner'), self::string($parameters, 'epoch'), self::string($parameters, 'token'), self::integer($parameters, 'visibility')),
             QueueStorageOperation::Settle => new OperationResultDTO(Outcome::Commit, ['settlement' => $this->settle(self::integer($parameters, 'id'), self::string($parameters, 'token'), self::string($parameters, 'owner'), self::string($parameters, 'epoch'))->value]),
+            QueueStorageOperation::Keepalive => $this->keepalive(self::integer($parameters, 'id'), self::string($parameters, 'token'), self::string($parameters, 'owner'), self::string($parameters, 'epoch'), self::integer($parameters, 'visibility'), self::integer($parameters, 'minimum')),
             QueueStorageOperation::Eligibility => new OperationResultDTO(Outcome::ReadOnly, ['ready_at' => $this->eligibility(self::string($parameters, 'queue'))]),
         };
     }
@@ -116,13 +117,40 @@ class QueueWorkerOperation implements Operation
         return new OperationResultDTO(Outcome::Commit, ['message' => ['id' => $id, 'body' => $body, 'headers' => $headers, 'available_at' => $availableAt, 'reserved_until' => $expires]]);
     }
 
+    private function keepalive(int $id, string $token, string $ownerId, string $epoch, int $visibility, int $minimum): OperationResultDTO
+    {
+        $now = DeadlinePolicy::now($this->clock);
+        if ($minimum < 0) {
+            return new OperationResultDTO(Outcome::Rollback, ['validation_error' => QueueValidationError::NegativeKeepalive->value]);
+        }
+        try {
+            $deadline = DeadlinePolicy::deadline($now, max($visibility, $minimum));
+        } catch (\InvalidArgumentException) {
+            return new OperationResultDTO(Outcome::Rollback, ['validation_error' => QueueValidationError::DeadlineOverflow->value]);
+        }
+        $result = $this->sql->execute(QueueSql::KEEPALIVE_SQL, [$deadline, $id, $token, $ownerId, $epoch, $now]);
+        if (0 === $result['row_count']) {
+            return new OperationResultDTO(Outcome::Rollback, ['settlement' => $this->settlementFailure($id, $token, $ownerId, $epoch, $now, QueueStorageOperation::Keepalive)->value]);
+        }
+        if (1 !== $result['row_count']) {
+            throw new \RuntimeException('Keepalive UPDATE did not affect exactly one reservation.');
+        }
+        $result = $this->sql->execute(QueueSql::DIAGNOSE_SQL, [$id]);
+        $row = $result['rows'][0] ?? null;
+        if (null === $row || 'integer' !== ($row['reserved_until_type'] ?? null) || !\is_int($row['reserved_until'])) {
+            throw new \RuntimeException('Renewed reservation expiry must be an integer.');
+        }
+
+        return new OperationResultDTO(Outcome::Commit, ['reserved_until' => $row['reserved_until']]);
+    }
+
     private function settle(int $id, string $token, string $ownerId, string $epoch): SettlementResultEnum
     {
         $now = DeadlinePolicy::now($this->clock);
         $result = $this->sql->execute(QueueSql::DELETE_SQL, [$id, $token, $ownerId, $epoch, $now]);
         $changed = $result['row_count'];
         if (0 === $changed) {
-            return $this->settlementFailure($id, $token, $ownerId, $epoch, $now);
+            return $this->settlementFailure($id, $token, $ownerId, $epoch, $now, QueueStorageOperation::Settle);
         }
         if (1 !== $changed) {
             throw new \RuntimeException('Settlement DELETE did not affect exactly one reservation.');
@@ -131,7 +159,7 @@ class QueueWorkerOperation implements Operation
         return SettlementResultEnum::Settled;
     }
 
-    private function settlementFailure(int $id, string $token, string $ownerId, string $epoch, int $now): SettlementResultEnum
+    private function settlementFailure(int $id, string $token, string $ownerId, string $epoch, int $now, QueueStorageOperation $operation): SettlementResultEnum
     {
         $result = $this->sql->execute(QueueSql::DIAGNOSE_SQL, [$id]);
         $row = $result['rows'][0] ?? null;
@@ -163,7 +191,8 @@ class QueueWorkerOperation implements Operation
             return SettlementResultEnum::Expired;
         }
 
-        throw new \RuntimeException('Settlement DELETE failed despite a matching active reservation.');
+        $statement = QueueStorageOperation::Keepalive === $operation ? 'Keepalive UPDATE' : 'Settlement DELETE';
+        throw new \RuntimeException($statement.' failed despite a matching active reservation.');
     }
 
     private static function payloadBytes(mixed $value): string

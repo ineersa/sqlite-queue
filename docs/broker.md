@@ -79,11 +79,13 @@ if (null !== $delivery) {
 }
 ```
 
-The default reservation lasts 60 seconds. Both broker commands accept `--redeliver-timeout=60` in positive integer seconds. Choose a duration that covers your handlers; there is no lease renewal. For the bundle command, an explicit CLI value overrides `sqlite_queue.redeliver_timeout`, which defaults to 60. The standalone command does not load bundle configuration.
+The default reservation lasts 60 seconds. Both broker commands accept `--redeliver-timeout=60` in positive integer seconds. Renew reservations for long-running work, or choose a duration that covers the handler without renewal. For the bundle command, an explicit CLI value overrides `sqlite_queue.redeliver_timeout`, which defaults to 60. The standalone command does not load bundle configuration.
 
 The PHP `BrokerFactory::visibilityTimeout` argument uses milliseconds and defaults to 60,000. Client communication timeouts are separate and do not change reservation expiry. The default communication allowance is 10 seconds, plus the requested duration for WAIT.
 
 An unacknowledged reservation becomes eligible again at its persisted deadline. Closing a client does not shorten that deadline. PHP callers can construct `BrokerFactory` with `visibilityTimeout` and call `create()`. For an application-owned cancellation token, pass it to `Broker::run()`.
+
+Call `Client::keepalive($receipt, $minimumMilliseconds)` on the connection that received the delivery to renew it. The minimum defaults to zero, selecting the broker's configured duration. Success returns the committed Unix-millisecond deadline and retains the receipt. Renewal cannot shorten the current deadline or revive an expired receipt. Native Messenger consumers use `--keepalive`, whose default interval is 5 seconds. See [long-running handlers](messenger.md#keep-long-running-handlers-alive).
 
 The Messenger bundle maps WAIT and WAIT_ANY onto native consumer idle events when `--sleep` is omitted or zero. Selected receivers must share one configured endpoint and name at most 16 distinct queues. See [Messenger idle behavior and limits](messenger.md#idle-waits).
 

@@ -1,6 +1,6 @@
 # Broker protocol v1
 
-The v1 Unix-socket protocol covers immediate queue operations and bounded WAIT and WAIT_ANY. No operation executes application handlers or accepts SQL or database paths over the socket.
+The v1 Unix-socket protocol covers immediate queue operations, reservation renewal, and bounded WAIT and WAIT_ANY. No operation executes application handlers or accepts SQL or database paths over the socket.
 
 ## Framing and limits
 
@@ -14,9 +14,17 @@ Handshake reads have a five-second deadline. After the handshake, an established
 
 The first request is `{"v":1,"id":0,"op":"hello"}`. The response confirms v1 and returns `result: {"max_payload":1040000}`. Later requests use consecutive positive integer IDs starting at 1. Every response echoes `v` and `id`, plus `ok: true` and `result`, or `ok: false` and `error: {"code":"..."}`. Framing adds the two payload-length fields to every control object.
 
-Operations are `send` with `queue` and nonnegative millisecond `delay`, `receive` with `queue`, `acknowledge` or `reject` with `receipt`, and `wait` with `queue` and integer `wait_ms`. Send uses the raw payload blocks and returns the insertion ID. Receive remains immediate: it returns null or delivery metadata with raw payload blocks and never accepts `wait_ms`. Delivery metadata contains `id`, `queue`, `receipt`, `available_at`, and `reserved_until`. Both timestamps use Unix milliseconds. Settlement returns null. Closing the socket ends a session. Unknown operations and control fields are rejected.
+Operations are `send` with `queue` and nonnegative millisecond `delay`, `receive` with `queue`, `acknowledge` or `reject` with `receipt`, `keepalive` with `receipt` and integer `keepalive_ms`, and `wait` with `queue` and integer `wait_ms`. Send uses the raw payload blocks and returns the insertion ID. Receive remains immediate: it returns null or delivery metadata with raw payload blocks and never accepts `wait_ms`. Delivery metadata contains `id`, `queue`, `receipt`, `available_at`, and `reserved_until`. Both timestamps use Unix milliseconds. Settlement returns null. Keepalive returns the committed reservation deadline as an integer in Unix milliseconds. Closing the socket ends a session. Unknown operations and control fields are rejected.
 
 `wait_any` carries `queues` instead of `queue`, plus integer `wait_ms`. It accepts a JSON list of 1 through 16 distinct queue names. Each name follows the same validation as `queue`; empty input, duplicates, non-list input, invalid names, and larger lists are rejected. Sixteen maximum-length names fit within the existing 8,192-byte control limit. Payload blocks must be empty.
+
+### KEEPALIVE
+
+A KEEPALIVE request carries `receipt` and nonnegative integer `keepalive_ms`. Both body and headers must be empty. Zero selects the broker's configured reservation duration. A positive value requests a minimum duration from the sampled transaction time; it does not set a total handler budget.
+
+Inside one immediate transaction, the broker samples time after acquiring the transaction and conditionally extends the existing reservation. The new expiry is `max(existing expiry, now + max(configured duration, keepalive_ms))`. Renewal never shortens an expiry or changes the receipt token. The result confirms the persisted deadline only after commit; the reply carries no payload.
+
+Only the original connection can renew an unexpired reservation with the matching broker epoch and delivery token. An expired, reclaimed or settled delivery cannot be revived. Rejections reuse the receipt errors listed below, including `malformed_receipt`. Missing, non-integer or negative `keepalive_ms`, nonempty payloads, and deadline overflow return `invalid_request` and end that session. A failed renewal does not trigger an automatic retry. An absent confirmation leaves its outcome unknown.
 
 ### WAIT
 
@@ -49,7 +57,7 @@ Each receipt error maps to a concrete exception under `Exception`. All six exten
 | `receipt_token_mismatch` | `ReceiptTokenMismatchException` | The supplied token differs from the current reservation token. |
 | `expired_receipt` | `ExpiredReceiptException` | The reservation deadline is at or before the sampled transaction time. |
 
-Syntax is checked before storage access. After a zero-row conditional DELETE, storage diagnoses failures in table order inside the same immediate transaction. It uses the same clock sample as DELETE. When several fields mismatch, the first failure wins. Missing rows have no history to distinguish never-created from already-settled messages.
+Syntax is checked before storage access. After a zero-row conditional settlement DELETE or renewal UPDATE, storage diagnoses failures in table order inside the same immediate transaction. It uses the same clock sample as that mutation. When several fields mismatch, the first failure wins. Missing rows have no history to distinguish never-created from already-settled messages.
 
 ## Ownership and readiness
 
@@ -69,7 +77,7 @@ SQL executes in the driver's child process. Waiting for its results suspends a f
 
 ## Client recovery
 
-`Client` connects once and performs no automatic reconnect or retry. A transport error means the caller must discard it. An absent confirmation does not establish whether send, claim, or settlement committed. SQLite can commit before its result reaches the broker or before the broker's confirmation reaches the client. A connection failure in either interval leaves the caller unable to distinguish a committed operation from a failure before commit. Constructing a new client is explicit and does not reuse the old session or receipts. Malformed remote responses raise `ProtocolException` with the violated field, invalidate the client, and never replay. Known receipt rejections and invalid-queue responses keep the session usable. A receipt cannot move to a different connection.
+`Client` connects once and performs no automatic reconnect or retry. A transport error means the caller must discard it. An absent confirmation does not establish whether send, claim, renewal, or settlement committed. SQLite can commit before its result reaches the broker or before the broker's confirmation reaches the client. A connection failure in either interval leaves the caller unable to distinguish a committed operation from a failure before commit. Constructing a new client is explicit and does not reuse the old session or receipts. Malformed remote responses raise `ProtocolException` with the violated field, invalidate the client, and never replay. Known receipt rejections and invalid-queue responses keep the session usable. A receipt cannot move to a different connection.
 
 The default client timeout is ten seconds per exchange and for connection establishment. A WAIT exchange uses that transport allowance plus the requested `wait_ms`. Concurrent calls on the same client raise `LogicException` rather than queueing more requests. A frame rejected locally before writing, including unencodable UTF-8 control or an out-of-range WAIT bound, does not consume a request ID and leaves the client open. `TransportException` invalidates the client for EOF, timeout, cancellation, and socket I/O failure. A known queue-name error raises `InvalidArgumentException`. Receipt rejections raise the specific exceptions listed above.
 
