@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Sqlite;
 
 use Amp\Cancellation;
+use Amp\DeferredCancellation;
+use Amp\DeferredFuture;
 use Fabpot\Amp\Sqlite\SqliteConfig;
 use Fabpot\Amp\Sqlite\SqliteConnector;
 use Fabpot\Amp\Sqlite\SqliteJournalMode;
@@ -25,7 +27,11 @@ final class SqliteQueueStorage
     private const int BUSY_TIMEOUT_MILLISECONDS = 5_000;
     private const int WAL_AUTOCHECKPOINT_PAGES = 1_000;
     private const string SQLITE_MINIMUM_VERSION = '3.31.0';
-    private bool $closed = false;
+    private bool $closeStarted = false;
+    /** @var DeferredFuture<void> Completion of the first close, including driver cleanup. */
+    private readonly DeferredFuture $closeCompletion;
+    /** Every close caller may tighten the one driver close's budget. */
+    private readonly DeferredCancellation $closeCancellation;
 
     /** @param array{journal_mode: string, synchronous: string, busy_timeout: int, wal_autocheckpoint: int, sqlite_version: string} $configuration */
     private function __construct(
@@ -33,6 +39,9 @@ final class SqliteQueueStorage
         private readonly OperationExecutor $executor,
         private readonly array $configuration,
     ) {
+        $this->closeCompletion = new DeferredFuture();
+        $this->closeCompletion->getFuture()->ignore();
+        $this->closeCancellation = new DeferredCancellation();
     }
 
     /**
@@ -215,21 +224,41 @@ final class SqliteQueueStorage
         return $readyAt;
     }
 
-    /** Null selects the driver's default budget; brokers supply their shutdown cancellation. */
+    /** Null adds no caller budget. Later cancellation tightens the existing close; all callers await cleanup. */
     public function close(?Cancellation $cancellation = null): void
     {
-        if ($this->closed) {
-            return;
+        $subscription = $cancellation?->subscribe($this->closeCancellation->cancel(...));
+        try {
+            if ($this->closeStarted) {
+                // Cancellation reaches the driver, never abandons this completion await.
+                $this->closeCompletion->getFuture()->await();
+
+                return;
+            }
+            $this->closeStarted = true;
+            try {
+                $this->executor->close();
+                $this->connection->close($this->closeCancellation->getCancellation());
+                $this->closeCompletion->complete();
+            } catch (\Throwable $error) {
+                $this->closeCompletion->error($error);
+                throw $error;
+            }
+        } finally {
+            if (null !== $subscription) {
+                $cancellation?->unsubscribe($subscription);
+            }
         }
-        $this->closed = true;
-        $this->executor->close();
-        $this->connection->close($cancellation);
     }
 
     private function invalidReply(string $message): never
     {
-        $this->close();
-        throw new \RuntimeException($message.' Outcome may be unknown; storage is closed.');
+        try {
+            $this->close();
+        } finally {
+            // Cleanup must not replace the application-reply diagnostic.
+            throw new \RuntimeException($message.' Outcome may be unknown; storage is closed.');
+        }
     }
 
     private function requireOutcome(OperationResultDTO $result, Outcome $expected, string $description): void
@@ -242,7 +271,7 @@ final class SqliteQueueStorage
     /** @param array<string, mixed> $parameters */
     private function run(QueueStorageOperation $operation, array $parameters): OperationResultDTO
     {
-        if ($this->closed) {
+        if ($this->closeStarted) {
             throw new \RuntimeException('Queue storage is closed.');
         }
 

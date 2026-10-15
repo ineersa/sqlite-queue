@@ -8,6 +8,7 @@ use Amp\ByteStream\BufferedReader;
 use Amp\ByteStream\StreamChannel;
 use Amp\CancelledException;
 use Amp\DeferredCancellation;
+use Amp\DeferredFuture;
 use Amp\Parallel\Context\ProcessContext;
 use Amp\Parallel\Context\ProcessContextFactory;
 use Amp\Process\Process;
@@ -17,12 +18,17 @@ use Fabpot\Amp\Sqlite\SqliteConnector;
 use Fabpot\Amp\Sqlite\SqliteJournalMode;
 use Ineersa\SqliteQueue\Broker\Broker;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
+use Ineersa\SqliteQueue\Broker\BrokerLifetimeLocks;
 use Ineersa\SqliteQueue\Broker\QueueNotifier;
+use Ineersa\SqliteQueue\Broker\SocketIdentity;
 use Ineersa\SqliteQueue\Client;
 use Ineersa\SqliteQueue\Exception\TransportException;
 use Ineersa\SqliteQueue\Protocol\Operation;
+use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Sqlite\QueueSql;
 use Ineersa\SqliteQueue\Sqlite\QueueStorageOperation;
+use Ineersa\SqliteQueue\Sqlite\QueueWorkerOperation;
+use Ineersa\SqliteQueue\Sqlite\QueueWorkerProtocol;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 use Ineersa\SqliteQueue\Tests\Support\DeadlineQueueWorkerOperation;
@@ -265,6 +271,188 @@ final class StorageDeadlineTest extends ProcessTestCase
         } finally {
             $connection->close();
             $server->close();
+        }
+    }
+
+    public static function gracefulOperations(): iterable
+    {
+        yield 'send commits' => [Operation::Send, QueueStorageOperation::Insert, false];
+        yield 'ack commits' => [Operation::Acknowledge, QueueStorageOperation::Settle, false];
+        yield 'keepalive commits' => [Operation::Keepalive, QueueStorageOperation::Keepalive, false];
+        yield 'graceful budget expires' => [Operation::Send, QueueStorageOperation::Insert, true];
+    }
+
+    #[DataProvider('gracefulOperations')]
+    public function testNormalStopDrainsDispatchedWorkUnlessItsSharedBudgetExpires(Operation $operation, QueueStorageOperation $storageOperation, bool $expire): void
+    {
+        $broker = $this->broker();
+        $running = async($broker->run(...));
+        $running->ignore();
+        $client = Client::connect($this->database->path('broker.sock'));
+        $client->send('jobs', 'target');
+        $delivery = $client->receive('jobs');
+        $this->assertNotNull($delivery);
+        $server = listen('127.0.0.1:0');
+        file_put_contents($this->database->path('control.json'), json_encode(['operation' => $storageOperation->value, 'uri' => 'tcp://'.$server->getAddress()->toString()], \JSON_THROW_ON_ERROR));
+        $request = async(static fn () => match ($operation) {
+            Operation::Send => $client->send('jobs', 'during-stop'),
+            Operation::Acknowledge => $client->acknowledge($delivery->receipt),
+            Operation::Keepalive => $client->keepalive($delivery->receipt, 120_000),
+            default => throw new \LogicException('Unsupported graceful operation.'),
+        });
+        $request->ignore();
+        $barrier = $server->accept(new TimeoutCancellation(self::SAFETY_SECONDS));
+        $reader = new BufferedReader($barrier);
+        $this->assertSame($storageOperation->value, $reader->readUntil("\n", new TimeoutCancellation(self::SAFETY_SECONDS)));
+        try {
+            $broker->stop();
+            $timerId = (new \ReflectionProperty($broker, 'shutdownTimer'))->getValue($broker);
+            if ($expire) {
+                $this->fire($this->timers(self::SAFETY_SECONDS)[$timerId]);
+                try {
+                    $running->await(new TimeoutCancellation(self::SAFETY_SECONDS));
+                    $this->fail('Exhausting the shutdown budget must fail the broker.');
+                } catch (CancelledException) {
+                    $this->assertTrue((new \ReflectionProperty($broker, 'failed'))->getValue($broker));
+                }
+            } else {
+                $barrier->write("release\n");
+                $this->assertSame(0, $running->await(new TimeoutCancellation(self::SAFETY_SECONDS)));
+            }
+            $observer = new \SQLite3($this->database->path());
+            try {
+                $this->assertSame(Operation::Send === $operation && !$expire ? 1 : 0, $observer->querySingle("SELECT count(*) FROM queue_messages WHERE CAST(body AS TEXT) = 'during-stop'"));
+                if (Operation::Acknowledge === $operation) {
+                    $this->assertSame(0, $observer->querySingle('SELECT count(*) FROM queue_messages'));
+                }
+                if (Operation::Keepalive === $operation) {
+                    $this->assertGreaterThan($delivery->reservedUntil, $observer->querySingle('SELECT reserved_until FROM queue_messages'));
+                }
+            } finally {
+                $observer->close();
+            }
+        } finally {
+            $broker->stop();
+            $client->close();
+            $barrier->close();
+            $server->close();
+        }
+    }
+
+    public static function closeCompletions(): iterable
+    {
+        yield 'release driver close' => [false];
+        yield 'expire original shutdown budget' => [true];
+    }
+
+    #[DataProvider('closeCompletions')]
+    public function testDeadlineAndRepeatedCloseAwaitInvalidReplyCleanupBeforeReleasingLocks(bool $expireShutdown): void
+    {
+        $source = \dirname((new \ReflectionClass(SqliteConnector::class))->getFileName()).'/Internal';
+        $worker = file_get_contents($source.'/worker.php');
+        $anchor = "            \$channel->send(['id' => \$id, 'value' => \$worker->handle(\$request)]);";
+        $this->assertSame(1, substr_count($worker, $anchor));
+        $hook = "            if (\$request['operation'] === 'close') {\n                \$GLOBALS['queueFaultBarrier']->at('close');\n            }\n"
+            ."            if (\$request['operation'] === 'executeWorkerOperation') {\n                \$GLOBALS['queueFaultBarrier']->at('operation');\n            }\n"
+            ."            \$value = \$worker->handle(\$request);\n"
+            ."            if (\$request['operation'] === 'executeWorkerOperation') {\n                \$value['data']['id'] = 'application-invalid';\n            }\n"
+            ."            \$channel->send(['id' => \$id, 'value' => \$value]);";
+        file_put_contents($this->database->path('worker.php'), str_replace($anchor, $hook, $worker));
+        copy($source.'/WorkerProcess.php', $this->database->path('WorkerProcess.php'));
+        $server = listen('127.0.0.1:0');
+        $factory = new QueueFaultContextFactory(new ProcessContextFactory(), $this->database->directory(), 'tcp://'.$server->getAddress()->toString());
+        $connection = (new SqliteConnector($factory))->connect((new SqliteConfig($this->database->path()))->withJournalMode(SqliteJournalMode::Wal)->withWorkerOperations([QueueWorkerProtocol::OPERATION_NAME => QueueWorkerOperation::class]));
+        $storage = SqliteQueueStorage::fromConnection($connection, SqliteSynchronousMode::Normal);
+        $channel = (new \ReflectionProperty($connection, 'channel'))->getValue($connection);
+        $context = (new \ReflectionProperty($channel, 'context'))->getValue($channel);
+        $process = (new \ReflectionProperty(ProcessContext::class, 'process'))->getValue($context);
+        $endpoint = $this->database->path('broker.sock');
+        $locks = new BrokerLifetimeLocks($this->database->path(), $endpoint);
+        $socketServer = listen('unix://'.$endpoint);
+        $broker = new Broker($socketServer, new Queue($storage), $storage, $locks, SocketIdentity::fromEndpoint($endpoint), static fn (): int => (int) floor(microtime(true) * 1000), self::STORAGE_SECONDS);
+        $running = async($broker->run(...));
+        $running->ignore();
+        $client = Client::connect($endpoint);
+        $request = async(static fn () => $client->send('jobs', 'committed-but-unconfirmed'));
+        $request->ignore();
+        $socket = $server->accept(new TimeoutCancellation(self::SAFETY_SECONDS));
+        $control = new StreamChannel($socket, $socket);
+        try {
+            $this->assertSame('operation', $control->receive(new TimeoutCancellation(self::SAFETY_SECONDS)));
+            $broker->stop();
+            $this->assertSame([], (new \ReflectionProperty($broker, 'shutdownTasks'))->getValue($broker), 'A graceful stop initially drains the in-flight operation.');
+            $shutdownTimer = (new \ReflectionProperty($broker, 'shutdownTimer'))->getValue($broker);
+            $shutdownDeadline = (new \ReflectionProperty($broker, 'deadline'))->getValue($broker);
+            $control->send(\Ineersa\SqliteQueue\Tests\Support\WorkerFaultAction::Continue->value);
+            $this->assertSame('close', $control->receive(new TimeoutCancellation(self::SAFETY_SECONDS)), 'The invalid reply starts driver close after graceful shutdown began.');
+            $firstTimers = $this->timers(self::SAFETY_SECONDS);
+            $this->assertNotEmpty($firstTimers, 'The first close owns its hard driver ceiling.');
+            $entered = new DeferredFuture();
+            $second = async(static function () use ($storage, $entered, $shutdownDeadline): void {
+                $entered->complete();
+                $storage->close($shutdownDeadline->getCancellation());
+            });
+            $second->ignore();
+            $entered->getFuture()->await(new TimeoutCancellation(self::SAFETY_SECONDS));
+            $this->assertFalse($second->isComplete(), 'Repeated close must await the first cleanup.');
+            $this->assertSame(array_keys($firstTimers), array_keys($this->timers(self::SAFETY_SECONDS)), 'Repeated close creates no fresh budget.');
+            if (!$expireShutdown) {
+                $operationTimers = $this->timers(self::STORAGE_SECONDS);
+                $this->assertCount(1, $operationTimers);
+                $this->fire(reset($operationTimers));
+                $this->until(static fn (): bool => [] !== (new \ReflectionProperty($broker, 'shutdownTasks'))->getValue($broker));
+            }
+            try {
+                $request->await(new TimeoutCancellation(self::SAFETY_SECONDS));
+                $this->fail('Invalid application reply cannot confirm success.');
+            } catch (TransportException) {
+                $this->addToAssertionCount(1);
+            }
+            $this->assertFalse($running->isComplete(), 'Deadline must not abandon cleanup already in progress.');
+            $this->assertTrue($process->isRunning());
+            $this->assertFileExists($endpoint);
+            try {
+                new BrokerLifetimeLocks($this->database->path(), $endpoint);
+                $this->fail('Lifetime locks must remain held until the first close finishes.');
+            } catch (\RuntimeException $error) {
+                $this->assertStringContainsString('lock', strtolower($error->getMessage()));
+            }
+            if ($expireShutdown) {
+                $driverTimers = array_diff_key($firstTimers, [$shutdownTimer => true]);
+                $this->assertNotEmpty($driverTimers);
+                foreach ($driverTimers as $timer) {
+                    // Disable independent ceilings: only the original broker budget may finish cleanup.
+                    EventLoop::disable($timer->id);
+                }
+                $this->fire($firstTimers[$shutdownTimer]);
+            } else {
+                $control->send(\Ineersa\SqliteQueue\Tests\Support\WorkerFaultAction::Continue->value);
+            }
+            $second->await(new TimeoutCancellation(self::SAFETY_SECONDS));
+            try {
+                $this->assertSame(1, $running->await(new TimeoutCancellation(self::SAFETY_SECONDS)));
+            } catch (CancelledException) {
+                $this->assertTrue($expireShutdown);
+                $this->assertTrue($running->isComplete(), 'An await safety timeout cannot prove completed cleanup.');
+            }
+            $process->join(new TimeoutCancellation(self::SAFETY_SECONDS));
+            $this->assertFalse($process->isRunning());
+            $this->assertTrue($context->isClosed());
+            $this->assertFileDoesNotExist($endpoint);
+            $replacement = new BrokerLifetimeLocks($this->database->path(), $endpoint);
+            $replacement->close();
+            $this->assertTrue($connection->isClosed());
+        } finally {
+            $broker->stop();
+            $client->close();
+            $context->close();
+            $control->close();
+            $server->close();
+            try {
+                $running->await(new TimeoutCancellation(self::SAFETY_SECONDS));
+            } catch (\Throwable) {
+                // Preserve an assertion failure while still observing asynchronous cleanup.
+            }
         }
     }
 

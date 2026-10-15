@@ -41,7 +41,7 @@ final class Broker
     private const int SHUTDOWN_BUDGET_SECONDS = 5;
     /** @var array<int, array{socket: Socket, ownerId: string, lifetime: DeferredCancellation, future: Future<void>}> */
     private array $clients = [];
-    /** @var list<Future<void>> Close work admitted once, when the first stop request starts shutdown. */
+    /** @var list<Future<void>> One close task shared by graceful draining and fatal escalation. */
     private array $shutdownTasks = [];
     private bool $stopping = false;
     private bool $started = false;
@@ -138,8 +138,15 @@ final class Broker
             // budget already covers every step below and this path must never arm a second timer.
             $this->stop();
             $budget = $this->deadline->getCancellation();
-            // Close before draining sessions: pending SQL does not accept session cancellation.
-            // Closing the executor blocks queued work and the driver releases stalled callers.
+            // Drain healthy dispatched work; fatal failures and budget expiry start close early.
+            foreach ($this->clients as $client) {
+                try {
+                    $client['future']->await($budget);
+                } catch (\Throwable $error) {
+                    $failure ??= $error;
+                }
+            }
+            $this->startStorageClose();
             foreach ($this->shutdownTasks as $task) {
                 try {
                     // Driver close enforces the shared budget itself. Observe its completion
@@ -150,13 +157,6 @@ final class Broker
                 }
             }
             $this->shutdownTasks = [];
-            foreach ($this->clients as $client) {
-                try {
-                    $client['future']->await($budget);
-                } catch (\Throwable $error) {
-                    $failure ??= $error;
-                }
-            }
             $this->disarmShutdownDeadline();
             if (null !== $subscription) {
                 $cancellation?->unsubscribe($subscription);
@@ -182,9 +182,9 @@ final class Broker
             // socket closes, so the budget covers every step that follows. Later requests, including
             // the serving loop's own stop() in its finally, share that one deadline and never rearm it.
             $this->armShutdownDeadline();
-            $close = async(fn () => $this->storage->close($this->deadline->getCancellation()));
-            $close->ignore();
-            $this->shutdownTasks[] = $close;
+        }
+        if ($this->failed) {
+            $this->startStorageClose();
         }
         $this->server->close();
         $this->notifier->close();
@@ -194,12 +194,23 @@ final class Broker
         }
     }
 
+    private function startStorageClose(): void
+    {
+        if ([] !== $this->shutdownTasks) {
+            return;
+        }
+        $close = async(fn () => $this->storage->close($this->deadline->getCancellation()));
+        $close->ignore();
+        $this->shutdownTasks[] = $close;
+    }
+
     /** Arms the single shutdown deadline; only the first stop request may reach this. */
     private function armShutdownDeadline(): void
     {
         $this->shutdownTimer = EventLoop::delay(self::SHUTDOWN_BUDGET_SECONDS, function (): void {
             $this->failed = true;
             $this->deadline->cancel(new \RuntimeException('Broker shutdown budget exhausted.'));
+            $this->startStorageClose();
         });
     }
 

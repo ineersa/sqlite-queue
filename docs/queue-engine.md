@@ -40,7 +40,7 @@ The database directory must exist. Queue names are independent of the database p
 
 The worker operation receives a `QueueClock` and samples nonnegative Unix wall-clock milliseconds after the write transaction begins. Its production clock samples `floor(microtime(true) * 1000)`. Send, claim, renewal and settlement calculate deadlines inside that transaction. The factory's optional clock controls notifier scheduling, not worker mutation timestamps. No monotonic deadline is persisted. Delays and visibility timeouts must fit the signed integer timestamp range. Visibility must be positive; delay may be zero but not negative.
 
-Always close storage in `finally`. `close(?Cancellation $cancellation = null)` accepts an existing shutdown budget; without one, the driver's default close ceiling applies. Close is idempotent, and closed storage rejects subsequent operations. Engines cannot be cloned. Broker clients do not open a second SQLite connection.
+Always close storage in `finally`. The first `close(?Cancellation $cancellation = null)` accepts an existing shutdown budget; without one, the driver's default close ceiling applies. Starting close rejects subsequent operations. Repeated calls await that first close's actual completion and share its result. A later caller's cancellation can tighten the existing close budget, but cannot restart close, extend its budget, or abandon cleanup. Engines cannot be cloned. Broker clients do not open a second SQLite connection.
 
 ## API
 
