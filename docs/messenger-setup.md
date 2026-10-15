@@ -53,7 +53,7 @@ With the bundle enabled, `php bin/console sqlite-queue:broker` accepts the same 
 
 Use absolute paths and a socket path no longer than 100 bytes. See [broker startup and recovery](broker.md) for permissions and supervisor configuration.
 
-The default reservation lasts 60 seconds. Choose a longer timeout if processing or deferred batch flushes can exceed it. There is no automatic renewal. `options.timeout: 10` is the communication timeout in seconds, not the reservation duration.
+The default reservation lasts 60 seconds. Enable native `--keepalive` for processing or deferred batch flushes that can exceed it. The consumer renews every 5 seconds by default; without that flag, no automatic renewal occurs. `options.timeout: 10` is the communication timeout in seconds, not the reservation duration or handler budget.
 
 ## Run consumers
 
@@ -71,6 +71,8 @@ Separate workers also use notifications:
 	php bin/console messenger:consume email
 	php bin/console messenger:consume reports
 ```
+
+For long-running handlers, add `--keepalive` to either form. Processing can continue beyond 30 minutes or 24 hours while renewal succeeds. Keep the tick interval shorter than the reservation duration and configure application execution limits separately. See [keepalive and ownership loss](messenger.md#keep-long-running-handlers-alive).
 
 Explicit positive `--sleep` retains native polling. `--all` and native selection expansion use notifications when all selected receivers meet the same-broker limit. Selections containing sqlite-queue use a bounded sleep fallback for mixed transport types, different endpoints, or more than 16 distinct queues. Consumers selecting only other transports remain unchanged. See [idle waits](messenger.md#idle-waits).
 

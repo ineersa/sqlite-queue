@@ -41,16 +41,41 @@ final readonly class Frame
 
     public static function read(Socket $socket, Cancellation $cancellation): ?self
     {
-        $prefix = $socket->read($cancellation, Limits::LENGTH_PREFIX_BYTES);
+        return self::readUsing(static fn (int $length): ?string => $socket->read($cancellation, $length));
+    }
+
+    /** @param \Closure(int): ?string $read reads at most the requested bytes, or null at EOF */
+    public static function readUsing(\Closure $read): ?self
+    {
+        $prefix = $read(Limits::LENGTH_PREFIX_BYTES);
         if (null === $prefix) {
             return null;
         }
 
-        return self::readAfterPrefix($socket, $prefix, $cancellation);
+        return self::complete($prefix, $read);
     }
 
     /** Completes a frame after the first one to four length-prefix bytes have arrived. */
     public static function readAfterPrefix(Socket $socket, string $prefix, Cancellation $cancellation): self
+    {
+        return self::complete($prefix, static fn (int $length): ?string => $socket->read($cancellation, $length));
+    }
+
+    /** Socket writes have no cancellation argument; closing interrupts Amp's pending write. */
+    public static function write(Socket $socket, string $bytes, Cancellation $cancellation): void
+    {
+        $cancellation->throwIfRequested();
+        $subscription = $cancellation->subscribe(static fn () => $socket->close());
+        try {
+            $socket->write($bytes);
+            $cancellation->throwIfRequested();
+        } finally {
+            $cancellation->unsubscribe($subscription);
+        }
+    }
+
+    /** @param \Closure(int): ?string $read */
+    private static function complete(string $prefix, \Closure $read): self
     {
         $prefixLength = \strlen($prefix);
         if (0 === $prefixLength) {
@@ -59,17 +84,17 @@ final readonly class Frame
         if ($prefixLength > Limits::LENGTH_PREFIX_BYTES) {
             throw new \InvalidArgumentException('Frame prefix exceeds the length-prefix size.');
         }
-        $prefix .= self::exact($socket, Limits::LENGTH_PREFIX_BYTES - $prefixLength, $cancellation);
+        $prefix .= self::exact($read, Limits::LENGTH_PREFIX_BYTES - $prefixLength);
         $length = (int) unpack('Nlength', $prefix)['length'];
         if (!self::isFrameLength($length)) {
             throw new ProtocolException(ErrorCode::FrameTooLarge, 'Invalid frame length.');
         }
-        $controlLength = (int) unpack('Nlength', self::exact($socket, Limits::CONTROL_LENGTH_BYTES, $cancellation))['length'];
+        $controlLength = (int) unpack('Nlength', self::exact($read, Limits::CONTROL_LENGTH_BYTES))['length'];
         if (!self::isControlLength($controlLength, $length)) {
             throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid control length.');
         }
         try {
-            $control = json_decode(self::exact($socket, $controlLength, $cancellation), true, Limits::JSON_DEPTH, \JSON_THROW_ON_ERROR);
+            $control = json_decode(self::exact($read, $controlLength), true, Limits::JSON_DEPTH, \JSON_THROW_ON_ERROR);
         } catch (\JsonException) {
             throw new ProtocolException(ErrorCode::InvalidRequest, 'Invalid control JSON.');
         }
@@ -86,20 +111,7 @@ final readonly class Frame
             throw new ProtocolException(ErrorCode::InvalidRequest, 'Payload lengths do not match frame.');
         }
 
-        return new self($control, self::exact($socket, $bodyLength, $cancellation), self::exact($socket, $headersLength, $cancellation));
-    }
-
-    /** Socket writes have no cancellation argument; closing interrupts Amp's pending write. */
-    public static function write(Socket $socket, string $bytes, Cancellation $cancellation): void
-    {
-        $cancellation->throwIfRequested();
-        $subscription = $cancellation->subscribe(static fn () => $socket->close());
-        try {
-            $socket->write($bytes);
-            $cancellation->throwIfRequested();
-        } finally {
-            $cancellation->unsubscribe($subscription);
-        }
+        return new self($control, self::exact($read, $bodyLength), self::exact($read, $headersLength));
     }
 
     private static function isFrameLength(int $length): bool
@@ -131,12 +143,13 @@ final readonly class Frame
         return $bodyLength + $headersLength === $length - Limits::CONTROL_LENGTH_BYTES - $controlLength;
     }
 
-    private static function exact(Socket $socket, int $length, Cancellation $cancellation): string
+    /** @param \Closure(int): ?string $read */
+    private static function exact(\Closure $read, int $length): string
     {
         $bytes = '';
         $remaining = $length;
         while ($remaining > 0) {
-            $chunk = $socket->read($cancellation, $remaining);
+            $chunk = $read($remaining);
             if (null === $chunk) {
                 throw new ProtocolException(ErrorCode::InvalidRequest, 'Truncated frame.');
             }

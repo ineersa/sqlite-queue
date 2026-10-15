@@ -353,6 +353,9 @@ final class Broker
         if (Operation::Acknowledge === $operation || Operation::Reject === $operation) {
             return $this->settle($request, $operation, $ownerId, $lifetime, $id);
         }
+        if (Operation::Keepalive === $operation) {
+            return $this->keepalive($request, $ownerId, $lifetime, $id);
+        }
         if (Operation::Wait === $operation) {
             return $this->awaitReadiness($request, $socket, $lifetime, $id);
         }
@@ -524,6 +527,24 @@ final class Broker
         }
 
         return $selected;
+    }
+
+    private function keepalive(Frame $request, string $ownerId, Cancellation $lifetime, int $id): Frame
+    {
+        $this->assertNoPayload($request);
+        $receipt = $request->control[ControlField::Receipt->value] ?? null;
+        if (!\is_string($receipt)) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'KEEPALIVE receipt must be a string.');
+        }
+        $minimum = $request->control[ControlField::KeepaliveMilliseconds->value] ?? null;
+        if (!\is_int($minimum)) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'KEEPALIVE duration must be an integer.');
+        }
+        if ($minimum < 0) {
+            throw new ProtocolException(ErrorCode::InvalidRequest, 'KEEPALIVE duration must be nonnegative milliseconds.');
+        }
+
+        return self::ok($id, $this->queue->keepalive($receipt, $ownerId, $minimum, $lifetime));
     }
 
     private function settle(Frame $request, Operation $operation, string $ownerId, Cancellation $lifetime, int $id): Frame

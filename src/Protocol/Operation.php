@@ -11,6 +11,7 @@ enum Operation: string
     case Receive = 'receive';
     case Acknowledge = 'acknowledge';
     case Reject = 'reject';
+    case Keepalive = 'keepalive';
     case Wait = 'wait';
     case WaitAny = 'wait_any';
 
@@ -26,6 +27,7 @@ enum Operation: string
             self::Send => [ControlField::Queue->value, ControlField::Delay->value],
             self::Receive => [ControlField::Queue->value],
             self::Acknowledge, self::Reject => [ControlField::Receipt->value],
+            self::Keepalive => [ControlField::Receipt->value, ControlField::KeepaliveMilliseconds->value],
             self::Wait => [ControlField::Queue->value, ControlField::WaitMilliseconds->value],
             self::WaitAny => [ControlField::Queues->value, ControlField::WaitMilliseconds->value],
         };

@@ -15,3 +15,5 @@ services:
     Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Handler\NativeEffectMessageHandler:
         arguments:
             $recordPath: '%kernel.project_dir%/effect.log'
+
+    Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Handler\NativeKeepaliveMessageHandler: ~

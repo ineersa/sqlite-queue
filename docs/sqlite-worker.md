@@ -4,9 +4,9 @@ The broker uses one asynchronous connection from the `ineersa/amp-sqlite3` fork.
 
 ## Process model
 
-`BrokerFactory` opens storage, verifies WAL and the selected synchronous mode, creates the schema, and constructs `Queue` with a fresh epoch. Queue and notifier share the factory's clock.
+`BrokerFactory` opens storage, verifies WAL and the selected synchronous mode, creates the schema, and constructs `Queue` with a fresh epoch. The notifier uses the factory's clock. Mutations sample wall-clock milliseconds inside the SQLite worker after transaction acquisition, using the operation's injected `QueueClock`.
 
-An Amp mutex serializes complete storage operations on the writing connection. Contention and driver calls suspend fibers without blocking the broker's event loop. Sockets, WAIT timers, and signals remain available while SQLite runs. Transactions do not contain handlers or client socket I/O.
+The driver owns an exclusive serial operation executor on the writing connection. Each request runs a complete queue operation, including its transaction and outcome validation, in the worker. The broker has no outer storage mutex or operation pipeline. Contention and driver calls suspend fibers without blocking the broker's event loop. Sockets, WAIT timers, and signals remain available while SQLite runs. Transactions do not contain handlers or client socket I/O.
 
 Readiness reports `storage_execution: "fabpot"` and the effective synchronous mode. It omits `persistence_pid` because the package does not supervise the driver's child. Driver failures stop service when a storage operation observes them. The broker does not independently monitor idle child exits or replace failed connections.
 

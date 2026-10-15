@@ -34,11 +34,11 @@ The database directory must exist. Queue names are independent of the database p
 
 `SqliteQueueStorage::open(string $path, SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal, ?Cancellation $cancellation = null)` opens one asynchronous driver connection with immediate transactions. The optional cancellation applies to the connection handshake, not subsequent schema queries. Only NORMAL and FULL are supported. Use `SqliteQueueStorage::open($path, SqliteSynchronousMode::Full)` for FULL. Initialization verifies WAL and the selected synchronous mode, sets `busy_timeout` to 5,000 milliseconds and `wal_autocheckpoint` to 1,000 pages, and creates the table and indexes if absent. In-memory databases are not supported. Do not modify the schema or open the database independently while the broker owns it.
 
-`new SqliteQueueStorage(SqliteCancellableConnection $connection, SqliteSynchronousMode $synchronous, LocalMutex $mutex)` takes exclusive ownership of a driver connection. Initialization failure closes it. Do not use the transferred connection concurrently or change its schema or settings after construction.
+`SqliteQueueStorage::fromConnection(SqliteWorkerOperationConnection $connection, SqliteSynchronousMode $synchronous)` takes exclusive ownership of an acquired driver connection. Initialization failure closes it. Do not use the transferred connection concurrently or change its schema or settings after construction.
 
-`new Queue(SqliteQueueStorage $storage, int $visibilityTimeout = 60000, ?Closure $clock = null)` is message policy only. It does not open, configure, or close storage. Invalid visibility fails without closing the caller-owned storage dependency.
+`new Queue(SqliteQueueStorage $storage, int $visibilityTimeout = 60000)` is message policy only. It does not open, configure, or close storage. Invalid visibility fails without closing the caller-owned storage dependency.
 
-The optional clock is a `Closure(): int` returning nonnegative Unix wall-clock milliseconds. The default samples `floor(microtime(true) * 1000)`. Send, claim, and settlement sample deadlines after the write transaction begins. Queue supplies the clock and deadline calculation; storage invokes them inside the transaction. No monotonic deadline is persisted. Delays and visibility timeouts must fit the signed integer timestamp range. Visibility must be positive; delay may be zero but not negative.
+The worker operation receives a `QueueClock` and samples nonnegative Unix wall-clock milliseconds after the write transaction begins. Its production clock samples `floor(microtime(true) * 1000)`. Send, claim, renewal and settlement calculate deadlines inside that transaction. The factory's optional clock controls notifier scheduling, not worker mutation timestamps. No monotonic deadline is persisted. Delays and visibility timeouts must fit the signed integer timestamp range. Visibility must be positive; delay may be zero but not negative.
 
 Always close storage in `finally`. `close(?Cancellation $cancellation = null)` accepts an existing shutdown budget; without one, the driver's default close ceiling applies. Close is idempotent, and closed storage rejects subsequent operations. Engines cannot be cloned. Broker clients do not open a second SQLite connection.
 
@@ -51,6 +51,7 @@ Always close storage in `finally`. `close(?Cancellation $cancellation = null)` a
 | `earliestEligibility(QueueName $queue, ?Cancellation $cancellation = null): ?int` | Earliest effective eligibility deadline for one queue, or `null` when the queue has no rows. Scheduling hint only. |
 | `acknowledge(string $receipt, string $ownerId, ?Cancellation $cancellation = null): void` | Deletes the current delivery after validating its receipt and ownership. Returns only after commit. |
 | `reject(string $receipt, string $ownerId, ?Cancellation $cancellation = null): void` | The same fenced terminal deletion. Does not reschedule or retry. |
+| `keepalive(string $receipt, string $ownerId, int $minimumMilliseconds = 0, ?Cancellation $cancellation = null): int` | Committed reservation deadline after checking the original receipt and ownership. Zero selects the configured visibility duration; renewal never shortens the existing deadline. |
 
 `DeliveryDTO` has readonly fields `id`, `queue`, `body`, `headers`, `receipt`, `availableAt`, and `reservedUntil`. The two timestamps are Unix wall-clock milliseconds. Treat the receipt as opaque, even though its current representation contains the insertion ID and a random reservation token.
 
@@ -90,7 +91,7 @@ WHERE queue = ? AND available_at <= ?
 ORDER BY id LIMIT 1
 ```
 
-An Amp mutex serializes full storage operations. Each mutation uses an immediate driver transaction. Receive selects the ID and payload, conditionally updates the reservation using the same eligibility predicate, validates the payload, and commits before returning it. A zero-row conditional update or empty selection rolls back and returns `null`. There is no DML `RETURNING`.
+The driver's exclusive serial executor runs complete storage operations. Each mutation uses an immediate worker-owned transaction. Receive selects the ID and payload, conditionally updates the reservation using the same eligibility predicate, validates the payload, and commits before returning it. An empty selection rolls back and returns `null`. Intermediate SQL materialization limits can reject oversized payloads before the reservation update. There is no DML `RETURNING`.
 
 Concurrent writers acquire SQLite's write lock before selection. Committed insertions therefore define the ID order. This promises eligible-message ordering, not consumer completion order. The broker owns one driver connection. SQLite serializes writers from independent connections to the same file.
 
@@ -104,7 +105,7 @@ Receipt rejections have distinct concrete exceptions under `Exception`, all exte
 
 No active reservation means the message is absent or unreserved. Storage retains no settlement history, so it cannot distinguish an already-settled message from an ID that never existed. If every predicate matches but DELETE removes no row, storage reports an invariant failure instead of a receipt rejection. Wire codes and client exception mappings are listed in the [protocol reference](broker-protocol.md#receipt-errors).
 
-Cancelling a connection lifetime before dispatch invalidates the call without starting storage work. A committed reservation expiry remains unchanged. Reopening creates a new Queue epoch and does not clear reservations. Old receipts cannot settle them. At the original expiry, a new receive may claim the row with a new token. There is no receive-count cap or lease extension. A slow consumer can still repeat an external effect after redelivery; receipt fencing does not provide exactly-once application execution.
+Cancelling a connection lifetime before dispatch invalidates the call without starting storage work. A committed reservation expiry remains unchanged by cancellation. Reopening creates a new Queue epoch and does not clear reservations. Old receipts cannot settle or renew them. At the last committed expiry, a new receive may claim the row with a new token. There is no receive-count cap or cumulative processing cap. A slow consumer can still repeat an external effect after redelivery; receipt fencing does not provide exactly-once application execution.
 
 ## Failures and durability
 
