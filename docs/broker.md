@@ -8,12 +8,11 @@ For a Symfony application, start with [Configure and run Messenger](messenger-se
 
 Use PHP 8.5 or later within the Composer `^8.5` constraint, with `ext-sqlite3`. The broker runs on Unix and requires `posix` for ownership checks. The foreground command also requires `pcntl` for signal handling. PDO SQLite is not the storage driver.
 
-In your application's directory, configure both VCS repositories and require both packages:
+In your application's directory, configure the required driver fork and install the released broker from [Packagist](https://packagist.org/packages/ineersa/sqlite-queue). The driver fork still uses the package name `fabpot/amphp-sqlite3`:
 
 ```sh
-composer config repositories.sqlite-queue vcs https://github.com/ineersa/sqlite-queue
-composer config repositories.amp-sqlite3 vcs https://github.com/ineersa/amp-sqlite3
-composer require ineersa/sqlite-queue:dev-main fabpot/amphp-sqlite3:dev-development
+	composer config repositories.amp-sqlite3 vcs https://github.com/ineersa/amp-sqlite3
+	composer require ineersa/sqlite-queue fabpot/amphp-sqlite3:dev-development
 ```
 
 Composer does not inherit repository declarations from dependencies. The explicit driver requirement permits its development stability without lowering your application's global stability setting. Commit your application's Composer lock file for reproducible deployments.

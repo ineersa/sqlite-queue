@@ -16,15 +16,14 @@ Composer installs the required Symfony components, Amp, and Revolt. Doctrine is 
 
 ## Install
 
-The package is installed from Git and depends on the `ineersa/amp-sqlite3` fork's development branch, published under the package name `fabpot/amphp-sqlite3`. Add both repositories to your application:
+Install the released broker from [Packagist](https://packagist.org/packages/ineersa/sqlite-queue). It still requires the `ineersa/amp-sqlite3` driver's development branch, installed under the package name `fabpot/amphp-sqlite3`. Configure that fork's repository in your application before installing:
 
 ```sh
-composer config repositories.sqlite-queue vcs https://github.com/ineersa/sqlite-queue
-composer config repositories.amp-sqlite3 vcs https://github.com/ineersa/amp-sqlite3
-composer require ineersa/sqlite-queue:dev-main fabpot/amphp-sqlite3:dev-development
+	composer config repositories.amp-sqlite3 vcs https://github.com/ineersa/amp-sqlite3
+	composer require ineersa/sqlite-queue fabpot/amphp-sqlite3:dev-development
 ```
 
-Commit your application's Composer lock file and deploy with `composer install`. See the [Symfony setup guide](docs/messenger-setup.md) or [standalone client guide](docs/broker.md) for the next steps.
+The explicit driver requirement allows its development branch without lowering your application's global stability setting. Commit your application's Composer lock file and deploy with `composer install`. See the [Symfony setup guide](docs/messenger-setup.md) or [standalone client guide](docs/broker.md) for the next steps.
 
 ## Use with Symfony Messenger
 

@@ -9,12 +9,11 @@ Use the [configuration reference](configuration.md) to look up broker command op
 ## Install the package
 
 1. Use PHP `^8.5` with `ext-sqlite3`. Run the broker on Unix with `posix` enabled. Enable `pcntl` in CLI PHP for broker signals and native consumer keepalive. This package uses the SQLite3 extension, not PDO, for queue storage.
-2. With Messenger and FrameworkBundle installed in your Symfony application, add both VCS repositories and require the package and driver:
+2. With Messenger and FrameworkBundle installed in your Symfony application, configure the required driver fork and install the released broker from [Packagist](https://packagist.org/packages/ineersa/sqlite-queue). The driver fork still uses the package name `fabpot/amphp-sqlite3`:
 
    ```sh
-   composer config repositories.sqlite-queue vcs https://github.com/ineersa/sqlite-queue
-   composer config repositories.amp-sqlite3 vcs https://github.com/ineersa/amp-sqlite3
-   composer require ineersa/sqlite-queue:dev-main fabpot/amphp-sqlite3:dev-development
+		composer config repositories.amp-sqlite3 vcs https://github.com/ineersa/amp-sqlite3
+		composer require ineersa/sqlite-queue fabpot/amphp-sqlite3:dev-development
    ```
 
    Composer does not inherit repository declarations from dependencies. Requiring the driver's development branch explicitly permits that stability without changing your global minimum stability. Commit the resulting Composer lock file.
