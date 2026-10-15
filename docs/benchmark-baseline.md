@@ -1,6 +1,6 @@
-# Doctrine SQLite baseline results
+# Historical Doctrine SQLite baseline
 
-The baseline capture contains six workloads, each with one warmup and three measured repetitions. It measures the Doctrine SQLite transport only, not this broker. The results establish no broker performance advantage.
+The 28 September 2026 baseline measured Doctrine SQLite only, not this broker: six workloads, each with one warmup and three measured repetitions. It establishes no broker performance advantage and is not a current-build measurement.
 
 ## Revision and reproduction
 
@@ -12,9 +12,9 @@ Historical capture command at revision `13a43bc`:
 
 The benchmark source hashes match revision `13a43bc`. Capture metadata records parent revision `688353e` and a dirty worktree; the recorded file hashes, rather than that parent revision alone, identify the measured source. The archive also records the Composer lock hash.
 
-The current native-Messenger runner uses different workload contracts and measurement boundaries. This capture remains historical evidence for `13a43bc`. Do not pool its timings with current measurements.
+The current native-Messenger runner uses different workload contracts and measurement boundaries. The command above is historical; use the [benchmark guide](../bench/README.md) for current commands. Do not pool these timings with current measurements or the later [native comparisons](benchmark-comparison.md).
 
-The original artifact directory is `var/bench/20260928-010402-4cda6aa2/`. The archive `baseline-v1-20260928.tar.gz` contains all 24 repetition directories, raw JSONL samples, logs, configuration, `summary.json`, and `report.md`. It contains no queue database files. Raw archives are no longer tracked in Git. The originating machine retains its local copy; the archive also remains in historical commits.
+The original capture identifier was `20260928-010402-4cda6aa2`. The archive `baseline-v1-20260928.tar.gz` was recorded as containing all 24 repetition directories, raw JSONL samples, logs, configuration, `summary.json`, and `report.md`, but no queue database files. Raw archives are not distributed with the repository; availability depends on the operator. No continued local copy is assumed.
 
 Archive SHA-256:
 
@@ -22,9 +22,9 @@ Archive SHA-256:
 b3fab5e7acbc1042ab034c6719d50f9dc4d16a94017951ef1a522db8ca7ba756
 ```
 
-The capture used PHP 8.5.10, SQLite 3.45.1, Symfony Messenger and Doctrine Messenger 8.1.7, and Doctrine DBAL 4.5.0. The machine had an Intel Core i5-13400F, with the database directory on ext4 at `/dev/nvme0n1p2`. Xdebug 3.5.3 was loaded in `develop` mode; CLI OPcache was disabled. Full configuration and machine observations are in `summary.json`.
+The capture used PHP 8.5.10, SQLite 3.45.1, Symfony Messenger and Doctrine Messenger 8.1.7, and Doctrine DBAL 4.5.0. The machine had an Intel Core i5-13400F, with the database directory on ext4 at `/dev/nvme0n1p2`. Xdebug 3.5.3 was loaded in `develop` mode; CLI OPcache was disabled. The original `summary.json` recorded full configuration and machine observations.
 
-See the measurement method at revision `13a43bc` for the historical budgets and definitions. This was a local development-machine capture, not a controlled hardware certification.
+Use the method at revision `13a43bc` for historical budgets and definitions. This page does not restate owning-connection WAL and synchronous settings; do not infer them from current defaults. This was a local development-machine capture, not a controlled hardware certification.
 
 ## Outcomes
 
@@ -39,7 +39,7 @@ The command exited 1 because 14 of 24 repetitions were incomplete. No repetition
 | idle | Complete | Complete, complete, complete | 20 ACKs per repetition |
 | delayed | Complete | Incomplete, complete, incomplete | Lock failures in measured runs 1 and 3; the successful repetitions ACKed 41 messages including the probe |
 
-The underlying error was `SQLSTATE[HY000]: General error: 5 database is locked`. The runner does not add retries around standard Doctrine or restart failed workers. It stops remaining work when all consumers have exited and records the unattempted or unacknowledged work. This measures the standard transport's failure behavior under the declared workload, not a recovered-service throughput rate.
+The underlying error was `SQLSTATE[HY000]: General error: 5 database is locked`. That runner added no retries around standard Doctrine and did not restart failed workers. It stopped remaining work when all consumers exited and recorded unattempted or unacknowledged work. These are failures under the declared workload, not recovered-service throughput estimates.
 
 ## Observed variation
 
@@ -53,9 +53,9 @@ These are individual-run observations, not pooled values. Every p99 remains tail
 | Idle publish-to-handler p95 | 17.124 | 9.678 | 7.325 |
 | Idle full-cycle p95 | 20.064 | 12.560 | 10.175 |
 
-Roundtrip full-cycle p95 spanned about 0.67 ms. Idle full-cycle p95 varied by almost a factor of two. That variability and the concurrent failures rule out a useful speedup claim from one favorable run. A broker comparison needs repeated paired runs and larger matched budgets, as specified in method v1.
+Roundtrip full-cycle p95 spanned about 0.67 ms. Idle full-cycle p95 varied by almost a factor of two. That variability and the concurrent failures rule out a useful speedup claim from one favorable run.
 
-Idle child-tree CPU was about 22–24% of one CPU during the sampled empty interval at 1 ms worker polling. Peak sampled child counts were two for roundtrip/idle/delayed, five for concurrent/many-to-one, and three for backlog including prefill. These counts exclude the separately reported coordinator. Raw child footers retain final CPU time and high-water RSS.
+Idle child-tree CPU was about 22–24% of one CPU during the sampled empty interval at 1 ms worker polling. Peak sampled child counts were two for roundtrip/idle/delayed, five for concurrent/many-to-one, and three for backlog including prefill. These counts exclude the separately reported coordinator. Original child footers recorded final CPU time and high-water RSS.
 
 The clock probe bounded the possible offset to -3781 through 4223 ns and passed. Negative confirmation-to-handler durations remain valid observations rather than being clipped.
 
