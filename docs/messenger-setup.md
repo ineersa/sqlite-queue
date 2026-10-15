@@ -4,6 +4,8 @@ Use this guide to connect an existing Symfony 8 application to two queues on one
 
 The broker is a separate process. Registering a transport does not start it.
 
+Use the [configuration reference](configuration.md) to look up broker command options, bundle keys, transport settings, and consumer controls, including their units and defaults.
+
 ## Install the package
 
 1. Use PHP `^8.5` with `ext-sqlite3`. Run the broker on Unix with `posix` enabled. Enable `pcntl` in CLI PHP for broker signals and native consumer keepalive. This package uses the SQLite3 extension, not PDO, for queue storage.

@@ -46,7 +46,7 @@ Start the broker with `vendor/bin/sqlite-queue broker`, supplying its database a
 
 - A successful send or settlement is confirmed only after SQLite commits. WAL synchronous NORMAL is the default, but can lose recent confirmed writes after an OS crash or power loss. Choose FULL for stronger durability when storage honors synchronization.
 - Delivery is at least once within the selected durability guarantees, not exactly once. NORMAL does not guarantee delivery across power loss. Make external effects safe to repeat.
-- Reservations expire after 60 seconds by default. Native Messenger consumers can renew them with `--keepalive`, whose default tick is 5 seconds. Processing can continue for hours while renewals succeed; configure handler execution limits separately.
+- Reservations expire after 60 seconds by default. Native Messenger consumers can renew them with `--keepalive`, whose default tick is 5 seconds. Processing can continue for hours while renewals succeed. The package has no handler execution-time setting; see the [configuration reference](docs/configuration.md).
 - A connection failure can hide a committed operation. The client does not reconnect or replay it automatically.
 - A receipt belongs to the connection that received it. A replacement connection cannot acknowledge an old receipt.
 - Cancellation can stop an operation before storage begins. Dispatched mutations may commit after disconnect. A failed renewal does not itself stop a running handler.
@@ -61,6 +61,7 @@ Supervise the broker and consumers separately. Keep the database and socket priv
 
 ## Reference
 
+- [Configuration](docs/configuration.md): every broker option, bundle setting, transport timeout, and consumer control, with units, defaults, and precedence.
 - [Broker protocol](docs/broker-protocol.md): framing, limits, errors, and connection recovery.
 - [Queue engine](docs/queue-engine.md): PHP APIs, schema, and reservation checks.
 - [SQLite storage](docs/sqlite-worker.md): driver ownership, shutdown budgets, and durability modes.
