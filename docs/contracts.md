@@ -81,4 +81,4 @@ The broker exclusively locks its database and socket paths for its lifetime. Dir
 
 Readiness is a JSON `ready` event after locks, storage initialization, and socket binding succeed. Process creation alone is not readiness. The package does not daemonize or supervise itself.
 
-The former package-worker startup and exchange deadlines do not apply. Shutdown shares a five-second cleanup budget across client draining and driver close. The driver terminates an unresponsive child when that budget expires. See [cancellation and budgets](sqlite-worker.md#cancellation-and-budgets).
+Storage startup and each storage operation have separate 10-second overall deadlines. Operation deadlines include serial ownership waiting and notifier eligibility queries, not WAIT durations, idle sessions, or handler execution. Expiry stops the broker, closes the driver, and leaves unconfirmed mutations uncertain without replay. Shutdown shares a five-second cleanup budget across driver close and client draining. The driver terminates an unresponsive child when that budget expires. See [cancellation and budgets](sqlite-worker.md#cancellation-and-budgets).
