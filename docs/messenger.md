@@ -4,6 +4,8 @@ The adapter connects native `messenger:consume` workers to a separately supervis
 
 Start with [Configure and run Messenger](messenger-setup.md) for installation and a two-queue configuration. This guide explains the settings and behavior that matter when adapting an existing application.
 
+The [configuration reference](configuration.md) lists supported keys and command options with their types, units, defaults, and precedence. Handler execution deadlines are application-owned, not a package setting.
+
 ## Registration
 
 Use PHP `^8.5`, Symfony `^8.0`, and `ext-sqlite3`. Enable `Ineersa\SqliteQueue\SqliteQueueBundle` in your FrameworkBundle application. Check Flex's bundle registration, or add the class entry manually in `config/bundles.php`.

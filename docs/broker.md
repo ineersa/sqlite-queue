@@ -22,6 +22,8 @@ The following commands assume an installed package and use `vendor/bin/sqlite-qu
 
 ## Start the foreground broker
 
+See the [broker command options](configuration.md#broker-command-options) for the complete option list, descriptions, defaults, and bundle precedence.
+
 1. Create a private directory owned by the Unix user that will run the broker and clients:
 
    ```sh
