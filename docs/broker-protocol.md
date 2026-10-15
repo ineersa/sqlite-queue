@@ -1,84 +1,129 @@
 # Broker protocol v1
 
-The v1 Unix-socket protocol covers immediate queue operations, reservation renewal, and bounded WAIT and WAIT_ANY. No operation executes application handlers or accepts SQL or database paths over the socket.
+The broker accepts framed requests over a private Unix-domain socket. It exposes message operations and readiness hints, not SQL, database paths, handlers, or administrative queue queries. This reference describes the wire boundary; use the [PHP client guide](broker.md) for application code.
 
 ## Framing and limits
 
-Each frame is a four-byte unsigned big-endian length followed by a four-byte control length, UTF-8 JSON control, and raw body and header bytes. The outer length excludes its own prefix. Control includes integer `body_length` and `headers_length`; their sum must equal the raw payload length. JSON never contains serialized application bytes.
+All integers in the frame envelope are unsigned, four-byte, big-endian values:
 
-Fixed v1 limits are 1,048,576 frame bytes, 8,192 control bytes, 1,040,000 combined body and header bytes, and 30,000 milliseconds for WAIT. Each buffered request or reply is limited to roughly 1 MiB. The broker accepts at most 64 connections, executes one request per connection at a time, and retains at most one pending response per connection. Amp handles partial reads and write backpressure. Oversized lengths are rejected before reading their content.
+```text
+[length L][control length C][C bytes of UTF-8 JSON][body bytes][header bytes]
+```
 
-Handshake reads have a five-second deadline. After the handshake, an established connection can remain idle until disconnect or broker shutdown. Its thirty-second frame deadline starts when the first prefix bytes arrive and covers the rest of that frame. Idle time between requests does not consume the deadline or invalidate receipt ownership. Writes have a five-second deadline. A WAIT exchange remains open for the requested bound plus the client's transport allowance. The client still permits one outstanding call. Cancellation or timeout after starting an exchange invalidates the client. Larger frame limits are not negotiated in v1.
+`L = 4 + C + body_length + headers_length`. The outer length excludes its own four-byte prefix. `body_length` and `headers_length` are required nonnegative JSON integers in the control object. Their sum must exactly match the remaining payload bytes. Application bytes are not embedded in JSON and need not be UTF-8.
+
+| Resource | Limit |
+| --- | --- |
+| Frame length `L`, excluding the outer prefix | 1,048,576 bytes. |
+| Control JSON | 2 through 8,192 bytes; decoding depth limit 32. |
+| Combined body and headers | 1,040,000 bytes, including empty strings. |
+| Broker connections | 64 total, including notification connections. |
+| Outstanding exchanges | One per connection. Requests must wait for the preceding reply. |
+| WAIT duration | Integer 0 through 30,000 milliseconds. |
+| WAIT_ANY queue selection | JSON list of 1 through 16 distinct valid names. |
+| Queue name | 1 through 255 ASCII letters, digits, `.`, `_`, or `-`, starting with a letter or digit. |
+
+Limits are fixed in v1, not negotiated. The broker rejects excessive frame lengths before reading their contents. At the connection limit it closes a new socket without a handshake. Connection read and write deadlines are listed in [cancellation and budgets](sqlite-worker.md#cancellation-and-budgets).
 
 ## Exchanges
 
-The first request is `{"v":1,"id":0,"op":"hello"}`. The response confirms v1 and returns `result: {"max_payload":1040000}`. Later requests use consecutive positive integer IDs starting at 1. Every response echoes `v` and `id`, plus `ok: true` and `result`, or `ok: false` and `error: {"code":"..."}`. Framing adds the two payload-length fields to every control object.
+Every request control object contains integer `v: 1`, integer `id`, string `op`, and the two payload-length fields. The first request must be `hello` with ID 0 and empty payloads. Later IDs are consecutive positive integers starting at 1. Repeating HELLO or sending an unexpected ID is invalid.
 
-Operations are `send` with `queue` and nonnegative millisecond `delay`, `receive` with `queue`, `acknowledge` or `reject` with `receipt`, `keepalive` with `receipt` and integer `keepalive_ms`, and `wait` with `queue` and integer `wait_ms`. Send uses the raw payload blocks and returns the insertion ID. Receive remains immediate: it returns null or delivery metadata with raw payload blocks and never accepts `wait_ms`. Delivery metadata contains `id`, `queue`, `receipt`, `available_at`, and `reserved_until`. Both timestamps use Unix milliseconds. Settlement returns null. Keepalive returns the committed reservation deadline as an integer in Unix milliseconds. Closing the socket ends a session. Unknown operations and control fields are rejected.
+Successful responses contain `v`, the matching `id`, `ok: true`, and `result`. Failure responses contain `v`, `id`, `ok: false`, and `error: {"code":"..."}` instead of `result`. All responses include the payload-length fields. Failure responses have no payload. Error text and worker exception details are not wire fields.
 
-`wait_any` carries `queues` instead of `queue`, plus integer `wait_ms`. It accepts a JSON list of 1 through 16 distinct queue names. Each name follows the same validation as `queue`; empty input, duplicates, non-list input, invalid names, and larger lists are rejected. Sixteen maximum-length names fit within the existing 8,192-byte control limit. Payload blocks must be empty.
+### Operations
+
+The fields below are additional to the common request fields. Unknown request fields and unknown operations are rejected. Only SEND accepts request payload bytes.
+
+| `op` | Required fields | Request payload | Successful `result` and response payload |
+| --- | --- | --- | --- |
+| `hello` | None. | Empty. | `{"max_payload":1040000}`; empty payload. |
+| `send` | `queue`: valid name; `delay`: nonnegative integer milliseconds. | Raw body and headers. | Positive integer insertion ID; empty payload. |
+| `receive` | `queue`: valid name. | Empty. | `null`, or delivery metadata with the raw body and headers. Never waits for future work. |
+| `acknowledge` | `receipt`: string. | Empty. | `null` after terminal deletion. |
+| `reject` | `receipt`: string. | Empty. | `null` after terminal deletion. No requeue. |
+| `keepalive` | `receipt`: string; `keepalive_ms`: nonnegative integer milliseconds. | Empty. | Committed reservation expiry as an integer Unix timestamp in milliseconds; empty payload. |
+| `wait` | `queue`: valid name; `wait_ms`: integer within the WAIT bound. | Empty. | Boolean readiness hint; empty payload. |
+| `wait_any` | `queues`: list within the selection limit; `wait_ms`: integer within the WAIT bound. | Empty. | Boolean readiness hint; empty payload. Does not identify a queue. |
+
+A populated RECEIVE result has `id`, `queue`, `receipt`, `available_at`, and `reserved_until`. `id` is the positive message identity, distinct from the outer request ID. Both timestamps are Unix wall-clock milliseconds. Empty RECEIVE responses have no payload.
+
+For example, these are complete SEND request and response **control objects**, not complete binary frames. Append the five bytes `hello` to the request control block after encoding its two length fields. The reply has no payload:
+
+```json
+{"v":1,"id":1,"op":"send","queue":"jobs","delay":0,"body_length":5,"headers_length":0}
+```
+
+```json
+{"v":1,"id":1,"ok":true,"result":42,"body_length":0,"headers_length":0}
+```
+
+ID 1 assumes a successful HELLO exchange already occurred. The message ID 42 is illustrative. Mutating success is reported after commit; [delivery contracts](contracts.md#storage-and-durability) define the durability qualifications.
 
 ### KEEPALIVE
 
-A KEEPALIVE request carries `receipt` and nonnegative integer `keepalive_ms`. Both body and headers must be empty. Zero selects the broker's configured reservation duration. A positive value requests a minimum duration from the sampled transaction time; it does not set a total handler budget.
+`keepalive_ms: 0` uses the configured reservation duration. A positive value requests a minimum duration measured from the worker's transaction-time sample, not a total handler lifetime. Renewal persists:
 
-Inside one immediate transaction, the broker samples time after acquiring the transaction and conditionally extends the existing reservation. The new expiry is `max(existing expiry, now + max(configured duration, keepalive_ms))`. Renewal never shortens an expiry or changes the receipt token. The result confirms the persisted deadline only after commit; the reply carries no payload.
+```text
+max(existing expiry, now + max(configured reservation duration, keepalive_ms))
+```
 
-Only the original connection can renew an unexpired reservation with the matching broker epoch and delivery token. An expired, reclaimed or settled delivery cannot be revived. Rejections reuse the receipt errors listed below, including `malformed_receipt`. Missing, non-integer or negative `keepalive_ms`, nonempty payloads, and deadline overflow return `invalid_request` and end that session. A failed renewal does not trigger an automatic retry. An absent confirmation leaves its outcome unknown.
+The receipt must still match its message, connection owner, Queue epoch, and delivery token, and must be unexpired. Renewal neither changes the token nor shortens the deadline. Expired, settled, or reclaimed deliveries cannot be revived. Missing, non-integer, negative, or overflowing durations and unexpected payloads are `invalid_request`.
 
 ### WAIT
 
-A WAIT request carries `queue` and `wait_ms` only. Both body and headers must be empty. `wait_ms` must be an integer from `0` through `30_000`. Zero is an immediate readiness probe. The successful result is a boolean: `true` is a receive hint, never a reservation; `false` means the bound elapsed without a readiness hint. The reply carries no payload.
+`wait_ms: 0` probes immediately. `true` is a hint to attempt RECEIVE, not a reservation; another consumer can claim first. `false` means the wait completed without a readiness hint. An ordinary timeout leaves the session usable. RECEIVE does not accept `wait_ms`.
 
-WAIT-specific validation rejects negative, oversized, non-integer, or missing `wait_ms`, and rejects any payload bytes. Putting `wait_ms` on `receive` remains `invalid_request`. While WAIT is outstanding, the broker monitors the socket for unexpected bytes, cancels that wait, and replies with `invalid_request` for pipelined traffic. The monitor is cancelled and awaited before the WAIT reply is written. A normal timeout leaves the session reusable. Disconnect, session cancellation, and shutdown end that WAIT without a durable reservation change.
+WAIT_ANY registers every selected queue before checking readiness. A ready queue completes the request and removes all its registrations. A zero-duration request returns false only after all selected queues have been checked without a readiness hint. It does not alter the consumer's receive order. Duplicate names, non-list input, empty lists, or more than 16 names are invalid; the broker never truncates a selection.
 
-Persisted availability and visibility deadlines use Unix wall-clock milliseconds. WAIT bounds and per-queue deadline delays use Revolt duration timers. The broker converts a future wall-clock deadline into a duration under normal forward clock progression. A backward jump can postpone eligibility and force rearming. A forward jump can make work eligible on the next recheck, but an already armed monotonic timer is not moved earlier, so a wake hint may arrive late until another recheck, mutation, or WAIT. This is not a realtime or latency guarantee, and there is no separate scheduler service.
+While either wait is outstanding, the broker monitors the socket for disconnect or unexpected bytes. Pipelined traffic cancels the wait and produces `invalid_request` when a reply can be sent. The monitor is cancelled and awaited before the wait reply. Disconnect, cancellation, and shutdown remove registrations and timers without creating a reservation.
 
-The broker schedules wakeups for watched queues from persisted eligibility deadlines. Committed mutations trigger a readiness recheck. Restart rebuilds scheduling from storage. Timeout, cancellation, disconnect, and shutdown remove the affected waiters and timers.
+Watched queues use persisted availability and reservation deadlines. Committed inserts and claims trigger readiness rechecks, and watches rebuild scheduling from storage as needed after restart. Wall-clock changes can affect hint timing; see [eligibility and ordering](contracts.md#eligibility-and-ordering).
 
-WAIT_ANY uses the same timeout, boolean response, disconnect handling, and per-queue timers as WAIT. It registers every selected queue before checking readiness. A ready queue completes the whole request and removes every registration. Zero duration returns false only after all selected queues have been checked without a readiness hint. The reply does not identify a queue or choose one to claim. Consumers retain their own receive order.
+A v1 broker that does not implement `wait_any` rejects it as `invalid_request`. The PHP client does not downgrade automatically to polling.
 
-Single-queue WAIT remains unchanged. Older v1 brokers reject `wait_any` as `invalid_request`; the client fails explicitly and does not retry or downgrade to polling. Upgrade the broker before enabling multi-queue notification consumers.
+## Errors
 
-General errors are `invalid_request`, `unsupported_protocol_version`, `frame_too_large`, `invalid_queue_name`, and `broker_shutting_down`. Receipt errors are listed below. Malformed traffic ends the connection after a bounded error response when framing permits one. Storage failures are treated conservatively as uncertain outcomes, terminate service, and never trigger replay. Default diagnostics contain error categories, not payloads or worker exception text.
+| Wire code | Meaning | Established session |
+| --- | --- | --- |
+| `invalid_request` | Invalid framing content, sequence, operation, fields, types, bounds, or unexpected payload. | Ends. |
+| `unsupported_protocol_version` | `v` is not the supported integer version. | Ends. |
+| `frame_too_large` | Frame or payload exceeds a bound, or the outer length is invalid. | Ends. |
+| `invalid_queue_name` | Missing, non-string, or invalid queue name, including an invalid entry in WAIT_ANY. | Remains usable. |
+| `broker_shutting_down` | A request reaches the broker after shutdown starts. | Ends. A response is not guaranteed. |
+| Receipt errors below | The receipt does not authorize the requested mutation. | Remains usable. |
 
-Invalid queue names and receipt rejections leave the session usable. Other protocol errors end it. At the connection limit, the broker closes the new socket without a handshake. Shutdown and storage failure can close sockets before an error response is delivered.
+Malformed traffic receives a bounded error response only when framing and the peer permit one. Shutdown and storage failure may close the connection without an error frame. A storage error has no dedicated v1 wire code; it stops the broker. An invalid queue-name or receipt response still consumes the expected request ID.
 
 ### Receipt errors
 
-Each receipt error maps to a concrete exception under `Exception`. All six extend `InvalidReceiptException` and leave the client usable.
+All six concrete exceptions are under `Ineersa\SqliteQueue\Exception` and extend `InvalidReceiptException`.
 
-| Wire code | Exception | Established failure |
+| Wire code | Exception | Failure |
 | --- | --- | --- |
-| `malformed_receipt` | `MalformedReceiptException` | Invalid receipt syntax or message ID outside the supported positive integer range. |
+| `malformed_receipt` | `MalformedReceiptException` | Invalid syntax or message ID outside the positive PHP integer range. |
 | `no_active_reservation` | `NoActiveReservationException` | The message is absent or unreserved. |
-| `receipt_owner_mismatch` | `ReceiptOwnerMismatchException` | The reservation belongs to another client connection. |
-| `receipt_epoch_mismatch` | `ReceiptEpochMismatchException` | The reservation belongs to another Queue epoch. |
-| `receipt_token_mismatch` | `ReceiptTokenMismatchException` | The supplied token differs from the current reservation token. |
-| `expired_receipt` | `ExpiredReceiptException` | The reservation deadline is at or before the sampled transaction time. |
+| `receipt_owner_mismatch` | `ReceiptOwnerMismatchException` | Another connection owns the reservation. |
+| `receipt_epoch_mismatch` | `ReceiptEpochMismatchException` | Another Queue epoch issued the reservation. |
+| `receipt_token_mismatch` | `ReceiptTokenMismatchException` | The delivery token does not match. |
+| `expired_receipt` | `ExpiredReceiptException` | Expiry is at or before the transaction's sampled time. |
 
-Syntax is checked before storage access. After a zero-row conditional settlement DELETE or renewal UPDATE, storage diagnoses failures in table order inside the same immediate transaction. It uses the same clock sample as that mutation. When several fields mismatch, the first failure wins. Missing rows have no history to distinguish never-created from already-settled messages.
+Syntax is checked before storage. After a zero-row conditional DELETE or renewal UPDATE, the worker diagnoses reservation failures in table order, using the same transaction and clock sample. The first failure wins. Missing rows carry no history distinguishing never-created from already-settled messages. `ClientContextClosedException` represents local engine-context cancellation, not a receipt wire code.
 
 ## Ownership and readiness
 
-The foreground command is `bin/sqlite-queue broker --database=/absolute/path/queue.sqlite --endpoint=/private/directory/queue.sock`. Both parent directories must exist, belong to the current user, and have no group or other permissions. Existing database and lock files must also be private and owned by that user. Socket paths are limited to 100 bytes. New files and sockets use mode 0600.
+The broker locks the canonical database and endpoint paths for its lifetime with exclusive, nonblocking Symfony FlockStore locks. Parent directories must exist, be user-owned, and deny group and other access. Paths must be absolute; the canonical socket path is at most 100 bytes. The database must be a private regular file, not a symlink or multiply linked file. Newly created database and socket files use mode 0600.
 
-The broker holds two exclusive nonblocking Symfony FlockStore locks for its lifetime, one keyed by the canonical database path and one by the canonical endpoint path. Parent-directory aliases resolve to the same paths, so a second broker using a different endpoint for the same database still conflicts. The store manages its own sidecar files under the resource parent directories. Those directories must exist, belong to the current user, and deny group and other access, which protects the sidecars without this package naming or touching them. The database file itself is created mode 0600 or strictly validated: symlinks, multiply linked files, foreign owners, and group or other access are rejected. Lock sidecars stay on disk after shutdown to preserve the lock namespace.
+Startup refuses every existing endpoint, including leftover sockets. Shutdown removes only the socket inode this broker created, then releases the locks after storage cleanup completes. Lock sidecars remain to preserve their namespace. After an abrupt exit, verify ownership before removing a leftover socket. See [broker operation](broker.md) for the operational procedure.
 
-Startup refuses every existing endpoint, including a leftover socket. It does not infer that a socket is abandoned from its existence or from a failed probe. Normal shutdown removes only the socket inode created by this broker. After an abrupt broker exit, restarting at that endpoint requires operator verification and removal of the leftover socket, or a different endpoint. Other tools must respect the broker's ownership and must not alter its files while it runs.
+Readiness is one JSON `ready` event on stdout after lock acquisition, storage initialization, and socket binding. It contains `event`, `pid`, `storage_execution: "fabpot"`, `synchronous_effective`, `database`, and `endpoint`. It does not expose a driver-child PID. The command remains in the foreground; SIGINT and SIGTERM request shutdown.
 
-Readiness is a JSON `ready` event on stdout after lifetime locks, storage initialization, and socket binding succeed. The broker owns client-session lifetime and cancels those contexts on disconnect or shutdown. Queue and storage retain delivery owner identifiers, not a registry of live sessions. Shutdown stops accepting, closes clients, and closes local storage before releasing the socket and locks. SIGINT and SIGTERM request shutdown. The package does not detach or manage an application service.
-
-The readiness event includes `pid`, `storage_execution: "fabpot"`, `database`, `endpoint`, and `synchronous_effective`. It omits `persistence_pid`; the driver owns its child process. Normal stop exits 0. Startup failures, observed storage failures, and exhaustion of the broker's shutdown budget exit nonzero. Driver close may force termination after a close-protocol failure without reporting that failure to the broker; exit 0 does not certify graceful driver shutdown.
-
-Storage startup has one 10-second deadline for connection acquisition, readback, and schema setup. Each storage operation has a separate 10-second overall deadline, including serial ownership waiting and its worker reply. This covers notifier eligibility lookups, not WAIT durations or idle sessions. Expiry is a fatal storage failure: it stops admissions and clients, closes the driver, and exits nonzero without replay or a rollback guarantee. Shutdown has one five-second budget starting at the first stop request. Normal stop drains dispatched work before driver close; fatal failure or budget expiry starts close immediately, including during a graceful drain. Driver close receives the original cancellation, never a fresh shutdown budget. Repeated close calls await the first close's completion before socket removal and lock release. Fatal storage failure stops service without a separate error-frame write. Cleanup attempts every step and retains the first failure.
-
-SQL executes in the driver's child process. Waiting for its results suspends a fiber, leaving the broker's event loop available for sockets, WAIT timers, and signals. A client timeout does not revoke dispatched SQL or prove rollback. SQLite's 5,000-millisecond busy timeout is not an overall call bound. Use an external supervisor for a hard termination deadline.
+Normal stop exits zero. Startup failure, observed storage failure, or shutdown-budget exhaustion exits nonzero. Exit zero does not certify that the driver never forced child termination after a close-protocol failure. The broker's drain, escalation, and lock-release rules are defined under [cancellation and budgets](sqlite-worker.md#cancellation-and-budgets).
 
 ## Client recovery
 
-`Client` connects once and performs no automatic reconnect or retry. A transport error means the caller must discard it. An absent confirmation does not establish whether send, claim, renewal, or settlement committed. SQLite can commit before its result reaches the broker or before the broker's confirmation reaches the client. A connection failure in either interval leaves the caller unable to distinguish a committed operation from a failure before commit. Constructing a new client is explicit and does not reuse the old session or receipts. Malformed remote responses raise `ProtocolException` with the violated field, invalidate the client, and never replay. Known receipt rejections and invalid-queue responses keep the session usable. A receipt cannot move to a different connection.
+The PHP client maintains one connection and permits one outstanding call. Concurrent calls raise `LogicException` rather than queueing work. Local validation failures before a write, including oversized payloads, unencodable control, and invalid WAIT bounds, preserve the client and request sequence.
 
-The default client timeout is ten seconds per exchange and for connection establishment. A WAIT exchange uses that transport allowance plus the requested `wait_ms`. Concurrent calls on the same client raise `LogicException` rather than queueing more requests. A frame rejected locally before writing, including unencodable UTF-8 control or an out-of-range WAIT bound, does not consume a request ID and leaves the client open. `TransportException` invalidates the client for EOF, timeout, cancellation, and socket I/O failure. A known queue-name error raises `InvalidArgumentException`. Receipt rejections raise the specific exceptions listed above.
+Known receipt rejections raise their concrete exceptions; `invalid_queue_name` raises `InvalidArgumentException`. These responses keep the client usable. Malformed remote responses raise `ProtocolException` identifying the violated constraint and close the client. EOF, timeout, cancellation, and socket I/O failure raise `TransportException` and close it. There is no automatic reconnect.
 
-The client does not open the queue database. Standalone engine and client use do not require a Symfony application kernel. The executable requires Symfony Console, Unix sockets, `ext-sqlite3`, `ext-posix`, and `ext-pcntl`. See [Run the broker and use the client](broker.md) for setup. See [SQLite storage](sqlite-worker.md) for driver ownership and shutdown behavior.
+For committed-but-unconfirmed work, cancellation, and explicit recovery, follow [uncertain operations and cancellation](contracts.md#uncertain-operations-and-cancellation). The client never opens the queue database and cannot transfer receipts to a replacement connection.
