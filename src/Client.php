@@ -101,9 +101,13 @@ final class Client
                 throw new ProtocolException(ErrorCode::InvalidRequest, 'HELLO result must be an object.');
             }
             $maxPayload = $result[ControlField::MaxPayload->value] ?? null;
-            $maxConnections = $result[ControlField::MaxConnections->value] ?? null;
+            // Original v1 brokers advertise only max_payload and have a fixed
+            // 64-connection limit. The new capacity field is additive metadata.
+            $maxConnections = \array_key_exists(ControlField::MaxConnections->value, $result)
+                ? $result[ControlField::MaxConnections->value]
+                : Limits::MAX_CONNECTIONS;
             if (!\is_int($maxPayload) || !\is_int($maxConnections)) {
-                throw new ProtocolException(ErrorCode::InvalidRequest, 'HELLO result must include integer max_payload and max_connections.');
+                throw new ProtocolException(ErrorCode::InvalidRequest, 'HELLO payload and connection limits must be integers.');
             }
             try {
                 $limits = new ProtocolLimits($maxPayload, $maxConnections);

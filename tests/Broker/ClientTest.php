@@ -428,9 +428,19 @@ final class ClientTest extends TestCase
         }
     }
 
-    public function testConnectRejectsIncompleteHelloLimits(): void
+    public function testConnectAcceptsOriginalV1HelloWithoutConnectionMetadata(): void
     {
-        $this->assertConnectFails(['max_payload' => 1], '', '', 'HELLO result must include integer max_payload and max_connections.');
+        $endpoint = $this->serve(static function (Socket $socket): void {
+            Frame::read($socket, new TimeoutCancellation(3));
+            $socket->write((new Frame(['v' => Frame::VERSION, 'id' => 0, 'ok' => true, 'result' => ['max_payload' => Frame::MAX_PAYLOAD]]))->encode());
+            $request = Frame::read($socket, new TimeoutCancellation(3));
+            $socket->write((new Frame(['v' => Frame::VERSION, 'id' => $request->control['id'], 'ok' => true, 'result' => 9]))->encode());
+        });
+        $client = Client::connect($endpoint, expectedLimits: ProtocolLimits::defaults());
+        $this->clients[] = $client;
+        $this->assertSame(Frame::MAX_PAYLOAD, $client->protocolLimits()->maxPayload);
+        $this->assertSame(Limits::MAX_CONNECTIONS, $client->protocolLimits()->maxConnections);
+        $this->assertSame(9, $client->send('jobs', 'original v1 broker'));
     }
 
     public function testConnectRejectsUnexpectedExpectedLimits(): void
@@ -453,8 +463,8 @@ final class ClientTest extends TestCase
     {
         $good = ['max_payload' => Frame::MAX_PAYLOAD, 'max_connections' => Limits::MAX_CONNECTIONS];
         yield 'string result' => ['x', '', '', 'HELLO result must be an object.'];
-        yield 'missing max payload' => [[], '', '', 'HELLO result must include integer max_payload and max_connections.'];
-        yield 'missing max connections' => [['max_payload' => Frame::MAX_PAYLOAD], '', '', 'HELLO result must include integer max_payload and max_connections.'];
+        yield 'missing max payload' => [[], '', '', 'HELLO payload and connection limits must be integers.'];
+        yield 'null max connections' => [['max_payload' => Frame::MAX_PAYLOAD, 'max_connections' => null], '', '', 'HELLO payload and connection limits must be integers.'];
         yield 'with body' => [$good, 'b', '', 'HELLO must not include a payload.'];
         yield 'with headers' => [$good, '', 'h', 'HELLO must not include a payload.'];
     }
