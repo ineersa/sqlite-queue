@@ -33,6 +33,9 @@ Copy [the complete messenger.yaml example](examples/messenger.yaml) into `config
 sqlite_queue:
     redeliver_timeout: 60
     synchronous: normal
+    # Optional. Defaults preserve the published 1,040,000-byte / 64-connection budgets.
+    # max_payload: 1040000
+    # max_connections: 64
 
 framework:
     messenger:
@@ -80,9 +83,9 @@ The example uses Messenger's native PHP serializer. Use it only with trusted mes
 
 Both paths must be absolute. Keep the canonical socket path at most 100 bytes long. Use persistent storage rather than `/tmp` in production, and keep its parent directory private. See [production ownership and supervision](operations.md#process-ownership-and-supervision).
 
-The bundle command reads `sqlite_queue.redeliver_timeout` and `sqlite_queue.synchronous` from the configuration above. `--redeliver-timeout=60` and `--synchronous=normal|full` override those values. The reservation option is in positive integer seconds; the default is 60. NORMAL is the default durability mode and can lose recent commits after OS failure or power loss. Use FULL for stronger durability when storage honors synchronization. See [durability guarantees](contracts.md#storage-and-durability).
+The bundle command reads `sqlite_queue.redeliver_timeout`, `sqlite_queue.synchronous`, `sqlite_queue.max_payload`, and `sqlite_queue.max_connections` from the configuration above. `--redeliver-timeout=60`, `--synchronous=normal|full`, `--max-payload`, and `--max-connections` override those values. The reservation option is in positive integer seconds; the default is 60. Payload and connection defaults preserve the published 1,040,000-byte and 64-connection budgets. NORMAL is the default durability mode and can lose recent commits after OS failure or power loss. Use FULL for stronger durability when storage honors synchronization. See [configuration reference](configuration.md), [durability guarantees](contracts.md#storage-and-durability), and [broker protocol limits](broker-protocol.md#framing-and-limits).
 
-If you prefer the standalone executable, use `vendor/bin/sqlite-queue broker` with the same database and endpoint options. It **does not read bundle configuration**: pass any nondefault reservation or durability settings explicitly. Schema creation belongs to broker startup; no separate transport setup step is needed.
+If you prefer the standalone executable, use `vendor/bin/sqlite-queue broker` with the same database and endpoint options. It **does not read bundle configuration**: pass any nondefault reservation, durability, payload, or connection settings explicitly. Schema creation belongs to broker startup; no separate transport setup step is needed.
 
 ## Run consumers
 

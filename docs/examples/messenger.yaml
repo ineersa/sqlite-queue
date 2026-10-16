@@ -5,6 +5,9 @@
 sqlite_queue:
     redeliver_timeout: 60
     synchronous: normal
+    # Optional. Defaults preserve the published 1,040,000-byte / 64-connection budgets.
+    # max_payload: 1040000
+    # max_connections: 64
 
 framework:
     messenger:

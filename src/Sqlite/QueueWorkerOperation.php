@@ -9,7 +9,6 @@ use Fabpot\Amp\Sqlite\Worker\DTO\OperationResultDTO;
 use Fabpot\Amp\Sqlite\Worker\Operation;
 use Fabpot\Amp\Sqlite\Worker\Outcome;
 use Fabpot\Amp\Sqlite\Worker\SqlExecutor;
-use Ineersa\SqliteQueue\Protocol\Limits;
 use Symfony\Component\Clock\NativeClock;
 
 class QueueWorkerOperation implements Operation
@@ -28,8 +27,21 @@ class QueueWorkerOperation implements Operation
         $operation = QueueStorageOperation::from(self::string($parameters, 'operation'));
 
         return match ($operation) {
-            QueueStorageOperation::Insert => $this->insert(self::string($parameters, 'queue'), self::string($parameters, 'body'), self::string($parameters, 'headers'), self::integer($parameters, 'delay')),
-            QueueStorageOperation::Claim => $this->claim(self::string($parameters, 'queue'), self::string($parameters, 'owner'), self::string($parameters, 'epoch'), self::string($parameters, 'token'), self::integer($parameters, 'visibility')),
+            QueueStorageOperation::Insert => $this->insert(
+                self::string($parameters, 'queue'),
+                self::string($parameters, 'body'),
+                self::string($parameters, 'headers'),
+                self::integer($parameters, 'delay'),
+                self::integer($parameters, QueueWorkerProtocol::MAX_PAYLOAD_PARAMETER),
+            ),
+            QueueStorageOperation::Claim => $this->claim(
+                self::string($parameters, 'queue'),
+                self::string($parameters, 'owner'),
+                self::string($parameters, 'epoch'),
+                self::string($parameters, 'token'),
+                self::integer($parameters, 'visibility'),
+                self::integer($parameters, QueueWorkerProtocol::MAX_PAYLOAD_PARAMETER),
+            ),
             QueueStorageOperation::Settle => new OperationResultDTO(Outcome::Commit, ['settlement' => $this->settle(self::integer($parameters, 'id'), self::string($parameters, 'token'), self::string($parameters, 'owner'), self::string($parameters, 'epoch'))->value]),
             QueueStorageOperation::Keepalive => $this->keepalive(self::integer($parameters, 'id'), self::string($parameters, 'token'), self::string($parameters, 'owner'), self::string($parameters, 'epoch'), self::integer($parameters, 'visibility'), self::integer($parameters, 'minimum')),
             QueueStorageOperation::Eligibility => new OperationResultDTO(Outcome::ReadOnly, ['ready_at' => $this->eligibility(self::string($parameters, 'queue'))]),
@@ -58,8 +70,12 @@ class QueueWorkerOperation implements Operation
         return $value;
     }
 
-    private function insert(string $queue, string $body, string $headers, int $delay): OperationResultDTO
+    private function insert(string $queue, string $body, string $headers, int $delay, int $maxPayload): OperationResultDTO
     {
+        self::assertPositivePayloadBudget($maxPayload);
+        if (\strlen($body) + \strlen($headers) > $maxPayload) {
+            throw new \RuntimeException('Stored message payload exceeds the supported size.');
+        }
         $now = DeadlinePolicy::now($this->clock);
         try {
             $deadline = DeadlinePolicy::deadline($now, $delay);
@@ -80,8 +96,9 @@ class QueueWorkerOperation implements Operation
         return new OperationResultDTO(Outcome::Commit, ['id' => $id]);
     }
 
-    private function claim(string $queue, string $ownerId, string $epoch, string $token, int $visibility): OperationResultDTO
+    private function claim(string $queue, string $ownerId, string $epoch, string $token, int $visibility, int $maxPayload): OperationResultDTO
     {
+        self::assertPositivePayloadBudget($maxPayload);
         $now = DeadlinePolicy::now($this->clock);
         $expires = DeadlinePolicy::deadline($now, $visibility);
         $result = $this->sql->execute(QueueSql::ELIGIBLE_SQL, [$queue, $now, $now]);
@@ -91,7 +108,7 @@ class QueueWorkerOperation implements Operation
         }
         $body = self::payloadBytes($row['body'] ?? null);
         $headers = self::payloadBytes($row['headers'] ?? null);
-        if (\strlen($body) + \strlen($headers) > Limits::MAX_PAYLOAD) {
+        if (\strlen($body) + \strlen($headers) > $maxPayload) {
             throw new \RuntimeException('Stored message payload exceeds the supported size.');
         }
         if (!is_numeric($row['id'] ?? null)) {
@@ -205,6 +222,13 @@ class QueueWorkerOperation implements Operation
         }
 
         throw new \RuntimeException('Stored message is missing or has invalid payload types.');
+    }
+
+    private static function assertPositivePayloadBudget(int $maxPayload): void
+    {
+        if ($maxPayload < 1) {
+            throw new \InvalidArgumentException('Worker parameter '.QueueWorkerProtocol::MAX_PAYLOAD_PARAMETER.' must be a positive integer.');
+        }
     }
 
     private function eligibility(string $queue): ?int

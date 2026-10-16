@@ -81,6 +81,6 @@ WAIT and WAIT_ANY return booleans, not deliveries. Their public bound is **0 thr
 
 Native Messenger uses up to **1,000 milliseconds** per idle wait for selected queues on one broker. Mixed transports, different endpoints, or larger selections containing sqlite-queue use a bounded sleep fallback. Consumers without sqlite-queue receivers retain native idle handling. See [Messenger integration](messenger.md).
 
-The broker admits **64 connections**, including notification connections. Frame and payload bounds are defined in [framing and limits](broker-protocol.md#framing-and-limits). Storage startup, individual operations, and shutdown have separate [budgets](sqlite-worker.md#cancellation-and-budgets). Handler execution and established-session idle time are not storage operations.
+The broker admits **64 connections** by default, including notification connections. Operators may raise or lower that budget. Frame and payload bounds are defined in [framing and limits](broker-protocol.md#framing-and-limits). Storage startup, individual operations, and shutdown have separate [budgets](sqlite-worker.md#cancellation-and-budgets). Handler execution and established-session idle time are not storage operations.
 
 The broker owns its database and socket paths for its lifetime. Readiness is a JSON `ready` event after locks, storage initialization, and socket binding succeed; process creation alone is not readiness. The package does not daemonize or supervise itself. There are no public queue list, count, or purge APIs.

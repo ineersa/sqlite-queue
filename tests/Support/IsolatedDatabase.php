@@ -16,7 +16,9 @@ final class IsolatedDatabase
 
     public function __construct()
     {
-        $base = \dirname(__DIR__, 2).'/var/tests';
+        // Keep fixtures under /tmp so Unix socket endpoints stay within the 100-byte broker bound
+        // even when the checkout path itself is long (for example nested worktrees).
+        $base = '/tmp/sqlite-queue-tests';
 
         if (!is_dir($base) && !mkdir($base, 0o700, true) && !is_dir($base)) {
             throw new \RuntimeException(\sprintf('Cannot create the test directory "%s".', $base));

@@ -10,14 +10,19 @@ Put broker defaults in your application's `config/packages/sqlite_queue.yaml`:
 sqlite_queue:
     redeliver_timeout: 60
     synchronous: normal
+    # Optional. Defaults preserve the published 1,040,000-byte / 64-connection budgets.
+    # max_payload: 1040000
+    # max_connections: 64
 ```
 
-These are the **only two `sqlite_queue` configuration keys**. They configure the bundle's `sqlite-queue:broker` command, not the standalone executable or individual transports.
+These are the **only four `sqlite_queue` configuration keys**. They configure the bundle's `sqlite-queue:broker` command, not the standalone executable or individual transports.
 
 | Key | Type and allowed values | Units | Default | Effect |
 | --- | --- | --- | --- | --- |
 | `redeliver_timeout` | Positive integer, at most `intdiv(PHP_INT_MAX, 1000)` | Seconds | `60` | Reservation duration for all queues served by this broker. Expired reservations become eligible for redelivery. Not a handler execution limit. |
 | `synchronous` | String: `normal` or `full` | None | `normal` | WAL commit durability for this broker's database. |
+| `max_payload` | Positive integer at most `4,294,967,295 - 4 - 8,192 - 380` | Bytes | `1,040,000` | Combined body and header budget for every queue served by this broker. The frame budget is derived from this value. Do not lower it below retained messages. |
+| `max_connections` | Positive integer | Connections | `64` | Maximum simultaneous broker client sessions, including notification connections. |
 
 **Precedence:** explicit broker CLI option, then bundle YAML, then the package default. The standalone `vendor/bin/sqlite-queue broker` does not load Symfony configuration; it uses its CLI options or package defaults.
 
@@ -25,7 +30,7 @@ NORMAL preserves commits across application or process crashes, but can lose rec
 
 ## Broker command options
 
-Both commands define the same four broker-specific options:
+Both commands define the same six broker-specific options:
 
 - Symfony application: `php bin/console sqlite-queue:broker`.
 - Standalone installation: `vendor/bin/sqlite-queue broker`.
@@ -38,8 +43,10 @@ Every option takes a value. There are no broker-specific positional arguments.
 | `--endpoint=PATH` | Required absolute Unix socket path; canonical path at most 100 bytes | Bytes for the path limit | None; required on every start | Socket on which the broker accepts clients. Must match the clients' endpoint. Startup refuses any existing entry at this path rather than removing it. |
 | `--redeliver-timeout=SECONDS` | Positive integer, at most `intdiv(PHP_INT_MAX, 1000)` | Seconds | Bundle YAML value, otherwise `60` | Overrides the reservation duration. It does not limit total processing time while keepalive renewals succeed. |
 | `--synchronous=MODE` | `normal` or `full` | None | Bundle YAML value, otherwise `normal` | Overrides SQLite WAL synchronous mode. Applies to every queue in this database. |
+| `--max-payload=BYTES` | Positive integer at most `4,294,967,295 - 4 - 8,192 - 380` | Bytes | Bundle YAML value, otherwise `1,040,000` | Overrides the combined body and header budget. The frame budget is derived from this value. |
+| `--max-connections=COUNT` | Positive integer | Connections | Bundle YAML value, otherwise `64` | Overrides the simultaneous client-session budget, including notification connections. |
 
-For the standalone command, the last two defaults are always `60` and `normal` unless explicitly supplied. Database and endpoint paths have no bundle YAML equivalents. Keep both parent directories private, owned by the broker's Unix user, and already present. See [path and permission requirements](operations.md#paths-and-permissions).
+For the standalone command, the last four defaults are always `60`, `normal`, `1,040,000`, and `64` unless explicitly supplied. Database and endpoint paths have no bundle YAML equivalents. Keep both parent directories private, owned by the broker's Unix user, and already present. See [path and permission requirements](operations.md#paths-and-permissions).
 
 For example, after preparing the private directory:
 
@@ -60,7 +67,7 @@ Inspect the installed command's help for these options and Symfony's common cons
 	vendor/bin/sqlite-queue broker --help
 ```
 
-There are no broker CLI flags for keepalive, handler execution time, client communication timeout, or storage-operation timeout. Keepalive is a [consumer option](#native-consumer-options).
+There are no broker CLI flags for keepalive, handler execution time, client communication timeout, or storage-operation timeout. Payload and connection budgets are broker settings, not consumer settings. Keepalive is a [consumer option](#native-consumer-options).
 
 ## Messenger transport settings
 
@@ -122,13 +129,14 @@ These constructor and method arguments do not have corresponding bundle keys. Th
 | `BrokerFactory::visibilityTimeout` | Positive integer milliseconds | `60_000` | PHP equivalent of the CLI reservation setting, but with different units. |
 | `BrokerFactory::synchronous` | `SqliteSynchronousMode` enum | `SqliteSynchronousMode::Normal` | PHP equivalent of `--synchronous`; `SqliteSynchronousMode::Full` selects FULL. |
 | `BrokerFactory::storageOperationTimeoutSeconds` | Positive, finite float seconds | `10` | Configurable in PHP only. Sets both the overall storage-startup deadline and each storage-operation deadline. No YAML key or CLI flag exists. |
+| `BrokerFactory::limits` | `ProtocolLimits` | `new ProtocolLimits()` | PHP equivalent of `--max-payload` and `--max-connections`. Defaults preserve the published 1,040,000-byte and 64-connection budgets. |
 | `Client::connect()` argument `timeout` | Positive, finite float seconds | `10` | Configures the direct PHP client's connection and exchange allowance. Messenger passes its resolved transport timeout to this API. |
 
 Advanced engine ownership, cancellation, and per-operation arguments are documented in [the queue engine reference](queue-engine.md) and [the client guide](broker.md).
 
 ## Fixed bounds and unsupported settings
 
-The standard broker exposes no YAML or CLI settings for these bounds:
+The standard broker exposes no YAML or CLI settings for these remaining bounds. Payload and connection budgets are listed above.
 
 | Bound | Value | Can it be configured? |
 | --- | --- | --- |
@@ -138,7 +146,6 @@ The standard broker exposes no YAML or CLI settings for these bounds:
 | Broker shutdown | 5 seconds shared across draining and cleanup | No public broker setting. |
 | Driver close ceiling | 5 seconds | No package YAML or CLI setting. Cancellation can tighten cleanup's budget, not extend it. |
 | Public WAIT and WAIT_ANY duration | 0 through 30,000 milliseconds | Each call chooses a duration within this fixed limit. Not a global timeout setting. |
-| Broker connections | 64, including notification connections | No public broker setting. |
 | Standard SQLite busy timeout | 5,000 milliseconds | No broker YAML or CLI setting. Not a whole-operation deadline. |
 | Standard WAL autocheckpoint | 1,000 pages | No broker YAML or CLI setting. |
 | Handler execution time | No package-imposed limit | No sqlite-queue handler timeout setting exists. Enforce application deadlines or process-supervisor limits yourself. |

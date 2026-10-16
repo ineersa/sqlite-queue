@@ -10,8 +10,10 @@ use Amp\Socket\Socket;
 final readonly class Frame
 {
     public const int VERSION = 1;
+    /** Default frame budget for the published 1 MiB configuration. */
     public const int MAX_FRAME = Limits::MAX_FRAME;
     public const int MAX_CONTROL = Limits::MAX_CONTROL;
+    /** Default combined body and headers budget. */
     public const int MAX_PAYLOAD = Limits::MAX_PAYLOAD;
 
     /** @param array<string, mixed> $control */
@@ -19,11 +21,12 @@ final readonly class Frame
     {
     }
 
-    public function encode(): string
+    public function encode(?ProtocolLimits $limits = null): string
     {
+        $limits ??= ProtocolLimits::defaults();
         $bodyLength = \strlen($this->body);
         $headersLength = \strlen($this->headers);
-        if ($bodyLength + $headersLength > Limits::MAX_PAYLOAD) {
+        if ($bodyLength + $headersLength > $limits->maxPayload) {
             throw new ProtocolException(ErrorCode::FrameTooLarge, 'Message exceeds the payload limit.');
         }
         $control = json_encode(array_replace($this->control, [
@@ -32,33 +35,33 @@ final readonly class Frame
         ]), \JSON_THROW_ON_ERROR);
         $controlLength = \strlen($control);
         $length = Limits::CONTROL_LENGTH_BYTES + $controlLength + $bodyLength + $headersLength;
-        if ($controlLength > Limits::MAX_CONTROL || $length > Limits::MAX_FRAME) {
+        if ($controlLength > Limits::MAX_CONTROL || $length > $limits->maxFrame) {
             throw new ProtocolException(ErrorCode::FrameTooLarge, 'Frame exceeds the protocol limit.');
         }
 
         return pack('NN', $length, $controlLength).$control.$this->body.$this->headers;
     }
 
-    public static function read(Socket $socket, Cancellation $cancellation): ?self
+    public static function read(Socket $socket, Cancellation $cancellation, ?ProtocolLimits $limits = null): ?self
     {
-        return self::readUsing(static fn (int $length): ?string => $socket->read($cancellation, $length));
+        return self::readUsing(static fn (int $length): ?string => $socket->read($cancellation, $length), $limits);
     }
 
     /** @param \Closure(int): ?string $read reads at most the requested bytes, or null at EOF */
-    public static function readUsing(\Closure $read): ?self
+    public static function readUsing(\Closure $read, ?ProtocolLimits $limits = null): ?self
     {
         $prefix = $read(Limits::LENGTH_PREFIX_BYTES);
         if (null === $prefix) {
             return null;
         }
 
-        return self::complete($prefix, $read);
+        return self::complete($prefix, $read, $limits);
     }
 
     /** Completes a frame after the first one to four length-prefix bytes have arrived. */
-    public static function readAfterPrefix(Socket $socket, string $prefix, Cancellation $cancellation): self
+    public static function readAfterPrefix(Socket $socket, string $prefix, Cancellation $cancellation, ?ProtocolLimits $limits = null): self
     {
-        return self::complete($prefix, static fn (int $length): ?string => $socket->read($cancellation, $length));
+        return self::complete($prefix, static fn (int $length): ?string => $socket->read($cancellation, $length), $limits);
     }
 
     /** Socket writes have no cancellation argument; closing interrupts Amp's pending write. */
@@ -75,8 +78,9 @@ final readonly class Frame
     }
 
     /** @param \Closure(int): ?string $read */
-    private static function complete(string $prefix, \Closure $read): self
+    private static function complete(string $prefix, \Closure $read, ?ProtocolLimits $limits): self
     {
+        $limits ??= ProtocolLimits::defaults();
         $prefixLength = \strlen($prefix);
         if (0 === $prefixLength) {
             throw new \InvalidArgumentException('Frame prefix must not be empty.');
@@ -86,7 +90,7 @@ final readonly class Frame
         }
         $prefix .= self::exact($read, Limits::LENGTH_PREFIX_BYTES - $prefixLength);
         $length = (int) unpack('Nlength', $prefix)['length'];
-        if (!self::isFrameLength($length)) {
+        if (!self::isFrameLength($length, $limits)) {
             throw new ProtocolException(ErrorCode::FrameTooLarge, 'Invalid frame length.');
         }
         $controlLength = (int) unpack('Nlength', self::exact($read, Limits::CONTROL_LENGTH_BYTES))['length'];
@@ -107,16 +111,16 @@ final readonly class Frame
         }
         $bodyLength = $control[ControlField::BodyLength->value];
         $headersLength = $control[ControlField::HeadersLength->value];
-        if (!self::isPayloadLengths($bodyLength, $headersLength, $length, $controlLength)) {
+        if (!self::isPayloadLengths($bodyLength, $headersLength, $length, $controlLength, $limits)) {
             throw new ProtocolException(ErrorCode::InvalidRequest, 'Payload lengths do not match frame.');
         }
 
         return new self($control, self::exact($read, $bodyLength), self::exact($read, $headersLength));
     }
 
-    private static function isFrameLength(int $length): bool
+    private static function isFrameLength(int $length, ProtocolLimits $limits): bool
     {
-        return $length >= Limits::CONTROL_LENGTH_BYTES && $length <= Limits::MAX_FRAME;
+        return $length >= Limits::CONTROL_LENGTH_BYTES && $length <= $limits->maxFrame;
     }
 
     private static function isControlLength(int $controlLength, int $length): bool
@@ -126,17 +130,17 @@ final readonly class Frame
             && $controlLength <= $length - Limits::CONTROL_LENGTH_BYTES;
     }
 
-    private static function isPayloadLengths(int $bodyLength, int $headersLength, int $length, int $controlLength): bool
+    private static function isPayloadLengths(int $bodyLength, int $headersLength, int $length, int $controlLength, ProtocolLimits $limits): bool
     {
         if ($bodyLength < 0 || $headersLength < 0) {
             return false;
         }
 
-        if ($bodyLength > Limits::MAX_PAYLOAD || $headersLength > Limits::MAX_PAYLOAD) {
+        if ($bodyLength > $limits->maxPayload || $headersLength > $limits->maxPayload) {
             return false;
         }
 
-        if ($bodyLength + $headersLength > Limits::MAX_PAYLOAD) {
+        if ($bodyLength + $headersLength > $limits->maxPayload) {
             return false;
         }
 

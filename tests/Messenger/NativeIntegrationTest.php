@@ -25,6 +25,7 @@ use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\NativeKernel;
 use Ineersa\SqliteQueue\Tests\Support\ClockFile;
 use Ineersa\SqliteQueue\Tests\Support\ControlledQueueWorkerOperation;
 use Ineersa\SqliteQueue\Tests\Support\IsolatedDatabase;
+use Ineersa\SqliteQueue\Tests\Support\ShortUnixEndpoint;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\Attributes\RequiresOperatingSystem;
@@ -55,6 +56,7 @@ final class NativeIntegrationTest extends TestCase
     private ?IsolatedDatabase $database = null;
     private string $projectDir = '';
     private string $endpoint = '';
+    private ?ShortUnixEndpoint $endpointResource = null;
     private ?Broker $broker = null;
     /** @var Future<int>|null */
     private ?Future $brokerFuture = null;
@@ -77,7 +79,8 @@ final class NativeIntegrationTest extends TestCase
     {
         parent::setUp();
         $this->database = new IsolatedDatabase();
-        $this->endpoint = $this->database->path('queue.sock');
+        $this->endpointResource = new ShortUnixEndpoint();
+        $this->endpoint = $this->endpointResource->path();
         $this->projectDir = $this->database->directory().'/app';
         $this->clock = new ControllableClock($this->workerNow);
         $this->previousClock = \Symfony\Component\Clock\Clock::get();
@@ -117,6 +120,8 @@ final class NativeIntegrationTest extends TestCase
             $this->database?->remove();
         }
 
+        $this->endpointResource?->remove();
+        $this->endpointResource = null;
         parent::tearDown();
     }
 

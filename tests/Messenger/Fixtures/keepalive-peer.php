@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use Ineersa\SqliteQueue\Protocol\ErrorCode;
 use Ineersa\SqliteQueue\Protocol\Frame;
+use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Protocol\Operation;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\KeepalivePeerReply;
 
@@ -37,7 +38,7 @@ try {
             break;
         }
         $result = match ($operation) {
-            Operation::Hello => ['max_payload' => Frame::MAX_PAYLOAD],
+            Operation::Hello => ['max_payload' => Frame::MAX_PAYLOAD, 'max_connections' => Limits::MAX_CONNECTIONS],
             Operation::Send => 42,
             Operation::Keepalive => KeepalivePeerReply::Malformed === $mode ? 'not-an-integer' : 1_700_000_060_000,
             default => null,

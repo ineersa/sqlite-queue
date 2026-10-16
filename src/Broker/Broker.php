@@ -20,6 +20,7 @@ use Ineersa\SqliteQueue\Protocol\Frame;
 use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Protocol\Operation;
 use Ineersa\SqliteQueue\Protocol\ProtocolException;
+use Ineersa\SqliteQueue\Protocol\ProtocolLimits;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
@@ -65,6 +66,7 @@ final class Broker
         private readonly SocketIdentity $socketIdentity,
         private readonly \Closure $clock,
         private readonly float $storageOperationTimeoutSeconds,
+        private readonly ProtocolLimits $limits = new ProtocolLimits(),
     ) {
         if (!is_finite($storageOperationTimeoutSeconds)) {
             throw new \InvalidArgumentException('Storage operation timeout must be finite seconds.');
@@ -107,10 +109,12 @@ final class Broker
                     'synchronous_effective' => $this->storage->synchronousMode()->value,
                     'database' => $this->locks->database,
                     'endpoint' => $this->locks->endpoint,
+                    'max_payload' => $this->limits->maxPayload,
+                    'max_connections' => $this->limits->maxConnections,
                 ]);
             }
             while (!$this->stopping && null !== ($socket = $this->server->accept())) {
-                if (\count($this->clients) >= self::MAX_CONNECTIONS) {
+                if (\count($this->clients) >= $this->limits->maxConnections) {
                     $socket->close();
                     continue;
                 }
@@ -267,7 +271,10 @@ final class Broker
                     return;
                 }
                 if (0 === $expected) {
-                    $response = new Frame(['v' => Frame::VERSION, 'id' => 0, 'ok' => true, 'result' => ['max_payload' => Frame::MAX_PAYLOAD]]);
+                    $response = new Frame(['v' => Frame::VERSION, 'id' => 0, 'ok' => true, 'result' => [
+                        ControlField::MaxPayload->value => $this->limits->maxPayload,
+                        ControlField::MaxConnections->value => $this->limits->maxConnections,
+                    ]]);
                 } else {
                     try {
                         $response = match ($operation) {
@@ -302,7 +309,7 @@ final class Broker
                     }
                 }
                 unset($request);
-                Frame::write($socket, $response->encode(), new TimeoutCancellation(self::WRITE_TIMEOUT));
+                Frame::write($socket, $response->encode($this->limits), new TimeoutCancellation(self::WRITE_TIMEOUT));
                 unset($response);
                 ++$expected;
                 if ($this->stopping) {
@@ -323,7 +330,7 @@ final class Broker
             return;
         }
         try {
-            Frame::write($socket, $response->encode(), new TimeoutCancellation(self::WRITE_TIMEOUT));
+            Frame::write($socket, $response->encode($this->limits), new TimeoutCancellation(self::WRITE_TIMEOUT));
         } catch (\Throwable) {
             // A malformed or disconnected peer may be unable to receive its error.
         }
@@ -362,7 +369,7 @@ final class Broker
     private function readRequest(Socket $socket, Cancellation $lifetime, int $expected): ?Frame
     {
         if (0 === $expected) {
-            return Frame::read($socket, new CompositeCancellation($lifetime, new TimeoutCancellation(self::HANDSHAKE_TIMEOUT)));
+            return Frame::read($socket, new CompositeCancellation($lifetime, new TimeoutCancellation(self::HANDSHAKE_TIMEOUT)), $this->limits);
         }
 
         // An established session may be idle or executing a handler. Bound partial frames,
@@ -372,7 +379,7 @@ final class Broker
             return null;
         }
 
-        return Frame::readAfterPrefix($socket, $prefix, new CompositeCancellation($lifetime, new TimeoutCancellation(self::OPERATION_TIMEOUT)));
+        return Frame::readAfterPrefix($socket, $prefix, new CompositeCancellation($lifetime, new TimeoutCancellation(self::OPERATION_TIMEOUT)), $this->limits);
     }
 
     /** Validation runs before dispatch so every rejection reports its own error code. */
@@ -671,7 +678,7 @@ final class Broker
     private function writeError(Socket $socket, int $id, ErrorCode $code): void
     {
         try {
-            Frame::write($socket, self::error($id, $code)->encode(), new TimeoutCancellation(self::WRITE_TIMEOUT));
+            Frame::write($socket, self::error($id, $code)->encode($this->limits), new TimeoutCancellation(self::WRITE_TIMEOUT));
         } catch (\Throwable) {
         }
     }

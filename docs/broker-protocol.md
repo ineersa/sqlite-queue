@@ -12,18 +12,18 @@ All integers in the frame envelope are unsigned, four-byte, big-endian values:
 
 `L = 4 + C + body_length + headers_length`. The outer length excludes its own four-byte prefix. `body_length` and `headers_length` are required nonnegative JSON integers in the control object. Their sum must exactly match the remaining payload bytes. Application bytes are not embedded in JSON and need not be UTF-8.
 
-| Resource | Limit |
-| --- | --- |
-| Frame length `L`, excluding the outer prefix | 1,048,576 bytes. |
-| Control JSON | 2 through 8,192 bytes; decoding depth limit 32. |
-| Combined body and headers | 1,040,000 bytes, including empty strings. |
-| Broker connections | 64 total, including notification connections. |
-| Outstanding exchanges | One per connection. Requests must wait for the preceding reply. |
-| WAIT duration | Integer 0 through 30,000 milliseconds. |
-| WAIT_ANY queue selection | JSON list of 1 through 16 distinct valid names. |
-| Queue name | 1 through 255 ASCII letters, digits, `.`, `_`, or `-`, starting with a letter or digit. |
+| Resource | Default limit | Configurable? |
+| --- | --- | --- |
+| Frame length `L`, excluding the outer prefix | Derived from the payload budget as `max_payload + 4 + 8,192 + 380`. The published default is 1,048,576 bytes. | Derived from `max_payload`. |
+| Control JSON | 2 through 8,192 bytes; decoding depth limit 32. | Fixed. |
+| Combined body and headers | 1,040,000 bytes, including empty strings. | Yes. BrokerFactory, `--max-payload`, or bundle `max_payload`. |
+| Broker connections | 64 total, including notification connections. | Yes. BrokerFactory, `--max-connections`, or bundle `max_connections`. |
+| Outstanding exchanges | One per connection. Requests must wait for the preceding reply. | Fixed. |
+| WAIT duration | Integer 0 through 30,000 milliseconds. | Fixed. |
+| WAIT_ANY queue selection | JSON list of 1 through 16 distinct valid names. | Fixed. |
+| Queue name | 1 through 255 ASCII letters, digits, `.`, `_`, or `-`, starting with a letter or digit. | Fixed. |
 
-Limits are fixed in v1, not negotiated. The broker rejects excessive frame lengths before reading their contents. At the connection limit it closes a new socket without a handshake. Connection read and write deadlines are listed in [cancellation and budgets](sqlite-worker.md#cancellation-and-budgets).
+Published defaults preserve the v0.1.0 budgets. Operators may raise or lower only the payload and connection budgets. The frame budget expands or contracts with the payload budget so a worst-case control block still fits. The HELLO response advertises the active payload and connection budgets; clients adopt those budgets after HELLO. Unexpected expected-limit mismatches reject the connection. Absent `max_connections` in an original v1 HELLO defaults to 64; an explicit null is rejected. The broker rejects excessive frame lengths before reading their contents. At the configured connection limit it closes a new socket without a handshake. Connection read and write deadlines are listed in [cancellation and budgets](sqlite-worker.md#cancellation-and-budgets).
 
 ## Exchanges
 
@@ -37,7 +37,7 @@ The fields below are additional to the common request fields. Unknown request fi
 
 | `op` | Required fields | Request payload | Successful `result` and response payload |
 | --- | --- | --- | --- |
-| `hello` | None. | Empty. | `{"max_payload":1040000}`; empty payload. |
+| `hello` | None. | Empty. | `{"max_payload":1040000,"max_connections":64}` for the published defaults, or the configured values; empty payload. |
 | `send` | `queue`: valid name; `delay`: nonnegative integer milliseconds. | Raw body and headers. | Positive integer insertion ID; empty payload. |
 | `receive` | `queue`: valid name. | Empty. | `null`, or delivery metadata with the raw body and headers. Never waits for future work. |
 | `acknowledge` | `receipt`: string. | Empty. | `null` after terminal deletion. |
@@ -116,7 +116,7 @@ The broker locks the canonical database and endpoint paths for its lifetime with
 
 Startup refuses every existing endpoint, including leftover sockets. Shutdown removes only the socket inode this broker created, then releases the locks after storage cleanup completes. Lock sidecars remain to preserve their namespace. After an abrupt exit, verify ownership before removing a leftover socket. See [broker operation](broker.md) for the operational procedure.
 
-Readiness is one JSON `ready` event on stdout after lock acquisition, storage initialization, and socket binding. It contains `event`, `pid`, `storage_execution: "fabpot"`, `synchronous_effective`, `database`, and `endpoint`. It does not expose a driver-child PID. The command remains in the foreground; SIGINT and SIGTERM request shutdown.
+Readiness is one JSON `ready` event on stdout after lock acquisition, storage initialization, and socket binding. It contains `event`, `pid`, `storage_execution: "fabpot"`, `synchronous_effective`, `database`, `endpoint`, `max_payload`, and `max_connections`. It does not expose a driver-child PID. The command remains in the foreground; SIGINT and SIGTERM request shutdown.
 
 Normal stop exits zero. Startup failure, observed storage failure, or shutdown-budget exhaustion exits nonzero. Exit zero does not certify that the driver never forced child termination after a close-protocol failure. The broker's drain, escalation, and lock-release rules are defined under [cancellation and budgets](sqlite-worker.md#cancellation-and-budgets).
 

@@ -8,6 +8,7 @@ use Amp\Cancellation;
 use Amp\CompositeCancellation;
 use Amp\TimeoutCancellation;
 use Fabpot\Amp\Sqlite\Worker\Operation;
+use Ineersa\SqliteQueue\Protocol\ProtocolLimits;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Sqlite\QueueWorkerOperation;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
@@ -34,6 +35,7 @@ final class BrokerFactory
      * @param ?Cancellation           $cancellation                   cooperative cancellation for the blocking startup only; serving cancellation stays on Broker::run()
      * @param class-string<Operation> $workerOperation                worker implementation with its own injected clock
      * @param float                   $storageOperationTimeoutSeconds overall storage startup and per-operation budgets in seconds
+     * @param ProtocolLimits          $limits                         configurable payload and connection budgets; defaults preserve published v1 limits
      */
     public function __construct(
         private readonly string $database,
@@ -44,6 +46,7 @@ final class BrokerFactory
         private readonly SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal,
         private readonly string $workerOperation = QueueWorkerOperation::class,
         private readonly float $storageOperationTimeoutSeconds = Broker::STORAGE_OPERATION_TIMEOUT_SECONDS,
+        private readonly ProtocolLimits $limits = new ProtocolLimits(),
     ) {
         if ($visibilityTimeout <= 0) {
             throw new \InvalidArgumentException('Visibility timeout must be positive milliseconds.');
@@ -83,7 +86,7 @@ final class BrokerFactory
             $this->assertNotCancelled();
             $startupDeadline = new TimeoutCancellation($this->storageOperationTimeoutSeconds, 'Broker storage startup deadline expired.');
             $startupCancellation = null === $this->cancellation ? $startupDeadline : new CompositeCancellation($this->cancellation, $startupDeadline);
-            $storage = SqliteQueueStorage::open($locks->database, $this->synchronous, $startupCancellation, $this->workerOperation);
+            $storage = SqliteQueueStorage::open($locks->database, $this->synchronous, $startupCancellation, $this->workerOperation, $this->limits);
             unset($startupCancellation, $startupDeadline);
             $release[] = $storage->close(...);
             $clock = $this->clock ?? static fn (): int => (int) floor(microtime(true) * 1000);
@@ -113,7 +116,7 @@ final class BrokerFactory
             $this->yieldToEventLoop();
             $this->assertNotCancelled();
 
-            return new Broker($server, $queue, $storage, $locks, $socketIdentity, $clock, $this->storageOperationTimeoutSeconds);
+            return new Broker($server, $queue, $storage, $locks, $socketIdentity, $clock, $this->storageOperationTimeoutSeconds, $this->limits);
         } catch (\Throwable $error) {
             foreach (array_reverse($release) as $step) {
                 try {

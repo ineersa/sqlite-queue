@@ -425,7 +425,7 @@ final class TransportTest extends TestCase
                     'v' => Frame::VERSION,
                     'id' => 0,
                     'ok' => true,
-                    'result' => ['max_payload' => Frame::MAX_PAYLOAD],
+                    'result' => ['max_payload' => Frame::MAX_PAYLOAD, 'max_connections' => Limits::MAX_CONNECTIONS],
                 ]))->encode());
                 Frame::read($socket, new TimeoutCancellation(3));
                 ++$received;

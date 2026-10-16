@@ -60,7 +60,7 @@ The signatures below are methods on `Ineersa\SqliteQueue\Queue`. Types are `Amp\
 
 `DeliveryDTO` is readonly. Its fields are integer `id`, string `queue`, byte strings `body` and `headers`, string `receipt`, and integer Unix-millisecond timestamps `availableAt` and `reservedUntil`.
 
-Construct `QueueName` at the boundary for untrusted strings. Names contain 1 through 255 ASCII letters, digits, dots, underscores, or hyphens and start with a letter or digit. Bodies and headers can be arbitrary bytes, including empty strings, with a combined maximum of 1,040,000 bytes. Validation rejects oversized payloads rather than truncating them. Delays and calculated deadlines must fit the PHP integer range.
+Construct `QueueName` at the boundary for untrusted strings. Names contain 1 through 255 ASCII letters, digits, dots, underscores, or hyphens and start with a letter or digit. Bodies and headers can be arbitrary bytes, including empty strings. The combined default maximum is 1,040,000 bytes; the active broker payload budget may raise or lower that bound. Validation rejects oversized payloads rather than truncating them. Delays and calculated deadlines must fit the PHP integer range.
 
 Queue interprets receipt failures from storage and raises the [six concrete receipt exceptions](broker-protocol.md#receipt-errors). It retains no delivery history after deletion. There are no queue list, count, or purge methods.
 

@@ -20,6 +20,7 @@ use Ineersa\SqliteQueue\Protocol\KeepaliveStream;
 use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Protocol\Operation;
 use Ineersa\SqliteQueue\Protocol\ProtocolException;
+use Ineersa\SqliteQueue\Protocol\ProtocolLimits;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 
 use function Amp\Socket\connect;
@@ -43,18 +44,26 @@ final class Client
     private array $pendingKeepalives = [];
     private bool $flushingKeepalives = false;
 
-    private function __construct(private readonly Socket $socket, private readonly float $timeout)
-    {
+    private function __construct(
+        private readonly Socket $socket,
+        private readonly float $timeout,
+        private readonly ProtocolLimits $limits,
+    ) {
     }
 
     private function __clone(): void
     {
     }
 
+    public function protocolLimits(): ProtocolLimits
+    {
+        return $this->limits;
+    }
+
     /**
-     * @param float $timeout per-exchange bound in seconds; 10 is the documented protocol default
+     * @param ?ProtocolLimits $expectedLimits when provided, HELLO must advertise these exact budgets
      */
-    public static function connect(string $endpoint, float $timeout = 10, ?Cancellation $cancellation = null): self
+    public static function connect(string $endpoint, float $timeout = 10, ?Cancellation $cancellation = null, ?ProtocolLimits $expectedLimits = null): self
     {
         if ($timeout <= 0 || !is_finite($timeout)) {
             throw new \InvalidArgumentException('Timeout must be positive and finite.');
@@ -64,21 +73,64 @@ final class Client
         } catch (\Throwable $error) {
             throw new TransportException('Could not connect to queue broker.', previous: $error);
         }
-        $client = new self($socket, $timeout);
-        $client->exchange(
-            Operation::Hello,
-            static function (Frame $reply): void {
-                $result = $reply->control[ControlField::Result->value];
-                if (!\is_array($result)) {
-                    throw new ProtocolException(ErrorCode::InvalidRequest, 'HELLO result must be an object.');
-                }
-                if (($result[ControlField::MaxPayload->value] ?? null) !== Frame::MAX_PAYLOAD) {
-                    throw new ProtocolException(ErrorCode::InvalidRequest, 'HELLO result.max_payload must equal the client payload limit.');
-                }
-                self::assertNoPayload($reply, 'HELLO');
-            },
-            cancellation: $cancellation,
-        );
+        $deadline = new TimeoutCancellation($timeout);
+        $bound = null === $cancellation ? $deadline : new CompositeCancellation($deadline, $cancellation);
+        try {
+            // HELLO is empty and always fits the published default frame budget.
+            Frame::write($socket, (new Frame([
+                ControlField::Version->value => Frame::VERSION,
+                ControlField::Id->value => 0,
+                ControlField::Operation->value => Operation::Hello->value,
+            ]))->encode(ProtocolLimits::defaults()), $bound);
+            $reply = Frame::read($socket, $bound, ProtocolLimits::defaults());
+            if (null === $reply) {
+                throw new TransportException('Broker confirmation unavailable; outcome may be unknown. Client is closed.');
+            }
+            if (($reply->control[ControlField::Version->value] ?? null) !== Frame::VERSION) {
+                throw new ProtocolException(ErrorCode::InvalidRequest, 'Response v must equal protocol version 1.');
+            }
+            if (($reply->control[ControlField::Id->value] ?? null) !== 0) {
+                throw new ProtocolException(ErrorCode::InvalidRequest, 'Response id must equal the outstanding request id.');
+            }
+            $ok = $reply->control[ControlField::Ok->value] ?? null;
+            if (true !== $ok) {
+                throw new ProtocolException(ErrorCode::InvalidRequest, 'HELLO must succeed.');
+            }
+            $result = $reply->control[ControlField::Result->value] ?? null;
+            if (!\is_array($result)) {
+                throw new ProtocolException(ErrorCode::InvalidRequest, 'HELLO result must be an object.');
+            }
+            $maxPayload = $result[ControlField::MaxPayload->value] ?? null;
+            // Original v1 brokers advertise only max_payload and have a fixed
+            // 64-connection limit. The new capacity field is additive metadata.
+            $maxConnections = \array_key_exists(ControlField::MaxConnections->value, $result)
+                ? $result[ControlField::MaxConnections->value]
+                : Limits::MAX_CONNECTIONS;
+            if (!\is_int($maxPayload) || !\is_int($maxConnections)) {
+                throw new ProtocolException(ErrorCode::InvalidRequest, 'HELLO payload and connection limits must be integers.');
+            }
+            try {
+                $limits = new ProtocolLimits($maxPayload, $maxConnections);
+            } catch (\InvalidArgumentException) {
+                throw new ProtocolException(ErrorCode::InvalidRequest, 'HELLO result limits are invalid.');
+            }
+            if (null !== $expectedLimits
+                && ($expectedLimits->maxPayload !== $limits->maxPayload || $expectedLimits->maxConnections !== $limits->maxConnections)
+            ) {
+                throw new ProtocolException(ErrorCode::InvalidRequest, 'HELLO result limits must equal the expected client limits.');
+            }
+            self::assertNoPayload($reply, 'HELLO');
+        } catch (\Throwable $error) {
+            $socket->close();
+            if ($error instanceof TransportException || $error instanceof ProtocolException) {
+                throw $error;
+            }
+            throw new TransportException('Could not complete the broker handshake.', previous: $error);
+        }
+
+        $client = new self($socket, $timeout, $limits);
+        // HELLO used request id 0 outside exchange(); later calls start at 1.
+        $client->nextId = 1;
 
         return $client;
     }
@@ -390,7 +442,7 @@ final class Client
                 ControlField::Version->value => Frame::VERSION,
                 ControlField::Id->value => $id,
                 ControlField::Operation->value => $operation->value,
-            ] + $params, $body, $headers))->encode();
+            ] + $params, $body, $headers))->encode($this->limits);
         } catch (\JsonException) {
             throw new ProtocolException(ErrorCode::InvalidRequest, 'Request control is not valid UTF-8 JSON.');
         }
@@ -402,10 +454,10 @@ final class Client
                 $deadline = new TimeoutCancellation($timeout ?? $this->timeout);
                 $cancellation = null === $cancellation ? $deadline : new CompositeCancellation($deadline, $cancellation);
                 Frame::write($this->socket, $bytes, $cancellation);
-                $reply = Frame::read($this->socket, $cancellation);
+                $reply = Frame::read($this->socket, $cancellation, $this->limits);
             } else {
                 $keepaliveIo->write($bytes);
-                $reply = Frame::readUsing($keepaliveIo->read(...));
+                $reply = Frame::readUsing($keepaliveIo->read(...), $this->limits);
             }
         } catch (\Throwable $error) {
             $ioFailure = $error;
