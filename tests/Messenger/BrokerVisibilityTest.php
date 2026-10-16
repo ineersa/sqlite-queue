@@ -8,6 +8,7 @@ use Amp\DeferredFuture;
 use Amp\TimeoutCancellation;
 use Ineersa\SqliteQueue\Client;
 use Ineersa\SqliteQueue\Command\BrokerCommand;
+use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeProbeMessage;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\NativeKernel;
 use Ineersa\SqliteQueue\Tests\Support\ClockFile;
@@ -123,6 +124,34 @@ final class BrokerVisibilityTest extends TestCase
     {
         foreach (['0', '-1', '1.5', 'invalid', (string) (intdiv(\PHP_INT_MAX, 1000) + 1)] as $value) {
             yield $value => [$value];
+        }
+    }
+
+    public function testStandaloneDefaultKeepsPublishedPayloadAndConnectionLimits(): void
+    {
+        $command = new BrokerCommand();
+        $this->assertSame((string) Limits::MAX_PAYLOAD, $command->getDefinition()->getOption('max-payload')->getDefault());
+        $this->assertSame((string) Limits::MAX_CONNECTIONS, $command->getDefinition()->getOption('max-connections')->getDefault());
+    }
+
+    public function testBundleConfigurationHonorsRaisedPayloadAndConnectionLimits(): void
+    {
+        $fixture = new IsolatedDatabase();
+        $project = $fixture->directory().'/app';
+        $filesystem = new Filesystem();
+        $filesystem->mirror(__DIR__.'/Fixtures/NativeApp/config', $project.'/config');
+        $filesystem->dumpFile($project.'/config/packages/sqlite_queue.yaml', "sqlite_queue:\n    max_payload: 2000000\n    max_connections: 80\n");
+        $kernel = new NativeKernel($project);
+        try {
+            $kernel->boot();
+            $application = new Application($kernel);
+            $command = $application->find('sqlite-queue:broker');
+            $this->assertSame('2000000', $command->getDefinition()->getOption('max-payload')->getDefault());
+            $this->assertSame('80', $command->getDefinition()->getOption('max-connections')->getDefault());
+        } finally {
+            $kernel->shutdown();
+            $filesystem->remove($project);
+            $fixture->remove();
         }
     }
 

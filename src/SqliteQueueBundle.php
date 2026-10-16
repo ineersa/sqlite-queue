@@ -7,6 +7,7 @@ namespace Ineersa\SqliteQueue;
 use Ineersa\SqliteQueue\Command\BrokerCommand;
 use Ineersa\SqliteQueue\DependencyInjection\RegisterNativeConsumeWaitSubscriberPass;
 use Ineersa\SqliteQueue\Messenger\TransportFactory;
+use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 use Symfony\Component\Config\Definition\Configurator\DefinitionConfigurator;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
@@ -37,6 +38,8 @@ final class SqliteQueueBundle extends AbstractBundle
         $definition->rootNode()->children()
             ->enumNode('synchronous')->values(['normal', 'full'])->defaultValue('normal')->end()
             ->integerNode('redeliver_timeout')->min(1)->max(intdiv(\PHP_INT_MAX, 1000))->defaultValue(BrokerCommand::DEFAULT_REDELIVER_TIMEOUT_SECONDS)->end()
+            ->integerNode('max_payload')->min(1)->max(4_294_967_295 - 4 - 8192 - 380)->defaultValue(Limits::MAX_PAYLOAD)->end()
+            ->integerNode('max_connections')->min(1)->defaultValue(Limits::MAX_CONNECTIONS)->end()
         ->end();
     }
 
@@ -52,6 +55,8 @@ final class SqliteQueueBundle extends AbstractBundle
         $services->set(BrokerCommand::class)
             ->arg('$redeliverTimeoutSeconds', $config['redeliver_timeout'])
             ->arg('$synchronous', SqliteSynchronousMode::from($config['synchronous']))
+            ->arg('$maxPayload', $config['max_payload'])
+            ->arg('$maxConnections', $config['max_connections'])
             ->autoconfigure(false)
             ->tag('console.command', ['command' => 'sqlite-queue:broker']);
     }

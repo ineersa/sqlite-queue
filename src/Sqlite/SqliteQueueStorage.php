@@ -18,6 +18,7 @@ use Fabpot\Amp\Sqlite\Worker\Mode;
 use Fabpot\Amp\Sqlite\Worker\Operation;
 use Fabpot\Amp\Sqlite\Worker\OperationExecutor;
 use Fabpot\Amp\Sqlite\Worker\Outcome;
+use Ineersa\SqliteQueue\Protocol\ProtocolLimits;
 
 use function Amp\async;
 
@@ -38,6 +39,7 @@ final class SqliteQueueStorage
         private readonly SqliteWorkerOperationConnection $connection,
         private readonly OperationExecutor $executor,
         private readonly array $configuration,
+        private readonly ProtocolLimits $limits,
     ) {
         $this->closeCompletion = new DeferredFuture();
         $this->closeCompletion->getFuture()->ignore();
@@ -50,11 +52,12 @@ final class SqliteQueueStorage
      *
      * @param class-string<Operation> $workerOperation
      */
-    public static function open(string $path, SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal, ?Cancellation $cancellation = null, string $workerOperation = QueueWorkerOperation::class): self
+    public static function open(string $path, SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal, ?Cancellation $cancellation = null, string $workerOperation = QueueWorkerOperation::class, ?ProtocolLimits $limits = null): self
     {
         if ('' === $path || ':memory:' === $path) {
             throw new \InvalidArgumentException('Queue storage requires a database file path.');
         }
+        $limits ??= ProtocolLimits::defaults();
         $config = (new SqliteConfig($path))
             ->withJournalMode(SqliteJournalMode::Wal)
             ->withSynchronousMode(match ($synchronous) {
@@ -66,13 +69,14 @@ final class SqliteQueueStorage
             ->withPragma('wal_autocheckpoint', self::WAL_AUTOCHECKPOINT_PAGES)
             ->withWorkerOperations([QueueWorkerProtocol::OPERATION_NAME => $workerOperation]);
 
-        return self::fromConnection((new SqliteConnector())->connect($config, $cancellation), $synchronous, $cancellation);
+        return self::fromConnection((new SqliteConnector())->connect($config, $cancellation), $synchronous, $cancellation, $limits);
     }
 
     /** Transfers an acquired connection. Optional cancellation also bounds readback/schema initialization. */
-    public static function fromConnection(SqliteWorkerOperationConnection $connection, SqliteSynchronousMode $synchronous, ?Cancellation $cancellation = null): self
+    public static function fromConnection(SqliteWorkerOperationConnection $connection, SqliteSynchronousMode $synchronous, ?Cancellation $cancellation = null, ?ProtocolLimits $limits = null): self
     {
-        $initialization = async(static function () use ($connection, $synchronous): self {
+        $limits ??= ProtocolLimits::defaults();
+        $initialization = async(static function () use ($connection, $synchronous, $limits): self {
             $configuration = [
                 'journal_mode' => (string) self::scalar($connection, 'PRAGMA journal_mode'),
                 'synchronous' => match (self::scalar($connection, 'PRAGMA synchronous')) {
@@ -94,9 +98,9 @@ final class SqliteQueueStorage
                 throw new \RuntimeException('Queue storage requires effective file-backed WAL mode.');
             }
             $connection->executeScript(QueueSql::SCHEMA_SQL);
-            $executor = $connection->createWorkerOperationExecutor(QueueWorkerProtocol::MAXIMUM_RESULT_BYTES, QueueWorkerProtocol::MAXIMUM_RESULT_ROWS);
+            $executor = $connection->createWorkerOperationExecutor($limits->maximumResultBytes(), QueueWorkerProtocol::MAXIMUM_RESULT_ROWS);
 
-            return new self($connection, $executor, $configuration);
+            return new self($connection, $executor, $configuration, $limits);
         });
         $initialization->ignore();
         try {
@@ -109,6 +113,11 @@ final class SqliteQueueStorage
                 throw $error;
             }
         }
+    }
+
+    public function protocolLimits(): ProtocolLimits
+    {
+        return $this->limits;
     }
 
     public function synchronousMode(): SqliteSynchronousMode
@@ -275,6 +284,9 @@ final class SqliteQueueStorage
             throw new \RuntimeException('Queue storage is closed.');
         }
 
+        if (QueueStorageOperation::Insert === $operation || QueueStorageOperation::Claim === $operation) {
+            $parameters[QueueWorkerProtocol::MAX_PAYLOAD_PARAMETER] = $this->limits->maxPayload;
+        }
         $result = $this->executor->run(QueueWorkerProtocol::OPERATION_NAME, ['operation' => $operation->value, ...$parameters], QueueStorageOperation::Eligibility === $operation ? Mode::ReadOnly : Mode::Transaction);
         if (\array_key_exists('validation_error', $result->data)) {
             $this->requireOutcome($result, Outcome::Rollback, 'Worker validation reply');

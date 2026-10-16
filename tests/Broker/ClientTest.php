@@ -24,6 +24,7 @@ use Ineersa\SqliteQueue\Protocol\Frame;
 use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Protocol\Operation;
 use Ineersa\SqliteQueue\Protocol\ProtocolException;
+use Ineersa\SqliteQueue\Protocol\ProtocolLimits;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -427,17 +428,33 @@ final class ClientTest extends TestCase
         }
     }
 
-    public function testConnectRejectsWrongMaxPayload(): void
+    public function testConnectRejectsIncompleteHelloLimits(): void
     {
-        $this->assertConnectFails(['max_payload' => 1], '', '', 'HELLO result.max_payload must equal the client payload limit.');
+        $this->assertConnectFails(['max_payload' => 1], '', '', 'HELLO result must include integer max_payload and max_connections.');
+    }
+
+    public function testConnectRejectsUnexpectedExpectedLimits(): void
+    {
+        $endpoint = $this->serve(static function (Socket $socket): void {
+            Frame::read($socket, new TimeoutCancellation(3));
+            $socket->write(self::helloReply());
+        });
+        try {
+            Client::connect($endpoint, expectedLimits: new ProtocolLimits(maxPayload: Frame::MAX_PAYLOAD, maxConnections: Limits::MAX_CONNECTIONS + 1));
+            $this->fail('Mismatched expected HELLO limits must reject the connection.');
+        } catch (ProtocolException $error) {
+            $this->assertSame(ErrorCode::InvalidRequest, $error->errorCode);
+            $this->assertSame('HELLO result limits must equal the expected client limits.', $error->getMessage());
+        }
     }
 
     /** @return iterable<string, array{array<string, mixed>|string, string, string, string}> */
     public static function malformedHellos(): iterable
     {
-        $good = ['max_payload' => Frame::MAX_PAYLOAD];
+        $good = ['max_payload' => Frame::MAX_PAYLOAD, 'max_connections' => Limits::MAX_CONNECTIONS];
         yield 'string result' => ['x', '', '', 'HELLO result must be an object.'];
-        yield 'missing max payload' => [[], '', '', 'HELLO result.max_payload must equal the client payload limit.'];
+        yield 'missing max payload' => [[], '', '', 'HELLO result must include integer max_payload and max_connections.'];
+        yield 'missing max connections' => [['max_payload' => Frame::MAX_PAYLOAD], '', '', 'HELLO result must include integer max_payload and max_connections.'];
         yield 'with body' => [$good, 'b', '', 'HELLO must not include a payload.'];
         yield 'with headers' => [$good, '', 'h', 'HELLO must not include a payload.'];
     }
@@ -705,7 +722,7 @@ final class ClientTest extends TestCase
 
     private static function helloReply(): string
     {
-        return (new Frame(['v' => Frame::VERSION, 'id' => 0, 'ok' => true, 'result' => ['max_payload' => Frame::MAX_PAYLOAD]]))->encode();
+        return (new Frame(['v' => Frame::VERSION, 'id' => 0, 'ok' => true, 'result' => ['max_payload' => Frame::MAX_PAYLOAD, 'max_connections' => Limits::MAX_CONNECTIONS]]))->encode();
     }
 
     private function awaitBackground(): void

@@ -15,7 +15,6 @@ use Ineersa\SqliteQueue\Exception\NoActiveReservationException;
 use Ineersa\SqliteQueue\Exception\ReceiptEpochMismatchException;
 use Ineersa\SqliteQueue\Exception\ReceiptOwnerMismatchException;
 use Ineersa\SqliteQueue\Exception\ReceiptTokenMismatchException;
-use Ineersa\SqliteQueue\Protocol\Limits;
 use Ineersa\SqliteQueue\Sqlite\SettlementResultEnum;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
@@ -189,13 +188,6 @@ final class Queue
 
     private function assertPayloadBounds(string $body, string $headers): void
     {
-        $bodyLength = \strlen($body);
-        $headersLength = \strlen($headers);
-        if ($bodyLength > Limits::MAX_PAYLOAD
-            || $headersLength > Limits::MAX_PAYLOAD
-            || $bodyLength + $headersLength > Limits::MAX_PAYLOAD
-        ) {
-            throw new \InvalidArgumentException('Payload exceeds the supported frame budget.');
-        }
+        $this->storage->protocolLimits()->assertPayloadBounds($body, $headers);
     }
 }

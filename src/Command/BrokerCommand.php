@@ -8,6 +8,8 @@ use Amp\DeferredCancellation;
 use Fabpot\Amp\Sqlite\Worker\Operation;
 use Ineersa\SqliteQueue\Broker\BrokerEventEnum;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
+use Ineersa\SqliteQueue\Protocol\Limits;
+use Ineersa\SqliteQueue\Protocol\ProtocolLimits;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Sqlite\QueueWorkerOperation;
 use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
@@ -38,6 +40,8 @@ final class BrokerCommand extends BaseCommand
      */
     private const float SIGNAL_DISPATCH_INTERVAL_SECONDS = 1.0;
 
+    private readonly ProtocolLimits $limits;
+
     /** Standalone defaults use native worker time. The parent clock controls notifier timers.
      * @param class-string<Operation> $workerOperation
      */
@@ -46,6 +50,8 @@ final class BrokerCommand extends BaseCommand
         private readonly ClockInterface $clock = new Clock(),
         private readonly SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal,
         private readonly string $workerOperation = QueueWorkerOperation::class,
+        private readonly int $maxPayload = Limits::MAX_PAYLOAD,
+        private readonly int $maxConnections = Limits::MAX_CONNECTIONS,
     ) {
         if ($redeliverTimeoutSeconds <= 0) {
             throw new \InvalidArgumentException('Redelivery timeout must be positive seconds.');
@@ -53,6 +59,8 @@ final class BrokerCommand extends BaseCommand
         if ($redeliverTimeoutSeconds > intdiv(\PHP_INT_MAX, 1000)) {
             throw new \InvalidArgumentException('Redelivery timeout exceeds the supported milliseconds range.');
         }
+        // Construct once so invalid constructor defaults fail closed before configure().
+        $this->limits = new ProtocolLimits($maxPayload, $maxConnections);
         parent::__construct();
     }
 
@@ -63,6 +71,8 @@ final class BrokerCommand extends BaseCommand
             ->addOption('endpoint', null, InputOption::VALUE_REQUIRED, 'Absolute path to the private Unix socket file.')
             ->addOption('redeliver-timeout', null, InputOption::VALUE_REQUIRED, 'Reservation redelivery timeout in seconds.', (string) $this->redeliverTimeoutSeconds)
             ->addOption('synchronous', null, InputOption::VALUE_REQUIRED, 'SQLite WAL synchronous mode: normal or full.', $this->synchronous->value)
+            ->addOption('max-payload', null, InputOption::VALUE_REQUIRED, 'Maximum combined body and headers bytes.', (string) $this->limits->maxPayload)
+            ->addOption('max-connections', null, InputOption::VALUE_REQUIRED, 'Maximum simultaneous broker client sessions, including notification sockets.', (string) $this->limits->maxConnections)
             ->setHelp('Readiness, framing bounds, lifetime locks, failure handling, and client recovery are documented in docs/broker-protocol.md.');
     }
 
@@ -107,6 +117,15 @@ final class BrokerCommand extends BaseCommand
             $watchers[] = EventLoop::repeat(self::SIGNAL_DISPATCH_INTERVAL_SECONDS, static function (): void {
             });
 
+            $maxPayload = filter_var($input->getOption('max-payload'), \FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+            if (false === $maxPayload) {
+                throw new \InvalidArgumentException('--max-payload must be a positive integer byte count.');
+            }
+            $maxConnections = filter_var($input->getOption('max-connections'), \FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]);
+            if (false === $maxConnections) {
+                throw new \InvalidArgumentException('--max-connections must be a positive integer.');
+            }
+            $limits = new ProtocolLimits($maxPayload, $maxConnections);
             $broker = (new BrokerFactory(
                 $database,
                 $endpoint,
@@ -115,6 +134,7 @@ final class BrokerCommand extends BaseCommand
                 cancellation: $shutdown->getCancellation(),
                 synchronous: $synchronous,
                 workerOperation: $this->workerOperation,
+                limits: $limits,
             ))->create();
             $code = $broker->run(function (array $event) use ($output): void {
                 $this->write($event, $output);

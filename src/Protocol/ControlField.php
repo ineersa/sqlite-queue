@@ -23,6 +23,7 @@ enum ControlField: string
     case WaitMilliseconds = 'wait_ms';
     case Queues = 'queues';
     case MaxPayload = 'max_payload';
+    case MaxConnections = 'max_connections';
     case AvailableAt = 'available_at';
     case ReservedUntil = 'reserved_until';
 }

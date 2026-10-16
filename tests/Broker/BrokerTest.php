@@ -18,6 +18,7 @@ use Ineersa\SqliteQueue\Exception\TransportException;
 use Ineersa\SqliteQueue\Protocol\ErrorCode;
 use Ineersa\SqliteQueue\Protocol\Frame;
 use Ineersa\SqliteQueue\Protocol\Limits;
+use Ineersa\SqliteQueue\Protocol\ProtocolLimits;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Tests\Broker\Fixtures\GatingServerSocket;
 use Ineersa\SqliteQueue\Tests\Broker\Fixtures\WriteGate;
@@ -44,6 +45,8 @@ final class BrokerTest extends TestCase
     /** @var Future<int>|null */
     private ?Future $brokerFuture = null;
     private string $endpoint = '';
+    /** @var list<string> */
+    private array $endpointDirectories = [];
     /** @var list<Client> */
     private array $clients = [];
     /** @var list<Socket> */
@@ -79,6 +82,11 @@ final class BrokerTest extends TestCase
         } finally {
             $this->broker = null;
             $this->brokerFuture = null;
+            foreach ($this->endpointDirectories as $directory) {
+                @unlink($directory.'/q.sock');
+                @rmdir($directory);
+            }
+            $this->endpointDirectories = [];
             $this->database?->remove();
         }
 
@@ -173,6 +181,70 @@ final class BrokerTest extends TestCase
             $this->fireNotifierTimer($timer);
             $this->assertNull(Frame::read($peer, new TimeoutCancellation(self::SHUTDOWN_BOUND_SECONDS)));
             $this->connectClient()->send('jobs', 'unrelated client remains usable');
+        });
+    }
+
+    public function testConfiguredConnectionLimitAdmitsRaisedCapacityAndRejectsExcess(): void
+    {
+        $this->runAsync(function (): void {
+            $limits = new ProtocolLimits(maxPayload: Limits::MAX_PAYLOAD, maxConnections: 80);
+            $this->startBroker(limits: $limits);
+            $admitted = [];
+            for ($i = 0; $i < 80; ++$i) {
+                $admitted[] = $this->connectClient();
+            }
+            $this->assertCount(80, $admitted);
+            try {
+                Client::connect($this->endpoint, 5);
+                $this->fail('A broker beyond its configured connection bound must refuse the handshake.');
+            } catch (TransportException) {
+            }
+            $first = $this->clients[0];
+            $id = $first->send('jobs', 'still accepted');
+            $delivery = $first->receive('jobs');
+            $this->assertNotNull($delivery);
+            $this->assertSame($id, $delivery->id);
+            $first->acknowledge($delivery->receipt);
+        });
+    }
+
+    public function testConfiguredPayloadRoundTripsMultiMegabyteBodyAndHeaders(): void
+    {
+        $this->runAsync(function (): void {
+            $limits = new ProtocolLimits(maxPayload: 3_000_000, maxConnections: Limits::MAX_CONNECTIONS);
+            $this->startBroker(limits: $limits);
+            $client = $this->connectClient();
+            $this->assertSame(3_000_000, $client->protocolLimits()->maxPayload);
+            $body = str_repeat("\x00\xff", 1_200_000); // 2_400_000 bytes
+            $headers = str_repeat('h', 500_000);
+            $this->assertSame(2_900_000, \strlen($body) + \strlen($headers));
+            $id = $client->send('jobs', $body, $headers);
+            $delivery = $client->receive('jobs');
+            $this->assertNotNull($delivery);
+            $this->assertSame($id, $delivery->id);
+            $this->assertSame($body, $delivery->body);
+            $this->assertSame($headers, $delivery->headers);
+            $client->acknowledge($delivery->receipt);
+            $this->assertNull($client->receive('jobs'));
+        });
+    }
+
+    public function testConfiguredBrokerRejectsOversizedLengthPrefixBeforeContent(): void
+    {
+        $this->runAsync(function (): void {
+            $limits = new ProtocolLimits(maxPayload: 1_000, maxConnections: Limits::MAX_CONNECTIONS);
+            $this->startBroker(limits: $limits);
+            $peer = $this->rawPeer();
+            Frame::write($peer, (new Frame(['v' => Frame::VERSION, 'id' => 0, 'op' => 'hello']))->encode($limits), new TimeoutCancellation(5));
+            $hello = Frame::read($peer, new TimeoutCancellation(5), $limits);
+            $this->assertNotNull($hello);
+            // 1_000 payload => maxFrame = 1_000 + 4 + 8192 + 380 = 9576. Send a malicious larger prefix.
+            $peer->write(pack('N', $limits->maxFrame + 1));
+            $reply = Frame::read($peer, new TimeoutCancellation(5), $limits);
+            $this->assertNotNull($reply);
+            $this->assertFalse($reply->control['ok'] ?? true);
+            $this->assertSame(ErrorCode::FrameTooLarge->value, $reply->control['error']['code'] ?? null);
+            $this->assertNull(Frame::read($peer, new TimeoutCancellation(5), $limits));
         });
     }
 
@@ -1198,17 +1270,31 @@ final class BrokerTest extends TestCase
         $this->now = $value;
     }
 
-    private function startBroker(int $visibilityTimeout = 5000, ?\Closure $clock = null): void
+    private function shortEndpoint(string $basename = 'q.sock'): string
+    {
+        // Worktree paths under the repository exceed the 100-byte Unix socket bound.
+        $directory = '/tmp/sq-'.bin2hex(random_bytes(4));
+        if (!mkdir($directory, 0700) && !is_dir($directory)) {
+            throw new \RuntimeException('Cannot create short broker endpoint directory.');
+        }
+        $this->endpointDirectories[] = $directory;
+
+        return $directory.'/'.$basename;
+    }
+
+    private function startBroker(int $visibilityTimeout = 5000, ?\Closure $clock = null, ?ProtocolLimits $limits = null): void
     {
         $database = $this->database ?? throw new \LogicException('Missing test database.');
-        $this->endpoint = $database->path('queue.sock');
+        $this->endpoint = $this->shortEndpoint();
         ClockFile::configure($this->database->path(), $this->now);
+        $limits ??= ProtocolLimits::defaults();
         $this->broker = (new BrokerFactory(
             $database->path(),
             $this->endpoint,
             $visibilityTimeout,
             $clock ?? (fn (): int => $this->now),
             workerOperation: ControlledQueueWorkerOperation::class,
+            limits: $limits,
         ))->create();
         $ready = new DeferredFuture();
         $this->brokerFuture = async(fn (): int => $this->broker->run(static function (array $event) use ($ready): void {
@@ -1217,6 +1303,8 @@ final class BrokerTest extends TestCase
         $event = $ready->getFuture()->await(new TimeoutCancellation(15));
         $this->assertSame('ready', $event['event']);
         $this->assertSame('fabpot', $event['storage_execution']);
+        $this->assertSame($limits->maxPayload, $event['max_payload']);
+        $this->assertSame($limits->maxConnections, $event['max_connections']);
         $this->assertArrayNotHasKey('persistence_pid', $event);
     }
 
@@ -1227,7 +1315,7 @@ final class BrokerTest extends TestCase
     private function startBrokerWithGatedServer(WriteGate $gate, int $thresholdBytes, bool $skipHello = false): void
     {
         $database = $this->database ?? throw new \LogicException('Missing test database.');
-        $this->endpoint = $database->path('queue.sock');
+        $this->endpoint = $this->shortEndpoint();
         ClockFile::configure($this->database->path(), $this->now);
         $original = (new BrokerFactory(
             $database->path(),
