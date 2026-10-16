@@ -1,8 +1,10 @@
 # Copy into config/packages/messenger.yaml.
 # Replace the message classes and endpoint with your application's values.
-# Redelivery is seconds. Choose a duration that covers processing and batch flushes.
+# These settings apply to bin/console sqlite-queue:broker, not the standalone command.
+# Run consumers with --keepalive=5 for handlers or batch flushes that may exceed 60s.
 sqlite_queue:
     redeliver_timeout: 60
+    synchronous: normal
     # Optional. Defaults preserve the published 1,040,000-byte / 64-connection budgets.
     # max_payload: 1040000
     # max_connections: 64

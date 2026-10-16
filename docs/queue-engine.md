@@ -1,88 +1,98 @@
-# SQLite queue engine
+# In-process queue engine
 
-`Ineersa\SqliteQueue\Queue` owns message policy. `Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage` owns one asynchronous driver connection, schema setup, SQL, and transaction boundaries. SQLite is authoritative. The engine stores no message cache, tracks no live client sessions, and performs no application deserialization.
+This is the advanced PHP API used by the broker. Most applications should use the [client](broker.md) or [Messenger transport](messenger.md) instead.
 
-Both classes run in the broker. Driver calls suspend fibers while SQLite executes in the driver's child process. The broker owns sockets, WAIT coordination, and session lifetime. Broker waiting uses `earliestEligibility()` as a scheduling hint only.
+`Queue` owns message policy, receipt generation, and the Queue epoch. `SqliteQueueStorage` owns its driver connection, schema, SQL, and transaction boundary. Neither class owns a registry of live client sessions. See [storage architecture](sqlite-worker.md#process-model) for the worker execution model and [delivery contracts](contracts.md) for guarantees.
 
 ## Opening and ownership
+
+The database directory must already exist. Open file-backed storage, construct the policy object, and close storage in `finally`:
 
 ```php
 use Amp\DeferredCancellation;
 use Ineersa\SqliteQueue\Queue;
 use Ineersa\SqliteQueue\Sqlite\SqliteQueueStorage;
-use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
 use Ineersa\SqliteQueue\ValueObject\QueueName;
 
-$storage = SqliteQueueStorage::open('/absolute/path/to/queue.sqlite');
-$queue = new Queue($storage);
+$bodyBytes = 'example message';
+$headerBytes = '';
 $ownerId = bin2hex(random_bytes(32));
 $lifetime = new DeferredCancellation();
+$storage = SqliteQueueStorage::open('/absolute/path/queue.sqlite');
+
 try {
-    $id = $queue->send(new QueueName('emails'), $bodyBytes, $headerBytes, delay: 250, cancellation: $lifetime->getCancellation());
-    $delivery = $queue->receive(new QueueName('emails'), $ownerId, $lifetime->getCancellation());
-    if ($delivery !== null) {
-        // Application processing happens outside every storage transaction.
-        $queue->acknowledge($delivery->receipt, $ownerId, $lifetime->getCancellation());
-    }
+	$queue = new Queue($storage);
+	$name = new QueueName('emails');
+	$id = $queue->send($name, $bodyBytes, $headerBytes, cancellation: $lifetime->getCancellation());
+	$delivery = $queue->receive($name, $ownerId, $lifetime->getCancellation());
+	if ($delivery !== null) {
+		// Process $delivery->body outside the storage transaction.
+		$queue->acknowledge($delivery->receipt, $ownerId, $lifetime->getCancellation());
+	}
 } finally {
-    $lifetime->cancel();
-    $storage->close();
+	$lifetime->cancel();
+	$storage->close();
 }
 ```
 
-The database directory must exist. Queue names are independent of the database path. Construct `QueueName` from untrusted strings; invalid names fail at construction. Names contain 1 to 255 ASCII letters, digits, dots, underscores, or hyphens and start with a letter or digit. Paths, empty names, and NUL bytes are rejected. Bodies and headers can contain arbitrary bytes, including empty strings.
+`open()` accepts named `synchronous` and `cancellation` arguments. The default is `SqliteSynchronousMode::Normal`; pass `Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode::Full` for FULL. In-memory databases and an empty path are rejected. Initialization verifies SQLite 3.31.0 or newer, WAL, and the selected synchronous mode, then creates the table and indexes if absent. The standard connection uses a 5,000-millisecond busy timeout and 1,000-page WAL autocheckpoint threshold.
 
-`SqliteQueueStorage::open(string $path, SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal, ?Cancellation $cancellation = null)` opens one asynchronous driver connection with immediate transactions. Optional cancellation covers the connection handshake and subsequent configuration readback and schema queries. Only NORMAL and FULL are supported. Use `SqliteQueueStorage::open($path, SqliteSynchronousMode::Full)` for FULL. Initialization verifies WAL and the selected synchronous mode, sets `busy_timeout` to 5,000 milliseconds and `wal_autocheckpoint` to 1,000 pages, and creates the table and indexes if absent. In-memory databases are not supported. Do not modify the schema or open the database independently while the broker owns it.
+`SqliteQueueStorage::fromConnection(SqliteWorkerOperationConnection $connection, SqliteSynchronousMode $synchronous, ?Cancellation $cancellation = null): self` transfers exclusive ownership of an acquired driver connection. The connection must already have the required configuration and queue worker-operation registration. Initialization verifies configuration and creates the schema; failure closes the transferred connection. Do not reuse that connection, change its configuration, or modify its schema concurrently.
 
-`SqliteQueueStorage::fromConnection(SqliteWorkerOperationConnection $connection, SqliteSynchronousMode $synchronous, ?Cancellation $cancellation = null)` takes exclusive ownership of an acquired driver connection. Optional cancellation bounds configuration readback and schema initialization; failure closes the connection. Do not use the transferred connection concurrently or change its schema or settings after construction. The broker supplies its storage-startup deadline.
+`new Queue(SqliteQueueStorage $storage, int $visibilityTimeout = 60000)` requires positive visibility milliseconds. Queue does not acquire or close storage. Invalid visibility leaves caller-owned storage open. A Queue cannot be cloned; each new instance creates a fresh epoch.
 
-`new Queue(SqliteQueueStorage $storage, int $visibilityTimeout = 60000)` is message policy only. It does not open, configure, or close storage. Invalid visibility fails without closing the caller-owned storage dependency.
+**Direct engine use does not acquire the broker's lifetime locks, enforce its private-path checks, or install its startup and operation deadlines.** The caller owns those policies. An optional storage-initialization cancellation covers acquisition, readback, and schema setup as applicable; no overall initialization timeout is added by `open()` itself. Do not open the broker's database independently while the broker owns it.
 
-The worker operation receives a `QueueClock` and samples nonnegative Unix wall-clock milliseconds after the write transaction begins. Its production clock samples `floor(microtime(true) * 1000)`. Send, claim, renewal and settlement calculate deadlines inside that transaction. The factory's optional clock controls notifier scheduling, not worker mutation timestamps. No monotonic deadline is persisted. Delays and visibility timeouts must fit the signed integer timestamp range. Visibility must be positive; delay may be zero but not negative.
-
-Always close storage in `finally`. The first `close(?Cancellation $cancellation = null)` accepts an existing shutdown budget; without one, the driver's default close ceiling applies. Starting close rejects subsequent operations. Repeated calls await that first close's actual completion and share its result. A later caller's cancellation can tighten the existing close budget, but cannot restart close, extend its budget, or abandon cleanup. Engines cannot be cloned. Broker clients do not open a second SQLite connection.
+A caller owns each client context: use a nonempty owner identity for receive, keepalive, ACK, and reject, and cancel its lifetime on disconnect. Reusing an owner string does not transfer a broker receipt to a new connection. A requested context cancellation raises `ClientContextClosedException`, with the Amp cancellation as its cause. The [uncertain-operation rules](contracts.md#uncertain-operations-and-cancellation) still apply after dispatch.
 
 ## API
 
+The signatures below are methods on `Ineersa\SqliteQueue\Queue`. Types are `Amp\Cancellation`, `Ineersa\SqliteQueue\ValueObject\QueueName`, and `Ineersa\SqliteQueue\DTO\DeliveryDTO`.
+
 | Method | Result |
 | --- | --- |
-| `send(QueueName $queue, string $body, string $headers = '', int $delay = 0, ?Cancellation $cancellation = null): int` | Committed insertion ID. Persists the availability deadline sampled after transaction acquisition. |
-| `receive(QueueName $queue, string $ownerId, ?Cancellation $cancellation = null): ?DeliveryDTO` | One committed reservation, or `null` when nothing can be claimed. Never waits for future work. |
-| `earliestEligibility(QueueName $queue, ?Cancellation $cancellation = null): ?int` | Earliest effective eligibility deadline for one queue, or `null` when the queue has no rows. Scheduling hint only. |
-| `acknowledge(string $receipt, string $ownerId, ?Cancellation $cancellation = null): void` | Deletes the current delivery after validating its receipt and ownership. Returns only after commit. |
-| `reject(string $receipt, string $ownerId, ?Cancellation $cancellation = null): void` | The same fenced terminal deletion. Does not reschedule or retry. |
-| `keepalive(string $receipt, string $ownerId, int $minimumMilliseconds = 0, ?Cancellation $cancellation = null): int` | Committed reservation deadline after checking the original receipt and ownership. Zero selects the configured visibility duration; renewal never shortens the existing deadline. |
+| `send(QueueName $queue, string $body, string $headers = '', int $delay = 0, ?Cancellation $cancellation = null): int` | Committed positive insertion ID. Delay is nonnegative milliseconds, sampled after transaction acquisition. |
+| `receive(QueueName $queue, string $ownerId, ?Cancellation $cancellation = null): ?DeliveryDTO` | A committed reservation, or `null` if no message can be claimed. Does not wait for future work. |
+| `acknowledge(string $receipt, string $ownerId, ?Cancellation $cancellation = null): void` | Fenced terminal deletion. |
+| `reject(string $receipt, string $ownerId, ?Cancellation $cancellation = null): void` | The same terminal deletion, without retry or rescheduling. |
+| `keepalive(string $receipt, string $ownerId, int $minimumMilliseconds = 0, ?Cancellation $cancellation = null): int` | Committed expiry in Unix milliseconds. Zero uses configured visibility; a positive minimum cannot shorten the current lease. |
+| `earliestEligibility(QueueName $queue, ?Cancellation $cancellation = null): ?int` | Earliest effective eligibility timestamp, or `null` for an empty queue. A scheduling hint, not a claim or wait. |
 
-`DeliveryDTO` has readonly fields `id`, `queue`, `body`, `headers`, `receipt`, `availableAt`, and `reservedUntil`. The two timestamps are Unix wall-clock milliseconds. Treat the receipt as opaque, even though its current representation contains the insertion ID and a random reservation token.
+`DeliveryDTO` is readonly. Its fields are integer `id`, string `queue`, byte strings `body` and `headers`, string `receipt`, and integer Unix-millisecond timestamps `availableAt` and `reservedUntil`.
 
-Queue owns receipt generation and interpretation. It creates the storage epoch and reservation tokens, formats receipts, and interprets settlement outcomes. Storage receives those policy inputs and returns a `SettlementResultEnum` identifying success or the failed reservation predicate. Queue translates failures to specific exceptions.
+Construct `QueueName` at the boundary for untrusted strings. Names contain 1 through 255 ASCII letters, digits, dots, underscores, or hyphens and start with a letter or digit. Bodies and headers can be arbitrary bytes, including empty strings. The combined default maximum is 1,040,000 bytes; the active broker payload budget may raise or lower that bound. Validation rejects oversized payloads rather than truncating them. Delays and calculated deadlines must fit the PHP integer range.
 
-Callers own client lifetime. Create a new owner identity for each connection and pass that identity into receive and settlement. Pass an Amp cancellation for the connection lifetime. Cancel it on disconnect. Queue maps a requested cancellation to `ClientContextClosedException`, with the original Amp cancellation as its cause. This is not a receipt rejection.
+Queue interprets receipt failures from storage and raises the [six concrete receipt exceptions](broker-protocol.md#receipt-errors). It retains no delivery history after deletion. There are no queue list, count, or purge methods.
 
-Cancellation can prevent a call before storage begins. It does not revoke dispatched SQL. A completed claim can retain its reservation without disclosing its receipt to a disconnected caller. A disconnect or forced driver shutdown during a mutation cannot prove that the mutation did not commit.
+### Closing storage
+
+`SqliteQueueStorage::close(?Cancellation $cancellation = null): void` starts one close and rejects subsequent operations. Every caller awaits the same close completion and shares its result. The driver's own five-second close ceiling applies; supplied cancellation can tighten it. A later caller's cancellation also reaches the existing close, but cannot restart it, extend its budget, or abandon the cleanup await.
+
+Configuration is available through `configuration(): array`, a startup snapshot containing `journal_mode`, `synchronous`, `busy_timeout`, `wal_autocheckpoint`, and `sqlite_version`, and through `synchronousMode(): SqliteSynchronousMode`. These do not query a live connection or grant concurrent access to it.
 
 ## Schema and ordering
 
-There is one application table, `queue_messages`, for every named queue. SQLite also maintains its internal `sqlite_sequence` table.
+`queue_messages` holds all queues. SQLite also maintains `sqlite_sequence` for AUTOINCREMENT.
 
 | Column | Meaning |
 | --- | --- |
-| `id INTEGER PRIMARY KEY AUTOINCREMENT` | Insertion sequence and message identity. Normal deletion cannot recycle it. |
-| `queue TEXT NOT NULL` | Logical queue name from a validated `QueueName`. |
-| `body BLOB NOT NULL`, `headers BLOB NOT NULL` | Opaque bytes, bound as `SqliteBlob`. Type checks reject non-BLOB values. |
-| `available_at INTEGER NOT NULL` | Original send deadline. Never reset by claim or restart. |
+| `id INTEGER PRIMARY KEY AUTOINCREMENT` | Insertion sequence and identity. Committed IDs are not reused after ordinary deletion. |
+| `queue TEXT NOT NULL` | Logical queue name. QueueName validation belongs to the API boundary. |
+| `body BLOB NOT NULL`, `headers BLOB NOT NULL` | Opaque payloads; CHECK constraints require BLOB storage types. |
+| `available_at INTEGER NOT NULL` | Send deadline; a CHECK requires a nonnegative value. |
 | `reserved_until INTEGER` | Current visibility expiry, initially null. |
-| `reservation_token TEXT` | Random 256-bit token for this delivery, initially null. |
-| `owner_id TEXT` | Owning client identity, initially null. |
-| `broker_epoch TEXT` | Random 256-bit identity for the Queue policy instance, initially null. |
+| `reservation_token TEXT` | Random 256-bit delivery token, initially null. |
+| `owner_id TEXT` | Caller-supplied owner identity, initially null. |
+| `broker_epoch TEXT` | Random 256-bit Queue identity, initially null. |
 
-A constraint requires all four reservation fields to be null or all four to be populated. Deadlines cannot be negative.
+A CHECK requires the four reservation fields to be either all null or all populated. The worker calculates nonnegative wall-clock milliseconds and rejects deadline overflow. Claim and renewal do not change `available_at`.
 
-`queue_messages_order(queue, id)` narrows selection to one queue in insertion order. Eligibility filters are applied during that index scan. Future or reserved rows can increase scan work, but do not block a later eligible row or another queue. There is no temporary ordering step in the verified query plan. This is a correctness-first index choice, not a claim about delayed-backlog performance.
+| Index | Purpose |
+| --- | --- |
+| `queue_messages_order(queue, id)` | Supports selection in insertion order within a queue. Future or reserved rows can increase scan work but do not block later eligible rows. |
+| `queue_messages_ready(queue, max(available_at, coalesce(reserved_until, available_at)))` | Supports the earliest effective eligibility lookup for notifier scheduling. |
 
-`queue_messages_ready(queue, max(available_at, coalesce(reserved_until, available_at)))` supports the earliest-eligibility query used by WAIT scheduling. Effective eligibility is that same expression: unreserved rows use availability, and reserved rows use visibility expiry. The query returns the minimum ready deadline for one queue, or no row when the queue is empty. It does not claim a message and does not hold a transaction while waiting.
-
-The claim selects the lowest eligible ID:
+Receive selects the lowest eligible ID:
 
 ```sql
 SELECT id, body, headers, available_at FROM queue_messages
@@ -91,26 +101,20 @@ WHERE queue = ? AND available_at <= ?
 ORDER BY id LIMIT 1
 ```
 
-The driver's exclusive serial executor runs complete storage operations. Each mutation uses an immediate worker-owned transaction. Receive selects the ID and payload, conditionally updates the reservation using the same eligibility predicate, validates the payload, and commits before returning it. An empty selection rolls back and returns `null`. Intermediate SQL materialization limits can reject oversized payloads before the reservation update. There is no DML `RETURNING`.
+The complete claim runs inside one immediate transaction: acquire the write lock, sample time, select and validate the payload, conditionally reserve the row, then commit. Empty selection or a zero-row reservation update returns `null` after rollback. Driver materialization limits can reject oversized stored payloads before the reservation update; this is an error, not an empty-queue result. The operation does not use DML `RETURNING`.
 
-Concurrent writers acquire SQLite's write lock before selection. Committed insertions therefore define the ID order. This promises eligible-message ordering, not consumer completion order. The broker owns one driver connection. SQLite serializes writers from independent connections to the same file.
+Effective eligibility is `max(available_at, coalesce(reserved_until, available_at))`. `earliestEligibility()` returns the minimum for a queue, including a past timestamp when work is already ready. It does not hold a transaction while waiting for a future deadline. The [delivery contracts](contracts.md#eligibility-and-ordering) explain clock changes and the distinction between selection order and completion order.
 
 ## Visibility and receipts
 
-Availability is sampled after send acquires its write transaction, before insertion. Receive samples eligibility and visibility expiry inside its write transaction. Deadlines have millisecond resolution and follow wall clock, so clock adjustments can advance or postpone eligibility. A positive subsecond delay is preserved, not rounded to seconds or reset after reopen.
+The worker samples time after acquiring the write transaction. Claim writes a new token, owner, epoch, and expiry. Settlement and renewal match message ID and all reservation fields and require `reserved_until > now`.
 
-A claim records its owner identity, Queue epoch, new random token, and expiry. Acknowledge and reject match all of those fields plus message ID. They also require `reserved_until > now`; a receipt expires at its deadline even if no consumer has reclaimed it yet.
+A zero-row conditional mutation is diagnosed inside that transaction with the same clock sample. Missing or unreserved rows, owner mismatch, epoch mismatch, token mismatch, and expiry have distinct outcomes in that order. Matching all predicates without changing a row is an invariant error, not a receipt rejection. See [receipt errors](broker-protocol.md#receipt-errors) for wire codes and exception classes.
 
-Receipt rejections have distinct concrete exceptions under `Exception`, all extending the abstract `InvalidReceiptException` base. `MalformedReceiptException` identifies invalid syntax or an ID outside the supported positive integer range. A zero-row DELETE is diagnosed inside the same immediate transaction, using the same sampled clock. Failure precedence is `NoActiveReservationException`, `ReceiptOwnerMismatchException`, `ReceiptEpochMismatchException`, `ReceiptTokenMismatchException`, then `ExpiredReceiptException`. Multiple mismatches report the first in that order. These failures do not delete another reservation.
-
-No active reservation means the message is absent or unreserved. Storage retains no settlement history, so it cannot distinguish an already-settled message from an ID that never existed. If every predicate matches but DELETE removes no row, storage reports an invariant failure instead of a receipt rejection. Wire codes and client exception mappings are listed in the [protocol reference](broker-protocol.md#receipt-errors).
-
-Cancelling a connection lifetime before dispatch invalidates the call without starting storage work. A committed reservation expiry remains unchanged by cancellation. Reopening creates a new Queue epoch and does not clear reservations. Old receipts cannot settle or renew them. At the last committed expiry, a new receive may claim the row with a new token. There is no receive-count cap or cumulative processing cap. A slow consumer can still repeat an external effect after redelivery; receipt fencing does not provide exactly-once application execution.
+Reopening storage does not clear reservations. Constructing a new Queue changes the epoch, so old receipts cannot settle or renew those rows. At expiry, a new receive may claim them with a new token. [Reservation and keepalive contracts](contracts.md#reservations-and-receipts) define renewal, duplicate handling, and effect fencing.
 
 ## Failures and durability
 
-Send, successful claim, acknowledge, and reject return only after commit. SQL errors propagate after rollback. A failed rollback closes storage and preserves the original operation error as the exception's previous cause, with rollback details in the outer message. Connection failures close storage. The engine never retries an uncertain mutation.
+Storage validates worker transaction outcomes and result shapes before confirming an operation. Contradictory or malformed application replies close storage. SQL and driver failures propagate; direct engine callers must handle them and own service shutdown. The broker adds its own fatal-failure and timeout policy, described under [cancellation and budgets](sqlite-worker.md#cancellation-and-budgets).
 
-SQLite can commit before a process or connection fails to deliver confirmation. An exception therefore does not prove that the operation had no effect. The client does not replay uncertain operations.
-
-NORMAL can lose recent committed sends or ACKs after OS crashes or power loss. FULL provides stronger commit durability if storage honors synchronization. See [storage and durability](contracts.md#storage-and-durability). Close/reopen and process-crash checks do not establish power-loss survival.
+Successful mutation results follow commit. An exception is not proof that a mutation had no effect; use the shared [uncertain-operation rules](contracts.md#uncertain-operations-and-cancellation). NORMAL and FULL have different machine-failure guarantees, detailed under [storage and durability](contracts.md#storage-and-durability).

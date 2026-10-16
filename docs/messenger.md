@@ -1,97 +1,117 @@
-# Symfony Messenger transport reference
+# Use Symfony Messenger with sqlite-queue
 
-The adapter uses Symfony's `messenger:consume` command and normal handler and retry configuration. See [Configure and run Messenger](messenger-setup.md) for installation and examples.
+The adapter connects native `messenger:consume` workers to a separately supervised broker. Messenger owns handler execution, receive priority, retry publication and failure routing. The broker owns storage, reservations and readiness notifications.
+
+Start with [Configure and run Messenger](messenger-setup.md) for installation and a two-queue configuration. This guide explains the settings and behavior that matter when adapting an existing application.
+
+The [configuration reference](configuration.md) lists supported keys and command options with their types, units, defaults, and precedence. Handler execution deadlines are application-owned, not a package setting.
 
 ## Registration
 
-The package requires PHP `^8.5` and Symfony `^8.0`. Enable `Ineersa\SqliteQueue\SqliteQueueBundle` in a FrameworkBundle application. Symfony Flex enables this `symfony-bundle` package automatically; applications without Flex register the bundle in `config/bundles.php`.
+Use PHP `^8.5`, Symfony `^8.0`, and `ext-sqlite3`. Enable `Ineersa\SqliteQueue\SqliteQueueBundle` in your FrameworkBundle application. Check Flex's bundle registration, or add the class entry manually in `config/bundles.php`.
 
-The bundle registers the transport factory and `sqlite-queue:broker` command. The standalone command is `vendor/bin/sqlite-queue broker`. Neither a transport nor a consumer starts the broker.
+The bundle registers the transport factory, `sqlite-queue:broker` command and native idle-wait integration. It does not start a broker or replace the consumer command. The standalone executable, `vendor/bin/sqlite-queue broker`, does not load bundle configuration.
 
 ## Transport configuration
 
 | Setting | Meaning |
 | --- | --- |
-| DSN | `sqlite-queue://<queue>`. The authority is a case-sensitive queue name, not a Messenger transport name. |
-| `endpoint` | Required absolute Unix socket path, supplied in options or as a URL-encoded query value. |
-| `timeout` | Positive finite communication timeout in seconds, default `10`. It does not change reservation expiry. |
+| DSN | `sqlite-queue://<queue>`. The authority is the literal, case-sensitive broker queue name, not a hostname or Messenger alias. |
+| `options.endpoint` | Required absolute Unix socket path. It can also be supplied as a URL-encoded DSN query value. |
+| `options.timeout` | Positive finite client communication allowance in seconds, default `10`. It does not change the lease or handler budget. |
 | Precedence | Explicit options override DSN query values. |
 
-Credentials, ports, fragments, nonempty URL paths, and unknown options are rejected. Messenger's `transport_name` metadata is accepted. Queue names follow the [queue-name rules](queue-engine.md#opening-and-ownership).
+Credentials, ports, fragments, nonempty URL paths and unknown options are rejected. Messenger's `transport_name` metadata is accepted. See [queue-name rules](queue-engine.md#opening-and-ownership) for the allowed names.
 
-In the [configuration example](examples/messenger.yaml), `email` and `reports` are Messenger aliases. Their DSNs select the broker queues `emails` and `reports` on the same socket.
+In [the configuration example](examples/messenger.yaml), the `email` transport uses the `emails` broker queue. The `reports` transport uses the `reports` queue. Configure exactly the same endpoint value for transports that should share notification waits.
 
-Transport construction validates configuration without connecting. Container boot, transport resolution, and `messenger:setup-transports` do not require a live broker. The adapter does not implement transport setup; the broker creates its schema on startup. Actual sends, receives, and waits require the broker.
+Transport construction validates settings but defers connecting until the first operation. Container boot and transport service resolution do not require a live broker. The adapter has no transport setup interface; the broker initializes its schema at startup. Do not rely on `messenger:setup-transports` to start or provision a broker.
 
-The adapter opens separate socket connections for queue operations and notification waits. Cancelling a wait does not close the connection needed to acknowledge messages during the worker's final batch flush. Both sockets use the same broker and SQLite storage.
-
-For direct PHP construction, `Transport` requires distinct operation and notification `BrokerConnection` owners and the absolute broker endpoint path. Each owner receives a closure that accepts Amp `Cancellation` and returns a fresh `Client`. `TransportFactory` supplies these dependencies for normal Messenger use.
+Normal Messenger configuration creates the required connection owners for you. For direct PHP construction, `Transport` takes a `BrokerConnection` for operations, a `QueueName`, the Messenger serializer, a distinct `BrokerConnection` for notifications, and the absolute endpoint path. Each connection owner receives a closure accepting Amp `Cancellation` and returning a fresh `Client`. Do not give both owners the same client: cancelling a wait must not close the connection needed for settlement.
 
 ## Serialization and settlement
 
-The configured Messenger serializer handles envelopes. The broker stores opaque bytes and never deserializes application objects. The adapter encodes serializer headers as JSON string values. Headers must be valid UTF-8; NUL characters are preserved.
+The configured Messenger serializer encodes and decodes envelopes. The broker stores opaque bytes and never deserializes application objects. Adapter headers are a JSON object of UTF-8 string values; NUL bytes are preserved. The native PHP serializer in the example is suitable only for trusted messages. Use another Messenger serializer if your application's format or trust boundary requires it.
 
-The example uses Messenger's `PhpSerializer`. Use it only with trusted messages. Configure another Messenger serializer if required by your application.
+`get()` claims at most one message and does not wait for new work. Received envelopes carry Symfony's `TransportMessageIdStamp` and the adapter's non-sendable `DeliveryReceiptStamp`. That receipt belongs to the receiving transport and its operations connection. Do not acknowledge an envelope through another transport or reconnect and reuse its receipt. Resending an envelope removes delivery-specific stamps before serialization.
 
-Received envelopes carry Symfony's `TransportMessageIdStamp` and the adapter's non-sendable `DeliveryReceiptStamp`. The receipt stamp identifies the delivery and the transport that received it. ACK and reject require that transport and receipt. Resending removes both delivery-specific stamps before serialization.
+ACK deletes the reserved message. Reject also deletes it, without rescheduling. Messenger handles retry publication, backoff and failure routing around those operations. `DelayStamp` uses integer milliseconds, including subsecond delays.
 
-`get()` returns at most one message and does not wait. ACK deletes the delivery. Reject also deletes it, without rescheduling. Messenger owns retry publication and backoff. `DelayStamp` retains integer milliseconds, including subsecond delays.
+A successful storage operation is confirmed after commit, but its crash durability depends on the selected synchronous mode. NORMAL can lose recent sends or settlements after an OS crash or power loss. See [storage and durability](contracts.md#storage-and-durability).
 
 ## Idle waits
 
-A native consumer uses broker notifications when `--sleep` is omitted or zero and all selected receivers are sqlite-queue transports with the same configured endpoint. One distinct queue uses WAIT; **2 through 16** distinct queues use WAIT_ANY. Queue aliases are deduplicated. Each idle wait lasts at most **1,000 milliseconds**, shortened by the native time limit. A readiness reply means try receiving again; it does not reserve a message or change Messenger's receive priority.
+Leave `--sleep` omitted or set it to zero to enable broker notification waits. Selection determines the behavior:
 
-The adapter reads the receiver set from the started worker's metadata, after native selection. `--all`, regex expansion, exclusions, and interactive selection participate when the installed Symfony version supports them. Symfony 8.0's literal names and Symfony 8.1's expanded names follow their native behavior.
+| Selected receivers | Idle behavior |
+| --- | --- |
+| One distinct sqlite-queue queue | WAIT on that queue. |
+| 2 through 16 distinct sqlite-queue queues, all with the same configured endpoint | WAIT_ANY across those queues. |
+| A selection containing sqlite-queue and foreign transports, different endpoints, or more than 16 distinct queues | Bounded Clock sleep fallback. |
+| No sqlite-queue receivers | Native Messenger sleep options and idle listeners remain unchanged. |
+| Explicit positive `--sleep`, such as `--sleep=0.5` | Native polling, without notification waits. |
 
-Selected transports keep their own operation connections for settlement. A group shares the first selected transport's separate notification connection. Cancelling that wait leaves operation connections available for final batch ACKs.
+The default notification and fallback budget is **1,000 milliseconds**, shortened by the native time limit. Aliases of the same queue are deduplicated. A readiness response means try receiving again; it neither reserves a message nor changes Messenger's receive order. A busy higher-priority queue can still delay a lower-priority queue.
 
-Consumers with no sqlite-queue receivers keep their native sleep options and idle listeners unchanged. The adapter activates only after the stock command resolves a selected sqlite-queue receiver, before the worker captures its sleep option.
+The adapter reads the receiver set after native selection. Literal receiver names work on Symfony 8.0. Regex expansion, exclusions, `--all` and interactive selection follow the installed Symfony version's own command support; the adapter does not add those options.
 
-Explicit positive sleep, such as `--sleep=0.5`, retains native polling. Selections containing sqlite-queue use a bounded Clock sleep fallback if they mix transport types, use different configured endpoints, or name more than 16 queues. The fallback uses the same 1,000-millisecond budget, shortened by the native time limit, so these selections cannot busy-poll with omitted or zero `--sleep`. Cross-broker notification waiting is not implemented. Older brokers reject WAIT_ANY explicitly; there is no automatic polling downgrade.
+Each selected transport retains its own operations connection. The group shares the first selected transport's separate notification connection. Cancelling an idle wait leaves operations connections available for final batch ACKs.
 
-Console stop signals cancel an active notification wait. `SIGALRM` remains under native handling. Other idle stop listeners may take up to one additional 1,000-millisecond wait before the worker exits. Message, memory, and time limits remain Messenger's responsibility.
+Console stop signals cancel an active notification wait. The fallback Clock sleep is not cancellation-aware while sleeping; stop handling can wait for that bounded sleep to return. Other idle listeners can also cause an additional wait before worker exit. `SIGALRM` remains under native Symfony keepalive handling. Messenger still owns message, memory and time limits.
 
-The public client WAIT limit is **30,000 milliseconds**. This is separate from the adapter's 1,000-millisecond idle wait and the **10-second** default communication timeout. A WAIT exchange adds the requested wait duration to the communication allowance.
+The public client's wait limit is **30,000 milliseconds**, distinct from the adapter's one-second idle budget. WAIT adds its requested duration to the client's default **10-second communication allowance**. The broker's separate **10-second storage deadline** covers eligibility queries, not the requested wait or idle time. See [cancellation and budgets](sqlite-worker.md#cancellation-and-budgets).
 
-Batch flush timing differs by Symfony version. Symfony 8.0 uses the idle sleep threshold; Symfony 8.1 can flush on its first idle iteration with zero sleep. Both versions force pending batches to flush during native shutdown.
+Cross-broker notification waiting is not implemented. A broker that does not support WAIT_ANY rejects it; the adapter does not silently downgrade to polling.
+
+Batch handlers can retain deliveries until a flush. Messenger controls idle flush timing and forces pending batches to flush during normal worker shutdown. Size the lease or enable keepalive for time spent waiting to flush, not only active handler work.
 
 ## Redelivery timeout
 
-Both broker commands accept `--redeliver-timeout` in positive integer **seconds**, default **60**. The bundle setting is `sqlite_queue.redeliver_timeout`. An explicit CLI value overrides the bundle setting. The standalone command does not load bundle configuration.
+The reservation duration is a broker setting, shared by the queues it serves. Both broker commands accept `--redeliver-timeout` in positive integer **seconds**, default **60**. The bundle command reads `sqlite_queue.redeliver_timeout`; a CLI value overrides it. The standalone command ignores bundle settings.
 
-The PHP engine and `BrokerFactory::visibilityTimeout` use **milliseconds**, default **60,000**. Transport `options.timeout` remains a separate communication setting.
+Without keepalive, choose a duration covering processing and deferred batch flushes. After expiry, another worker can reclaim the message. The original ACK fails even if no other worker has reclaimed it yet. Disconnecting does not release the reservation early.
 
-Without keepalive, choose a reservation duration that covers your handler, including deferred batch processing. After expiry, another worker can reclaim the message and the original ACK fails, even if no worker has reclaimed it yet.
+The PHP `BrokerFactory::visibilityTimeout` argument uses **milliseconds**, default **60,000**. Transport `options.timeout` is a separate communication setting. None of these values imposes a cumulative handler execution limit.
 
 ## Keep long-running handlers alive
 
-Enable Symfony's native keepalive for consumers whose handlers can outlive one reservation:
+Enable Symfony's native consumer keepalive:
 
 ```sh
-	php bin/console messenger:consume email reports --keepalive
+php bin/console messenger:consume email reports --keepalive=5
 ```
 
-The stock keepalive interval is **5 seconds**. Use `--keepalive=15` for a 15-second interval. Choose an interval comfortably shorter than the broker's reservation duration, which remains **60 seconds** by default. Native scheduling requires `pcntl` signal support.
+Enable `pcntl` in the consumer's CLI PHP. The bare `--keepalive` flag also selects Symfony's default five-second interval. Choose an interval comfortably shorter than the reservation duration, which defaults to 60 seconds. The interval is a scheduling target, not a guarantee that every renewal occurs exactly on time.
 
-The consumer initiates each renewal. The broker validates the existing receipt, connection owner, epoch, token and unexpired reservation, then commits an extended deadline without changing the receipt. Renewals never shorten a lease. The transport uses the same operations connection that received the message, never its notification connection. ACK, reject and close end pending renewal work.
+The consumer initiates renewal through the same operations connection that received the delivery. The broker validates receipt ownership, epoch, token and unexpired reservation, then commits a deadline extension. It does not change the receipt or shorten the lease. ACK, reject and transport close end renewal work for the delivery.
 
-A handler can run for 30 minutes, 24 hours or longer while renewals succeed. There is no cumulative processing cap. `--keepalive` does not enforce or extend a handler execution budget; the application owns that budget. Each renewal remains a bounded communication exchange, separate from storage-operation deadlines and reservation expiry.
+A handler can run for hours while renewals succeed. There is **no cumulative broker handler time cap**. Keepalive neither enforces nor extends an application execution budget. Configure application limits and supervision separately, and do not assume the worker's ordinary time limit can interrupt arbitrary running handler code.
 
-Symfony invokes keepalive from `SIGALRM`. For that call only, the client performs bounded native socket I/O without switching fibers. If a signal interrupts an exchange or deferred drain, it coalesces one pending renewal per active receipt. After the exchange finishes, the client drains a fixed snapshot of pending renewals. Ticks arriving during that drain remain queued for a later exchange or keepalive tick; they cannot keep the current caller draining indefinitely. A deferred renewal failure does not erase an already confirmed send or settlement. It surfaces on the next transport operation or close, with its original exception preserved.
+Symfony invokes keepalive through `SIGALRM`. The adapter performs bounded signal-safe I/O, or defers a renewal when another exchange is active. Multiple pending ticks for the same receipt are coalesced. Deferred renewal errors surface on a later transport operation or close, without replacing an already confirmed send or settlement. For protocol details, see [KEEPALIVE](broker-protocol.md#keepalive).
 
-An expired or reclaimed reservation cannot be revived. A broker restart or replacement connection also loses receipt ownership. A failed renewal can leave its outcome unknown; the transport does not reconnect or replay it. Symfony reports keepalive failures, but a failed heartbeat does not itself terminate a running handler. Decide how your application stops work after losing ownership.
+A failed renewal may have committed without confirmation. There is no automatic reconnect or retry. An expired, reclaimed or settled reservation cannot be revived. A broker restart or replacement connection also loses the old receipt's ownership.
 
-Make external effects idempotent. A disconnected consumer can continue processing after its lease expires while another worker claims the message. Renewal and receipt fencing do not guarantee exactly-once effects.
+**Renewal failure does not itself stop a running handler.** Symfony can report a keepalive failure while application code continues. Decide how your application detects ownership loss and stops or fences further effects. Make external effects idempotent or fenced: a disconnected handler and a newly assigned handler can overlap after lease expiry. Keepalive is not an exactly-once guarantee.
 
 ## Failures and recovery
 
-Broker and protocol failures become Symfony `TransportException`. A mutation may have committed before its confirmation was lost. The adapter does not reconnect or replay automatically, including after an initial connection failure. Restart the worker or construct a new transport after handling the uncertain outcome. A new connection cannot settle old receipts.
+Broker communication and protocol failures surface as Symfony Messenger `TransportException`. Invalid receipt failures also identify lost ownership. A missing confirmation means the operation's outcome may be unknown; do not infer rollback from an exception.
 
-Configure a failure transport through Messenger as usual. Applications using a Doctrine failure queue must install its dependencies. Use native `messenger:failed:show` and `messenger:failed:retry` for inspection and recovery; the broker adapter does not add a separate failure workflow.
+The adapter does not reconnect or replay automatically, including after initial connection acquisition fails. After assessing an uncertain operation, restart the affected worker or construct a new transport. New connections cannot settle old receipts. Recovery of an unsettled delivery normally waits for reservation expiry and redelivery, rather than trying to repair its old receipt. See [application and broker recovery](operations.md#recover-after-broker-or-consumer-failure).
 
-Decode failure differs by Symfony version:
+### Retry and failure transports
 
-- On Symfony 8.0, the adapter rejects the committed claim and throws `MessageDecodingFailedException`.
-- On Symfony 8.1 and later, it returns a failure envelope through `MessageDecodingFailedException::wrap()` for Messenger to handle.
+Configure Messenger's retry policy and failure routing as usual. Business failures, worker crashes and transport failures are different events; do not use retry policy as a blanket replay mechanism for uncertain sends or settlements.
 
-Malformed stored headers remain available as opaque bytes under `Transport::RAW_HEADERS_HEADER`.
+The sqlite-queue adapter **does not implement `ListableReceiverInterface`**. It cannot serve as an inspectable failure store for native `messenger:failed:show` and related inspection commands. If you need that workflow, choose a separate listable failure transport, such as Symfony's Doctrine transport, and install its transport and database dependencies. Configure `failure_transport` to that transport and follow its own setup and inspection instructions.
+
+Retrying a failed message can repeat external effects already performed. Preserve business identifiers and duplicate-effect protection through the failure workflow.
+
+### Message decoding failures
+
+Version-dependent handling matters when changing serializers or message classes:
+
+- Symfony 8.0: the adapter rejects the committed claim and throws `MessageDecodingFailedException`.
+- Symfony 8.1 and later: the adapter uses `MessageDecodingFailedException::wrap()` to return a failure envelope for Messenger to handle.
+
+Malformed stored headers are preserved as opaque bytes under `Transport::RAW_HEADERS_HEADER` in the failure-envelope path. Treat serializer changes as a deployment compatibility concern; retain the classes and serializer support needed to read queued messages.

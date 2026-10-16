@@ -1,53 +1,96 @@
 # Run the broker and use the client
 
-The broker supports immediate receive and bounded WAIT. The [Symfony Messenger adapter](messenger.md) integrates with native `messenger:consume`.
+Use the PHP client when you do not need Symfony Messenger. One broker owns a SQLite database and a Unix socket; applications send messages and claim deliveries through that socket. The broker stores body and header bytes without interpreting them.
+
+For a Symfony application, start with [Configure and run Messenger](messenger-setup.md). For supervision, backups and incident recovery, see [Operate the queue](operations.md).
+
+## Install the package
+
+Use PHP 8.5 or later within the Composer `^8.5` constraint, with `ext-sqlite3`. The broker runs on Unix and requires `posix` for ownership checks. The foreground command also requires `pcntl` for signal handling. PDO SQLite is not the storage driver.
+
+In your application's directory, configure the required driver fork and install the released broker from [Packagist](https://packagist.org/packages/ineersa/sqlite-queue). The driver fork still uses the package name `fabpot/amphp-sqlite3`:
+
+```sh
+	composer config repositories.amp-sqlite3 vcs https://github.com/ineersa/amp-sqlite3
+	composer require ineersa/sqlite-queue fabpot/amphp-sqlite3:dev-development
+```
+
+Composer does not inherit repository declarations from dependencies. The explicit driver requirement permits its development stability without lowering your application's global stability setting. Commit your application's Composer lock file for reproducible deployments.
+
+The following commands assume an installed package and use `vendor/bin/sqlite-queue`. If you are working in this repository instead, the executable is `php bin/sqlite-queue`.
 
 ## Start the foreground broker
 
-1. Run `composer install` in this checkout. Check that CLI PHP has `pdo_sqlite`, `pcntl`, and `posix` enabled.
-2. Create private storage and socket directories. Keep the absolute socket path under 101 bytes.
+See the [broker command options](configuration.md#broker-command-options) for the complete option list, descriptions, defaults, and bundle precedence.
+
+1. Create a private directory owned by the Unix user that will run the broker and clients:
 
    ```sh
    install -d -m 700 /tmp/sqlite-queue-demo
    ```
 
-3. Start the broker in the foreground.
+2. Start the broker in a terminal:
 
    ```sh
-   php bin/sqlite-queue broker --database=/tmp/sqlite-queue-demo/queue.sqlite --endpoint=/tmp/sqlite-queue-demo/queue.sock
+   vendor/bin/sqlite-queue broker \
+       --database=/tmp/sqlite-queue-demo/queue.sqlite \
+       --endpoint=/tmp/sqlite-queue-demo/queue.sock \
+       --redeliver-timeout=60 \
+       --synchronous=normal
    ```
 
-4. Wait for a JSON line whose `event` is `ready` before starting clients. Process creation alone is not readiness.
+3. Wait for a JSON line with `"event":"ready"` before starting clients. A running PID alone does not establish readiness.
 
-The executable uses the package's runtime Symfony Console dependency. A no-dev installation includes `vendor/bin/sqlite-queue`. With the bundle enabled, `php bin/console sqlite-queue:broker` accepts the same options. Standalone `Queue` and `Client` APIs do not boot a Symfony application.
+Both paths must be absolute. The canonical socket path must be no longer than **100 bytes**, including the directory. Use `0700` parent directories and `0600` files; keep the database, its SQLite companions, and the socket private to the same Unix user. Startup refuses an existing endpoint rather than removing it. Use `/tmp` only for this demo; choose persistent storage for production.
 
-## Run under a supervisor in production
+`--redeliver-timeout` is the reservation duration in positive integer **seconds**, not a handler execution limit. It defaults to 60. `--synchronous` accepts `normal` and `full`, defaulting to `normal`. The standalone command does not read Symfony bundle configuration.
 
-1. Run the foreground command under systemd, supervisord, Docker, PM2, or another external supervisor. Do not daemonize it or put it in the background inside the managed command.
-2. Configure restart after failure and wait for the `ready` event before admitting clients. The broker exits nonzero on fatal storage failure instead of replacing SQLite connections inside the running process.
-3. Send SIGTERM for graceful shutdown. Set the supervisor's forced-termination deadline explicitly.
-4. Verify broker process exit before starting a replacement. The driver owns its SQLite child; configure the supervisor to clean up the whole process group after an abrupt broker exit.
-5. Make client applications reconnect explicitly after failure. Do not replay unconfirmed operations automatically or reuse receipts from an old connection.
-
-After an abrupt exit, follow the endpoint verification instructions in [Stop or restart](#stop-or-restart). Do not add an unconditional socket deletion to the supervisor's startup command.
+With the bundle enabled, `php bin/console sqlite-queue:broker` accepts the same options. That command uses `sqlite_queue.redeliver_timeout` and `sqlite_queue.synchronous` unless a CLI value overrides them. Neither command starts automatically when a client connects.
 
 ## Send and settle a message
 
-Run this code in a separate PHP process with the package autoloader:
+Save this as `publish.php` beside your application's `vendor/` directory:
 
 ```php
 <?php
 
-require 'vendor/autoload.php';
+declare(strict_types=1);
+
+require __DIR__.'/vendor/autoload.php';
 
 use Ineersa\SqliteQueue\Client;
 
 $client = Client::connect('/tmp/sqlite-queue-demo/queue.sock');
 try {
-	$id = $client->send('jobs', "body\0bytes", "opaque headers\xff");
+	$id = $client->send('jobs', 'Hello from the publisher', '{}');
+	echo 'Committed message '.$id.PHP_EOL;
+} finally {
+	$client->close();
+}
+```
+
+Save this as `consume-once.php` in the same directory:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+require __DIR__.'/vendor/autoload.php';
+
+use Ineersa\SqliteQueue\Client;
+
+$client = Client::connect('/tmp/sqlite-queue-demo/queue.sock');
+try {
 	$delivery = $client->receive('jobs');
-	if (null !== $delivery) {
-		// Process the message here, outside the broker.
+	if (null === $delivery && $client->wait('jobs', 5_000)) {
+		$delivery = $client->receive('jobs');
+	}
+	if (null === $delivery) {
+		echo 'No delivery available.'.PHP_EOL;
+	} else {
+		// Replace this output with your application handler.
+		echo $delivery->body.PHP_EOL;
 		$client->acknowledge($delivery->receipt);
 	}
 } finally {
@@ -55,77 +98,92 @@ try {
 }
 ```
 
-Use `reject($delivery->receipt)` for terminal disposal instead of acknowledgment. Use the same client connection that received the delivery. Neither operation schedules retries.
+With the broker still running, execute:
 
-Pass `delay: 1500` to `send()` to make a message unavailable for 1,500 milliseconds. `receive()` still returns null immediately when no message is eligible. It never waits.
+```sh
+php publish.php
+php consume-once.php
+```
+
+The publisher prints a committed message ID; the consumer prints `Hello from the publisher` and deletes the delivery by acknowledging it. A second consumer invocation reports no available delivery after its bounded wait.
+
+Body and headers are opaque byte strings, not a prescribed JSON format. The `{}` in this example is an application choice. Use `send('jobs', $body, $headers, delay: 1_500)` for a delay of 1,500 milliseconds. A send confirms only after its transaction commits.
+
+`receive()` claims at most one eligible message and returns immediately with a `DeliveryDTO` or `null`. ACK deletes a reserved message. `reject($delivery->receipt)` also deletes it; rejection is terminal disposal, not a request for retry. Both require the same live connection that claimed the delivery. Put application retry policy outside these operations.
 
 ## Wait for readiness without busy polling
 
-Use `Client::wait(string $queue, int $timeoutMilliseconds, ?Cancellation $cancellation = null): bool` after an empty receive. Bounds are `0` through `30_000` milliseconds. Zero is an immediate readiness probe. Out-of-range local bounds raise `InvalidArgumentException` before any bytes are written, so the request sequence is unchanged. The exchange deadline is the requested wait plus the client's normal transport allowance. One outstanding exchange still applies.
+After an empty receive, call `wait('jobs', 5_000)`. A `true` result means try receiving again, not that a message is reserved for you. Another consumer may claim it first. A `false` result means the wait completed without a readiness hint. Do not add a polling sleep after a hint.
 
-`true` means try `receive()` again. It never grants a reservation. `false` means the bound elapsed without a readiness hint, including an empty zero-duration probe. Do not sleep after a hint. Cancellation during WAIT closes the connection, reports an uncertain outcome, and never replays.
+To watch multiple queues through one client:
 
 ```php
-$delivery = $client->receive('jobs');
-if (null === $delivery) {
-	if (!$client->wait('jobs', 5_000)) {
-		// Bound elapsed with no readiness hint. Decide whether to wait again.
-		return;
-	}
-	$delivery = $client->receive('jobs');
-}
-if (null !== $delivery) {
-	$client->acknowledge($delivery->receipt);
+if ($client->waitAny(['jobs', 'reports'], 5_000)) {
+	// Probe the queues in your application's preferred order.
+	$delivery = $client->receive('jobs') ?? $client->receive('reports');
 }
 ```
 
-The default reservation lasts 60 seconds. Both broker commands accept `--redeliver-timeout=60` in positive integer seconds. Renew reservations for long-running work, or choose a duration that covers the handler without renewal. For the bundle command, an explicit CLI value overrides `sqlite_queue.redeliver_timeout`, which defaults to 60. The standalone command does not load bundle configuration.
+`waitAny()` accepts 1 through 16 distinct queue names and returns a boolean, not a queue name. Both wait methods accept durations from 0 through **30,000 milliseconds**. Zero is a readiness probe. A wait does not claim a message or choose your receive priority.
 
-The PHP `BrokerFactory::visibilityTimeout` argument uses milliseconds and defaults to 60,000. Client communication timeouts are separate and do not change reservation expiry. The default communication allowance is 10 seconds, plus the requested duration for WAIT.
+The client communication allowance defaults to **10 seconds**. WAIT adds its requested duration to that allowance. This is separate from the broker's **10-second storage-operation deadline**, which bounds SQL work, including eligibility lookups, but does not count idle time or the requested WAIT duration. See [cancellation and budgets](sqlite-worker.md#cancellation-and-budgets).
 
-An unacknowledged reservation becomes eligible again at its persisted deadline. Closing a client does not shorten that deadline. PHP callers can construct `BrokerFactory` with `visibilityTimeout` and call `create()`. For an application-owned cancellation token, pass it to `Broker::run()`.
+Use separate clients for concurrent operations. One client permits only one outstanding exchange. Cancellation during a wait closes that client's connection, so do not cancel a wait on a connection whose receipts you still need to settle. The Messenger adapter manages separate operation and notification connections for this reason.
 
-Call `Client::keepalive($receipt, $minimumMilliseconds)` on the connection that received the delivery to renew it. The minimum defaults to zero, selecting the broker's configured duration. Success returns the committed Unix-millisecond deadline and retains the receipt. Renewal cannot shorten the current deadline or revive an expired receipt. Native Messenger consumers use `--keepalive`, whose default interval is 5 seconds. See [long-running handlers](messenger.md#keep-long-running-handlers-alive).
+## Renew a reservation
 
-The Messenger bundle maps WAIT and WAIT_ANY onto native consumer idle events when `--sleep` is omitted or zero. Selected receivers must share one configured endpoint and name at most 16 distinct queues. See [Messenger idle behavior and limits](messenger.md#idle-waits).
+An unacknowledged message becomes eligible for redelivery when its reservation expires. Disconnecting does not immediately release it. Without renewal, choose a reservation long enough for all processing, including deferred work before ACK.
+
+For work performed in bounded chunks, renew on the receiving client before the current lease expires:
+
+```php
+$newDeadline = $client->keepalive($delivery->receipt);
+```
+
+The default minimum of zero selects the broker's configured reservation duration. A successful renewal returns the committed Unix-millisecond deadline, never shortens the existing lease, and keeps the receipt unchanged. An optional minimum is expressed in milliseconds: `keepalive($receipt, 120_000)` requests at least two minutes from the renewal's clock sample.
+
+The standalone client does not schedule heartbeats for your handler. Arrange timely renewals in your application, or use [Messenger's native keepalive](messenger.md#keep-long-running-handlers-alive). Renewals cannot revive expired, reclaimed or settled deliveries. Long processing has no cumulative broker time cap while renewal succeeds, but a lost lease does not stop application code automatically.
 
 ## Recover from a failed exchange
 
-Catch `Exception\TransportException` for connection failures and `Protocol\ProtocolException` for malformed broker responses. Both invalidate the client after an exchange starts. The protocol exception identifies the violated field or constraint. Decide how to handle the uncertain operation before creating a replacement with `Client::connect()`. Do not automatically resend it. The broker may have committed before the connection failed.
+Treat a missing confirmation as an **unknown outcome**. A send, claim, renewal, ACK or reject may have committed before the connection failed. Do not turn an exception into an automatic resend or assume rollback.
 
-Client methods accept an optional Amp `Cancellation`. Cancellation during an exchange also closes the connection and reports an uncertain outcome. A new client cannot settle receipts from the old connection. Concurrent calls on one client are rejected; use separate clients for concurrent operations.
+- Catch `Ineersa\SqliteQueue\Exception\TransportException` for unavailable confirmations and connection failures.
+- Catch `Ineersa\SqliteQueue\Protocol\ProtocolException` for protocol violations. Its diagnostic identifies the violated constraint.
+- Receipt failures use specific subclasses of `Ineersa\SqliteQueue\Exception\InvalidReceiptException`. An expired receipt is not repaired by reconnecting or retrying ACK.
+
+I/O failure or a malformed broker reply invalidates the connection. Local validation before writing a request and explicit receipt errors can fail without doing so. Methods accept optional Amp cancellation; cancellation after dispatch does not revoke SQL. See the precise [uncertainty contract](contracts.md#uncertain-operations-and-cancellation) and [receipt errors](broker-protocol.md#receipt-errors).
+
+After deciding how to handle the uncertain operation, create a replacement with `Client::connect()`. There is no automatic reconnect or replay. A new connection cannot settle receipts issued to the old one. Make business effects idempotent or fenced because a disconnected handler can continue while another consumer receives an expired delivery.
+
+## Run under a supervisor in production
+
+Keep the broker in the foreground under a process supervisor. Supervise applications separately, gate their startup on the broker's ready event, and arrange cleanup of the broker's whole process group after an abrupt exit. See [process ownership and supervision](operations.md#process-ownership-and-supervision) for deployment and restart policy.
 
 ## Stop or restart
 
-Send SIGTERM or SIGINT, or press Ctrl-C in the foreground terminal. Wait for process exit before restarting. Normal stop removes the owned socket but preserves the database. Symfony FlockStore lock sidecars stay on disk under the private resource directories, which preserves the lock namespace.
+Send SIGTERM or SIGINT, or press Ctrl-C in the foreground terminal. Normal stop closes client sockets immediately but lets already-dispatched SQL drain within one shared **five-second** shutdown budget before closing storage. A transaction may finish without its client receiving confirmation.
 
-Normal shutdown drains already-dispatched storage work before driver close, within one five-second budget starting at the first stop request. Client sockets close immediately, so a completed mutation may still lack confirmation. Fatal storage failure or budget expiry starts driver close immediately, even during a graceful drain, using that same budget. Repeated close calls await ongoing cleanup. Only after close completes does cleanup remove the broker's socket and release the database and endpoint locks.
+Fatal storage failure or deadline expiry begins storage close immediately, including during an existing graceful drain. Repeated close calls wait for actual cleanup; later cancellation can tighten the existing close budget, not restart it. The broker removes its owned socket and releases lifetime locks only after storage cleanup completes.
 
-The broker bounds each storage operation, including serial ownership waiting, by 10 seconds. Expiry stops service and closes the driver; unconfirmed writes remain uncertain and are never replayed. This budget also covers notifier eligibility lookups, but not WAIT durations or idle connections. The `BrokerFactory` constructor's `storageOperationTimeoutSeconds` argument configures the serving and storage-startup budgets. SQLite's separate 5,000-millisecond busy timeout does not bound a whole operation. Waiting for SQL does not block socket or signal handling. Use an external supervisor for a hard process-exit deadline. See [cancellation and budgets](sqlite-worker.md#cancellation-and-budgets).
-
-If an endpoint remains after an abrupt exit, do not delete it just because a connection attempt fails. Verify that no broker or other listener owns it before removal, or choose another endpoint. Startup refuses existing sockets, regular files, and symlinks.
-
-See the [protocol reference](broker-protocol.md) for framing, deadlines, errors, and ownership requirements.
+Wait for the broker and its owned child process to exit before starting a replacement. Restart affected clients explicitly; old receipts are not transferable. Normal stop preserves the database and lock sidecars. Never delete lock sidecars, and never automatically delete an endpoint that remains after an abrupt exit. Follow [stale endpoint recovery](operations.md#recover-a-stale-endpoint).
 
 ## WAL synchronous mode
 
-Both broker commands accept `--synchronous=normal|full`. Only these two modes are supported. The default is `normal`. For the bundle command, precedence is CLI > `sqlite_queue.synchronous` > `normal`. The standalone command does not load bundle configuration.
+Choose durability before starting the broker:
 
-```sh
-vendor/bin/sqlite-queue broker --database=/private/queue.db --endpoint=/private/queue.sock --synchronous=full
-```
+| Mode | Behavior |
+| --- | --- |
+| `normal` | Default. Preserves commits across ordinary process crashes, but an OS crash or power loss can lose recent confirmed sends or settlements. |
+| `full` | Stronger commit durability across OS crashes and power loss if the storage stack honors synchronization. |
+
+NORMAL does not provide an at-least-once guarantee across power loss. Loss of a confirmed ACK can also cause duplicate handling. FULL does not make external application effects exactly once.
+
+For example, add `--synchronous=full` to either broker command. To set the bundle command's default:
 
 ```yaml
 sqlite_queue:
     synchronous: full
 ```
 
-PHP callers use the package enum:
-
-```php
-use Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode;
-
-$broker = (new BrokerFactory($database, $endpoint, synchronous: SqliteSynchronousMode::Full))->create();
-```
-
-NORMAL preserves commits across process crashes, but an OS crash or power failure can lose recent publications or ACKs. FULL provides stronger commit durability if storage honors synchronization. See [storage and durability](contracts.md#storage-and-durability).
+For an embedded broker, pass `synchronous: SqliteSynchronousMode::Full` to `BrokerFactory`. Its `visibilityTimeout` argument uses milliseconds, unlike the CLI's seconds. See [storage configuration](sqlite-worker.md#connection-configuration) and [storage and durability](contracts.md#storage-and-durability) for the lower-level contracts.

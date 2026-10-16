@@ -1,79 +1,128 @@
 # Configure and run Messenger
 
-Use an existing Symfony 8 application with Messenger and FrameworkBundle installed. The package is not published on Packagist, so installation requires a Composer VCS or path repository pointing to this source.
+Use this guide to connect an existing Symfony 8 application to two queues on one broker. Keep your normal `messenger:consume` command, message bus, handlers and retry configuration. You do not need a custom consumer command.
+
+The broker is a separate process. Registering a transport does not start it.
+
+Use the [configuration reference](configuration.md) to look up broker command options, bundle keys, transport settings, and consumer controls, including their units and defaults.
 
 ## Install the package
 
-1. Add the package and driver repositories to your application's Composer configuration:
+1. Use PHP `^8.5` with `ext-sqlite3`. Run the broker on Unix with `posix` enabled. Enable `pcntl` in CLI PHP for broker signals and native consumer keepalive. This package uses the SQLite3 extension, not PDO, for queue storage.
+2. With Messenger and FrameworkBundle installed in your Symfony application, configure the required driver fork and install the released broker from [Packagist](https://packagist.org/packages/ineersa/sqlite-queue). The driver fork still uses the package name `fabpot/amphp-sqlite3`:
 
-	```sh
-	composer config repositories.sqlite-queue vcs https://github.com/ineersa/sqlite-queue
-	composer config repositories.amp-sqlite3 vcs https://github.com/ineersa/amp-sqlite3
-	composer require ineersa/sqlite-queue:dev-main fabpot/amphp-sqlite3:dev-development
-	```
+   ```sh
+		composer config repositories.amp-sqlite3 vcs https://github.com/ineersa/amp-sqlite3
+		composer require ineersa/sqlite-queue fabpot/amphp-sqlite3:dev-development
+   ```
 
-   Composer does not inherit repository declarations from dependencies. The explicit driver requirement also permits its development stability in your application. Use the appropriate package branch if you are testing an unmerged change.
-2. Check `config/bundles.php` for Flex's registration of `SqliteQueueBundle`. Without Flex, add this entry to the returned array:
+   Composer does not inherit repository declarations from dependencies. Requiring the driver's development branch explicitly permits that stability without changing your global minimum stability. Commit the resulting Composer lock file.
+3. If Symfony Flex is installed, check its bundle registration in `config/bundles.php`. Otherwise add this entry to the returned array:
 
    ```php
    Ineersa\SqliteQueue\SqliteQueueBundle::class => ['all' => true],
    ```
 
+The bundle registers the transport factory, native idle-wait integration, and `sqlite-queue:broker` command.
+
 ## Configure two queues
 
-1. Copy [messenger.yaml](examples/messenger.yaml) to `config/packages/messenger.yaml`.
-2. Replace `App\Message\SendWelcomeEmail` and `App\Message\GenerateMonthlyReport` with your message classes. Register their handlers through your normal Messenger service configuration.
-3. Set both endpoints to the broker's absolute socket path.
+Copy [the complete messenger.yaml example](examples/messenger.yaml) into `config/packages/messenger.yaml`, or merge its entries with your existing configuration:
 
-The example routes email messages to the Messenger transport `email`, whose DSN selects the broker queue `emails`. Report messages use the transport `reports` and queue `reports`. Transport names are Messenger aliases; the DSN authority is the broker queue name. Both queues use one broker socket and database.
+```yaml
+sqlite_queue:
+    redeliver_timeout: 60
+    synchronous: normal
+    # Optional. Defaults preserve the published 1,040,000-byte / 64-connection budgets.
+    # max_payload: 1040000
+    # max_connections: 64
 
-The example uses native PHP serialization. Accept only trusted messages with this serializer.
+framework:
+    messenger:
+        transports:
+            email:
+                dsn: 'sqlite-queue://emails'
+                options:
+                    endpoint: '/tmp/sqlite-queue-demo/queue.sock'
+                    timeout: 10
+                serializer: messenger.transport.native_php_serializer
+            reports:
+                dsn: 'sqlite-queue://reports'
+                options:
+                    endpoint: '/tmp/sqlite-queue-demo/queue.sock'
+                    timeout: 10
+                serializer: messenger.transport.native_php_serializer
+        routing:
+            'App\Message\SendWelcomeEmail': email
+            'App\Message\GenerateMonthlyReport': reports
+```
+
+Replace the message class names with classes in your application and register their handlers through normal Messenger service configuration. This configuration does not create those application classes.
+
+`email` is a Messenger transport alias. `emails`, the authority in `sqlite-queue://emails`, is the literal broker queue name, not a hostname. Both transports point to the same absolute Unix socket path and share the broker's database. `options.timeout: 10` is the client communication allowance in seconds, not the reservation duration or a handler execution limit.
+
+The example uses Messenger's native PHP serializer. Use it only with trusted messages. The broker stores serialized bytes without loading your message classes.
 
 ## Start the broker
 
-1. Check that CLI PHP has `sqlite3`, `pcntl`, and `posix` enabled.
-2. Create a private directory owned by the user running the broker and consumers:
+1. Create a private directory owned by the user running the broker and application:
 
    ```sh
-   mkdir -m 700 /tmp/sqlite-queue-demo
+   install -d -m 700 /tmp/sqlite-queue-demo
    ```
 
-3. Start the foreground broker:
+2. Run the bundle command in a separate terminal:
 
    ```sh
-   vendor/bin/sqlite-queue broker \
+   php bin/console sqlite-queue:broker \
        --database=/tmp/sqlite-queue-demo/queue.sqlite \
-       --endpoint=/tmp/sqlite-queue-demo/queue.sock \
-       --redeliver-timeout=60
+       --endpoint=/tmp/sqlite-queue-demo/queue.sock
    ```
 
-4. Wait for the JSON `ready` event before starting consumers.
+3. Wait for the JSON event with `"event":"ready"` before sending messages or starting consumers.
 
-With the bundle enabled, `php bin/console sqlite-queue:broker` accepts the same options and loads `sqlite_queue.redeliver_timeout`, `sqlite_queue.synchronous`, `sqlite_queue.max_payload`, and `sqlite_queue.max_connections`. The standalone command does not read bundle configuration. An explicit CLI value overrides the bundle value. `--synchronous=normal|full` selects WAL commit durability, defaulting to NORMAL. `--max-payload` and `--max-connections` raise or lower the published defaults of 1,040,000 bytes and 64 connections. See [durability guarantees](contracts.md#storage-and-durability) and [broker protocol limits](broker-protocol.md#framing-and-limits).
+Both paths must be absolute. Keep the canonical socket path at most 100 bytes long. Use persistent storage rather than `/tmp` in production, and keep its parent directory private. See [production ownership and supervision](operations.md#process-ownership-and-supervision).
 
-Use absolute paths and a socket path no longer than 100 bytes. See [broker startup and recovery](broker.md) for permissions and supervisor configuration.
+The bundle command reads `sqlite_queue.redeliver_timeout`, `sqlite_queue.synchronous`, `sqlite_queue.max_payload`, and `sqlite_queue.max_connections` from the configuration above. `--redeliver-timeout=60`, `--synchronous=normal|full`, `--max-payload`, and `--max-connections` override those values. The reservation option is in positive integer seconds; the default is 60. Payload and connection defaults preserve the published 1,040,000-byte and 64-connection budgets. NORMAL is the default durability mode and can lose recent commits after OS failure or power loss. Use FULL for stronger durability when storage honors synchronization. See [configuration reference](configuration.md), [durability guarantees](contracts.md#storage-and-durability), and [broker protocol limits](broker-protocol.md#framing-and-limits).
 
-The default reservation lasts 60 seconds. Enable native `--keepalive` for processing or deferred batch flushes that can exceed it. The consumer renews every 5 seconds by default; without that flag, no automatic renewal occurs. `options.timeout: 10` is the communication timeout in seconds, not the reservation duration or handler budget.
+If you prefer the standalone executable, use `vendor/bin/sqlite-queue broker` with the same database and endpoint options. It **does not read bundle configuration**: pass any nondefault reservation, durability, payload, or connection settings explicitly. Schema creation belongs to broker startup; no separate transport setup step is needed.
 
 ## Run consumers
 
-Consume both configured transports with one native worker:
+Start one native worker for both transports:
 
 ```sh
-	php bin/console messenger:consume email reports
+php bin/console messenger:consume email reports --keepalive=5
 ```
 
-Leave `--sleep` omitted. If both transports use the same endpoint, the idle worker waits for work on either queue for up to 1,000 milliseconds instead of polling. Dispatch each message through your Messenger bus; its configured transport publishes it to the matching queue. Messenger retains the listed receive priority.
+Leave `--sleep` omitted. The adapter waits for readiness on either queue when the worker is idle. Messenger still checks `email` before `reports`; the wait does not change receive priority or guarantee fairness.
 
-Separate workers also use notifications:
+The five-second keepalive interval renews the default 60-second reservation. Keep the interval comfortably below the lease duration. Enable `pcntl` in the consumer's CLI PHP. Scheduling and communication can delay renewals, so neither an exact five-second tick nor uninterrupted ownership is guaranteed. See [long-running handlers](messenger.md#keep-long-running-handlers-alive).
+
+You can instead dedicate workers to each transport:
 
 ```sh
-	php bin/console messenger:consume email
-	php bin/console messenger:consume reports
+php bin/console messenger:consume email --keepalive=5
+php bin/console messenger:consume reports --keepalive=5
 ```
 
-For long-running handlers, add `--keepalive` to either form. Processing can continue beyond 30 minutes or 24 hours while renewal succeeds. Keep the tick interval shorter than the reservation duration and configure application execution limits separately. See [keepalive and ownership loss](messenger.md#keep-long-running-handlers-alive).
+Dispatch the configured messages through your application's injected `MessageBusInterface`, for example from an application service:
 
-Explicit positive `--sleep` retains native polling. `--all` and native selection expansion use notifications when all selected receivers meet the same-broker limit. Selections containing sqlite-queue use a bounded sleep fallback for mixed transport types, different endpoints, or more than 16 distinct queues. Consumers selecting only other transports remain unchanged. See [idle waits](messenger.md#idle-waits).
+```php
+$bus->dispatch(new \App\Message\SendWelcomeEmail(/* your constructor arguments */));
+$bus->dispatch(new \App\Message\GenerateMonthlyReport(/* your constructor arguments */));
+```
 
-Transport service resolution works before broker startup, but actual operations require the broker. Use an external supervisor for restarts. After a transport failure, do not replay an unconfirmed operation or reuse its receipt.
+The routing sends each envelope to its configured queue. Registered handlers run in the consumers. For a local smoke check, have a handler log a stable message identifier and verify it handles a dispatched message. Do not interpret duplicate handler output as proof of transport corruption: this is not an exactly-once transport.
+
+For handlers that finish within a reservation, keepalive is optional. Without `--keepalive`, reservations do not renew automatically. With it, a handler can run for hours while renewal succeeds; the broker imposes no cumulative handler time cap. Application and supervisor execution limits remain separate.
+
+## Choose idle and failure behavior
+
+The native idle wait uses WAIT for one queue and WAIT_ANY for 2 through 16 distinct queues on the same configured endpoint, with a default one-second wait budget. Explicit positive `--sleep` keeps native polling. Mixed transport selections, different endpoints, or oversized queue sets containing sqlite-queue use a bounded fallback sleep. Consumers selecting only other transports retain their native behavior. See [idle waits](messenger.md#idle-waits) for selection and shutdown details.
+
+Keep Messenger's normal retry policy, or configure it for your application. ACK and reject delete a delivery; the adapter does not itself republish retries. A lost confirmation may follow a committed operation, so automatic transport-level replay would be unsafe.
+
+If you need native failure inspection, configure a **separate listable failure transport**, such as Doctrine with its required packages and connection. The sqlite-queue adapter does not implement `ListableReceiverInterface`; do not configure it as a failure store expecting `messenger:failed:show` to inspect it. See [failures and recovery](messenger.md#failures-and-recovery).
+
+Supervise the broker and consumers as separate processes. Gate startup on broker readiness, restart affected workers after broker failure, and never reuse receipts from their old connections. Before production use, test consumer death, reservation expiry, redelivery and your application's duplicate-effect protection. See [Operate the queue](operations.md).
