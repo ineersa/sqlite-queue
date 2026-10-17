@@ -6,11 +6,11 @@ The broker uses one asynchronous connection from the `ineersa/amp-sqlite3` fork,
 
 | Component | Responsibility |
 | --- | --- |
-| `BrokerFactory` | Acquires lifetime locks, prepares the database, initializes storage, and binds the socket before handing over a ready broker. Failed startup cleans up acquired resources. |
+| `BrokerFactory` | Acquires lifetime locks, prepares the database, initializes storage, and binds the socket before handing over a ready broker. Failed startup cleans up acquired resources. Accepts an optional `Fabpot\Amp\Sqlite\SqliteConnector`; the default keeps the driver's process isolation. |
 | `Broker` | Owns client sessions, admissions, storage deadlines, and shutdown. |
 | `QueueNotifier` | Coordinates WAIT/WAIT_ANY and rechecks watched queues against persisted eligibility. |
 | `Queue` | Validates message policy, creates the epoch and delivery tokens, and interprets receipts. |
-| `SqliteQueueStorage` | Owns one driver connection and exclusive operation executor; initializes the schema and validates operation results. |
+| `SqliteQueueStorage` | Owns one driver connection and exclusive operation executor; initializes the schema and validates operation results. `open()` accepts an optional connector for the same reason. |
 | `QueueWorkerOperation` | Runs queue SQL and samples mutation time inside worker-owned transactions. |
 | Driver | Executes SQLite calls, serializes complete operations, carries results over IPC, and closes or terminates its child. |
 

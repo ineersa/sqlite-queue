@@ -130,6 +130,7 @@ These constructor and method arguments do not have corresponding bundle keys. Th
 | `BrokerFactory::synchronous` | `SqliteSynchronousMode` enum | `SqliteSynchronousMode::Normal` | PHP equivalent of `--synchronous`; `SqliteSynchronousMode::Full` selects FULL. |
 | `BrokerFactory::storageOperationTimeoutSeconds` | Positive, finite float seconds | `10` | Configurable in PHP only. Sets both the overall storage-startup deadline and each storage-operation deadline. No YAML key or CLI flag exists. |
 | `BrokerFactory::limits` | `ProtocolLimits` | `new ProtocolLimits()` | PHP equivalent of `--max-payload` and `--max-connections`. Defaults preserve the published 1,040,000-byte and 64-connection budgets. |
+| `BrokerFactory::connector` | `Fabpot\Amp\Sqlite\SqliteConnector` | `new SqliteConnector()` | Optional driver connector. The default keeps the driver's `ProcessContextFactory` isolation. Pass a configured connector when the host must control Amp worker process launch. The Symfony bundle registers this class and injects it into `sqlite-queue:broker`; replace that service in the host container. There is no YAML key or CLI flag. |
 | `Client::connect()` argument `timeout` | Positive, finite float seconds | `10` | Configures the direct PHP client's connection and exchange allowance. Messenger passes its resolved transport timeout to this API. |
 
 Advanced engine ownership, cancellation, and per-operation arguments are documented in [the queue engine reference](queue-engine.md) and [the client guide](broker.md).

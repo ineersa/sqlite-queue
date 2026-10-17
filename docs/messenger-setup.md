@@ -25,6 +25,8 @@ Use the [configuration reference](configuration.md) to look up broker command op
 
 The bundle registers the transport factory, native idle-wait integration, and `sqlite-queue:broker` command.
 
+The bundle also registers `Fabpot\Amp\Sqlite\SqliteConnector` and injects it into that broker command. Ordinary installations keep the driver's default process isolation. Hosts that must control Amp worker process launch can replace the `SqliteConnector` service with one constructed around a configured `Amp\Parallel\Context\ContextFactory`. There is no YAML key or broker CLI flag for this override.
+
 ## Configure two queues
 
 Copy [the complete messenger.yaml example](examples/messenger.yaml) into `config/packages/messenger.yaml`, or merge its entries with your existing configuration:

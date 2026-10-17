@@ -35,7 +35,7 @@ try {
 }
 ```
 
-`open()` accepts named `synchronous` and `cancellation` arguments. The default is `SqliteSynchronousMode::Normal`; pass `Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode::Full` for FULL. In-memory databases and an empty path are rejected. Initialization verifies SQLite 3.31.0 or newer, WAL, and the selected synchronous mode, then creates the table and indexes if absent. The standard connection uses a 5,000-millisecond busy timeout and 1,000-page WAL autocheckpoint threshold.
+`open()` accepts named `synchronous`, `cancellation`, and `connector` arguments. The default is `SqliteSynchronousMode::Normal`; pass `Ineersa\SqliteQueue\Sqlite\SqliteSynchronousMode::Full` for FULL. Omit `connector` to keep the driver's default `ProcessContextFactory` isolation, or pass a configured `Fabpot\Amp\Sqlite\SqliteConnector` when the host must control worker process launch. In-memory databases and an empty path are rejected. Initialization verifies SQLite 3.31.0 or newer, WAL, and the selected synchronous mode, then creates the table and indexes if absent. The standard connection uses a 5,000-millisecond busy timeout and 1,000-page WAL autocheckpoint threshold.
 
 `SqliteQueueStorage::fromConnection(SqliteWorkerOperationConnection $connection, SqliteSynchronousMode $synchronous, ?Cancellation $cancellation = null): self` transfers exclusive ownership of an acquired driver connection. The connection must already have the required configuration and queue worker-operation registration. Initialization verifies configuration and creates the schema; failure closes the transferred connection. Do not reuse that connection, change its configuration, or modify its schema concurrently.
 
