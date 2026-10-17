@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Ineersa\SqliteQueue\Command;
 
 use Amp\DeferredCancellation;
+use Fabpot\Amp\Sqlite\SqliteConnector;
 use Fabpot\Amp\Sqlite\Worker\Operation;
 use Ineersa\SqliteQueue\Broker\BrokerEventEnum;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
@@ -52,6 +53,8 @@ final class BrokerCommand extends BaseCommand
         private readonly string $workerOperation = QueueWorkerOperation::class,
         private readonly int $maxPayload = Limits::MAX_PAYLOAD,
         private readonly int $maxConnections = Limits::MAX_CONNECTIONS,
+        // Ordinary callers and the standalone binary keep the driver's default ProcessContextFactory isolation.
+        private readonly SqliteConnector $connector = new SqliteConnector(),
     ) {
         if ($redeliverTimeoutSeconds <= 0) {
             throw new \InvalidArgumentException('Redelivery timeout must be positive seconds.');
@@ -135,6 +138,7 @@ final class BrokerCommand extends BaseCommand
                 synchronous: $synchronous,
                 workerOperation: $this->workerOperation,
                 limits: $limits,
+                connector: $this->connector,
             ))->create();
             $code = $broker->run(function (array $event) use ($output): void {
                 $this->write($event, $output);

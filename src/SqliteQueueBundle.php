@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue;
 
+use Fabpot\Amp\Sqlite\SqliteConnector;
 use Ineersa\SqliteQueue\Command\BrokerCommand;
 use Ineersa\SqliteQueue\DependencyInjection\RegisterNativeConsumeWaitSubscriberPass;
 use Ineersa\SqliteQueue\Messenger\TransportFactory;
@@ -13,6 +14,8 @@ use Symfony\Component\Config\Definition\Configurator\DefinitionConfigurator;
 use Symfony\Component\DependencyInjection\ContainerBuilder;
 use Symfony\Component\DependencyInjection\Loader\Configurator\ContainerConfigurator;
 use Symfony\Component\HttpKernel\Bundle\AbstractBundle;
+
+use function Symfony\Component\DependencyInjection\Loader\Configurator\service;
 
 /**
  * Registers the Messenger transport factory, native consume WAIT subscriber, and broker command.
@@ -52,11 +55,16 @@ final class SqliteQueueBundle extends AbstractBundle
             ->autoconfigure(false)
             ->tag('messenger.transport_factory');
 
+        // Default driver connector. Hosts replace this service to supply a configured ContextFactory.
+        $services->set(SqliteConnector::class)
+            ->autoconfigure(false);
+
         $services->set(BrokerCommand::class)
             ->arg('$redeliverTimeoutSeconds', $config['redeliver_timeout'])
             ->arg('$synchronous', SqliteSynchronousMode::from($config['synchronous']))
             ->arg('$maxPayload', $config['max_payload'])
             ->arg('$maxConnections', $config['max_connections'])
+            ->arg('$connector', service(SqliteConnector::class))
             ->autoconfigure(false)
             ->tag('console.command', ['command' => 'sqlite-queue:broker']);
     }

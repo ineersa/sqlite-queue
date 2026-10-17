@@ -52,8 +52,15 @@ final class SqliteQueueStorage
      *
      * @param class-string<Operation> $workerOperation
      */
-    public static function open(string $path, SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal, ?Cancellation $cancellation = null, string $workerOperation = QueueWorkerOperation::class, ?ProtocolLimits $limits = null): self
-    {
+    public static function open(
+        string $path,
+        SqliteSynchronousMode $synchronous = SqliteSynchronousMode::Normal,
+        ?Cancellation $cancellation = null,
+        string $workerOperation = QueueWorkerOperation::class,
+        ?ProtocolLimits $limits = null,
+        // Ordinary callers keep the driver's default ProcessContextFactory isolation without constructing the connector.
+        SqliteConnector $connector = new SqliteConnector(),
+    ): self {
         if ('' === $path || ':memory:' === $path) {
             throw new \InvalidArgumentException('Queue storage requires a database file path.');
         }
@@ -69,7 +76,7 @@ final class SqliteQueueStorage
             ->withPragma('wal_autocheckpoint', self::WAL_AUTOCHECKPOINT_PAGES)
             ->withWorkerOperations([QueueWorkerProtocol::OPERATION_NAME => $workerOperation]);
 
-        return self::fromConnection((new SqliteConnector())->connect($config, $cancellation), $synchronous, $cancellation, $limits);
+        return self::fromConnection($connector->connect($config, $cancellation), $synchronous, $cancellation, $limits);
     }
 
     /** Transfers an acquired connection. Optional cancellation also bounds readback/schema initialization. */
