@@ -15,6 +15,7 @@ use Ineersa\SqliteQueue\Client;
 use Ineersa\SqliteQueue\Exception\TransportException as ClientTransportException;
 use Ineersa\SqliteQueue\Messenger\BrokerConnection;
 use Ineersa\SqliteQueue\Messenger\Stamp\DeliveryReceiptStamp;
+use Ineersa\SqliteQueue\Messenger\Stamp\ReceiptTransportState;
 use Ineersa\SqliteQueue\Messenger\Transport;
 use Ineersa\SqliteQueue\Protocol\Frame;
 use Ineersa\SqliteQueue\Protocol\Limits;
@@ -40,6 +41,7 @@ use function Amp\Socket\listen;
 final class TransportTest extends TestCase
 {
     private const int PROBE_SAFETY_SECONDS = 5;
+    private const int HANDOFF_VISIBILITY_MILLISECONDS = 50;
 
     private ?IsolatedDatabase $database = null;
     private ?Broker $broker = null;
@@ -313,6 +315,52 @@ final class TransportTest extends TestCase
             }
 
             $first->ack($received[0]);
+        });
+    }
+
+    public function testSerializedDeliveryReceiptRequiresOriginalParentStampForSettlement(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker(visibilityTimeout: self::HANDOFF_VISIBILITY_MILLISECONDS);
+            $transport = $this->transport();
+            $transport->send(new Envelope(new TransportProbeMessage('process-handoff')));
+            $received = iterator_to_array($transport->get());
+            $this->assertCount(1, $received);
+            $original = $received[0]->last(DeliveryReceiptStamp::class);
+            $this->assertInstanceOf(DeliveryReceiptStamp::class, $original);
+            $this->assertSame(['receipt' => $original->receipt], $original->__serialize());
+
+            $copy = unserialize(serialize($received[0]));
+            $this->assertInstanceOf(Envelope::class, $copy);
+            $copiedStamp = $copy->last(DeliveryReceiptStamp::class);
+            $this->assertInstanceOf(DeliveryReceiptStamp::class, $copiedStamp);
+            $this->assertSame($original->receipt, $copiedStamp->receipt);
+            $this->assertSame(ReceiptTransportState::Detached, $copiedStamp->transport);
+            $this->assertSame($transport, $original->transport);
+
+            try {
+                $transport->ack($copy);
+                $this->fail('A serialized receipt copy must not acknowledge the parent reservation.');
+            } catch (LogicException $error) {
+                $this->assertStringContainsString('not received by this transport instance', $error->getMessage());
+            }
+            try {
+                $transport->reject($copy);
+                $this->fail('A serialized receipt copy must not reject the parent reservation.');
+            } catch (LogicException $error) {
+                $this->assertStringContainsString('not received by this transport instance', $error->getMessage());
+            }
+
+            // Model the native parallel strategy's restoration through public Envelope APIs;
+            // the package's locked Messenger 8.1 does not contain that strategy itself.
+            $returned = unserialize(serialize($copy));
+            $this->assertInstanceOf(Envelope::class, $returned);
+            $this->assertSame(ReceiptTransportState::Detached, $returned->last(DeliveryReceiptStamp::class)?->transport);
+            $restored = $returned->withoutAll(DeliveryReceiptStamp::class)->with($original);
+            $this->assertSame($original, $restored->last(DeliveryReceiptStamp::class));
+            $transport->ack($restored);
+            $this->setNow($this->now + self::HANDOFF_VISIBILITY_MILLISECONDS);
+            $this->assertSame([], iterator_to_array($transport->get()));
         });
     }
 
