@@ -39,8 +39,9 @@
         "symfony/dependency-injection": "^8.0",
         "symfony/doctrine-messenger": "^8.0",
         "symfony/event-dispatcher": "^8.0",
-        "symfony/framework-bundle": "^8.0",
+        "symfony/framework-bundle": "^8.2@beta",
         "symfony/process": "^8.0",
+        "symfony/runtime": "^8.2@beta",
         "symfony/yaml": "^8.0"
     },
     "suggest": {
@@ -65,7 +66,12 @@
             "email": "ineersa@gmail.com"
         }
     ],
+    "minimum-stability": "beta",
+    "prefer-stable": true,
     "config": {
+        "allow-plugins": {
+            "symfony/runtime": false
+        },
         "sort-packages": true
     }
 }

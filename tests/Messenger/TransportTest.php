@@ -351,8 +351,8 @@ final class TransportTest extends TestCase
                 $this->assertStringContainsString('not received by this transport instance', $error->getMessage());
             }
 
-            // Model the native parallel strategy's restoration through public Envelope APIs;
-            // the package's locked Messenger 8.1 does not contain that strategy itself.
+            // Isolate the stamp's round-trip contract here; NativeIntegrationTest also
+            // exercises original-stamp restoration through actual native child handling.
             $returned = unserialize(serialize($copy));
             $this->assertInstanceOf(Envelope::class, $returned);
             $this->assertSame(ReceiptTransportState::Detached, $returned->last(DeliveryReceiptStamp::class)?->transport);

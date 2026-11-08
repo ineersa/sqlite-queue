@@ -3,6 +3,13 @@ services:
         autoconfigure: true
         autowire: true
 
+    # Expected handler failures must not corrupt PHPUnit's isolated-process
+    # result channel; keep the native logger and retain its diagnostics.
+    logger:
+        class: Symfony\Component\HttpKernel\Log\Logger
+        arguments:
+            $output: '%kernel.project_dir%/native.log'
+
     Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Handler\NativeProbeMessageHandler:
         public: true
         arguments:
@@ -17,3 +24,5 @@ services:
             $recordPath: '%kernel.project_dir%/effect.log'
 
     Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Handler\NativeKeepaliveMessageHandler: ~
+
+    Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Handler\NativeParallelMessageHandler: ~

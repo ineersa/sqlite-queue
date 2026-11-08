@@ -35,7 +35,11 @@ The configured Messenger serializer encodes and decodes envelopes. The broker st
 
 `get()` claims at most one message and does not wait for new work. Received envelopes carry Symfony's `TransportMessageIdStamp` and the adapter's non-sendable `DeliveryReceiptStamp`. That receipt belongs to the receiving transport and its operations connection. Do not acknowledge an envelope through another transport or reconnect and reuse its receipt. Resending an envelope removes delivery-specific stamps before serialization.
 
-PHP process serialization of `DeliveryReceiptStamp` preserves only the opaque receipt string, never the live transport or its connections. `new DeliveryReceiptStamp($receipt, $transport)` still creates a bound stamp with the original transport in its public readonly `$transport` property. The property type is now `Transport|ReceiptTransportState`: deserialized copies contain `ReceiptTransportState::Detached` instead. Such copies cannot acknowledge, reject or renew a reservation, even through the original transport. Parallel execution must retain the original parent-owned non-sendable stamp and restore that exact instance before settlement; the native parallel strategy used by Symfony versions providing it does this when the returned envelope retains the stamp class. The parent keeps ownership and keepalive responsibility throughout. The package's locked Symfony Messenger 8.1 does not provide that parallel strategy, so package tests cover serialization and explicit original-stamp restoration rather than native parallel execution.
+PHP process serialization of `DeliveryReceiptStamp` preserves only the opaque receipt string, never the live transport or its connections. `new DeliveryReceiptStamp($receipt, $transport)` still creates a bound stamp with the original transport in its public readonly `$transport` property. The property type is now `Transport|ReceiptTransportState`: deserialized copies contain `ReceiptTransportState::Detached` instead. Such copies cannot acknowledge, reject or renew a reservation, even through the original transport. Parallel execution must retain the original parent-owned non-sendable stamp and restore that exact instance before settlement; Symfony 8.2's native parallel strategy does this when the returned envelope retains the stamp class. The parent keeps ownership and keepalive responsibility throughout.
+
+The development/test baseline uses Symfony FrameworkBundle and Messenger 8.2.0-BETA1 to exercise real native child handling, parent ACK, retry/failure routing, parent keepalive during a blocked child, and a warmed underfilled concurrency-four pool. Unix socket barriers control child completion; tests do not use elapsed-time thresholds as proof. This development baseline does not raise the library's runtime Symfony `^8.0` support floor. Composer permits beta dependencies for the test baseline and prefers stable releases where compatible; `symfony/runtime` is development-only for native child console bootstrap.
+
+The keepalive proof runs the native consumer in a separate process using the existing console-process fixture. Signal-safe renewal performs blocking I/O, so collocating the consumer and its asynchronous broker on one PHP event loop would prevent the broker from answering. Other parallel scenarios use PHPUnit's native process isolation for runtime/event-loop globals and do not arm keepalive alarms. The fixture's native Symfony logger retains expected handler failures in a file rather than PHPUnit's process-result channel. The underfilled-pool proof installs observers before the native command creates its scoped dispatcher and stops on final completion rather than reaching its receive limit before an idle pass.
 
 ACK deletes the reserved message. Reject also deletes it, without rescheduling. Messenger handles retry publication, backoff and failure routing around those operations. `DelayStamp` uses integer milliseconds, including subsecond delays.
 
@@ -47,6 +51,7 @@ Leave `--sleep` omitted or set it to zero to enable broker notification waits. S
 
 | Selected receivers | Idle behavior |
 | --- | --- |
+| Native `--concurrency` greater than one (Symfony 8.2+) | Native parallel completion waiting; no adapter broker WAIT and no sleep-option mutation. |
 | One distinct sqlite-queue queue | WAIT on that queue. |
 | 2 through 16 distinct sqlite-queue queues, all with the same configured endpoint | WAIT_ANY across those queues. |
 | A selection containing sqlite-queue and foreign transports, different endpoints, or more than 16 distinct queues | Bounded Clock sleep fallback. |
@@ -54,6 +59,8 @@ Leave `--sleep` omitted or set it to zero to enable broker notification waits. S
 | Explicit positive `--sleep`, such as `--sleep=0.5` | Native polling, without notification waits. |
 
 The default notification and fallback budget is **1,000 milliseconds**, shortened by the native time limit. Aliases of the same queue are deduplicated. A readiness response means try receiving again; it neither reserves a message nor changes Messenger's receive order. A busy higher-priority queue can still delay a lower-priority queue.
+
+An idle receive pass in a parallel consumer does not mean its child handlers are idle. The adapter therefore declines notification-wait activation before changing sleep options whenever effective concurrency is greater than one. Commands without that option, and serial consumers with concurrency one, retain the notification behavior above.
 
 The adapter reads the receiver set after native selection. Literal receiver names work on Symfony 8.0. Regex expansion, exclusions, `--all` and interactive selection follow the installed Symfony version's own command support; the adapter does not add those options.
 

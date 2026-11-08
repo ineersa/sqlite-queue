@@ -97,6 +97,12 @@ final class NativeConsumeWaitSubscriber implements EventSubscriberInterface
         }
 
         $input = $event->getInput();
+        if ($command->getDefinition()->hasOption('concurrency') && (int) $input->getOption('concurrency') > 1) {
+            // An idle receive pass may still have child handlers running. Native
+            // parallel execution must wait on their completions, not broker WAIT.
+            return;
+        }
+
         $explicitSleep = $this->explicitSleepSeconds($input->hasParameterOption(['--sleep'], true)
             ? $input->getParameterOption(['--sleep'], false, true)
             : null);

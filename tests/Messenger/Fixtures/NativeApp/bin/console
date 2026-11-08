@@ -1,0 +1,8 @@
+<?php
+
+declare(strict_types=1);
+
+use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\NativeKernel;
+use Symfony\Bundle\FrameworkBundle\Console\Application;
+
+return static fn (): Application => new Application(new NativeKernel(\dirname(__DIR__)));

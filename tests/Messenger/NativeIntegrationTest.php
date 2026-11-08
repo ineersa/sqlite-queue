@@ -4,9 +4,12 @@ declare(strict_types=1);
 
 namespace Ineersa\SqliteQueue\Tests\Messenger;
 
+use Amp\ByteStream\BufferedReader;
 use Amp\Cancellation;
 use Amp\DeferredFuture;
 use Amp\Future;
+use Amp\Socket\ServerSocket;
+use Amp\Socket\Socket;
 use Amp\TimeoutCancellation;
 use Ineersa\SqliteQueue\Broker\Broker;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
@@ -15,11 +18,14 @@ use Ineersa\SqliteQueue\Client;
 use Ineersa\SqliteQueue\Command\BrokerCommand;
 use Ineersa\SqliteQueue\Messenger\BrokerConnection;
 use Ineersa\SqliteQueue\Messenger\NativeConsumeWaitSubscriber;
+use Ineersa\SqliteQueue\Messenger\Stamp\DeliveryReceiptStamp;
 use Ineersa\SqliteQueue\Messenger\Transport;
 use Ineersa\SqliteQueue\Messenger\TransportFactory;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\BrokenDecodeSerializer;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\ControllableClock;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Handler\NativeProbeMessageHandler;
+use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeParallelMessage;
+use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeParallelOutcome;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeProbeMessage;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\NativeKernel;
 use Ineersa\SqliteQueue\Tests\Support\ClockFile;
@@ -39,19 +45,27 @@ use Symfony\Component\Console\Output\BufferedOutput;
 use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\Messenger\Command\ConsumeMessagesCommand;
 use Symfony\Component\Messenger\Envelope;
+use Symfony\Component\Messenger\Event\WorkerMessageFailedEvent;
+use Symfony\Component\Messenger\Event\WorkerMessageHandledEvent;
+use Symfony\Component\Messenger\Event\WorkerMessageReceivedEvent;
+use Symfony\Component\Messenger\Event\WorkerMessageRetriedEvent;
 use Symfony\Component\Messenger\Event\WorkerRunningEvent;
 use Symfony\Component\Messenger\Event\WorkerStartedEvent;
 use Symfony\Component\Messenger\EventListener\StopWorkerOnMemoryLimitListener;
 use Symfony\Component\Messenger\Exception\MessageDecodingFailedException;
+use Symfony\Component\Messenger\Execution\ParallelExecutionStrategy;
 use Symfony\Component\Messenger\Stamp\DelayStamp;
 use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
+use Symfony\Component\Messenger\Worker;
 
 use function Amp\async;
+use function Amp\Socket\listen;
 
 #[RequiresOperatingSystem('Linux')]
 final class NativeIntegrationTest extends TestCase
 {
     private const int SAFETY_SECONDS = 15;
+    private const int VISIBILITY_MILLISECONDS = 5_000;
 
     private ?IsolatedDatabase $database = null;
     private string $projectDir = '';
@@ -74,6 +88,16 @@ final class NativeIntegrationTest extends TestCase
     private ?Application $application = null;
     /** @var list<Client> */
     private array $clients = [];
+    /** These resources exist only after a parallel scenario acquires its barrier and consumer. */
+    private ?ShortUnixEndpoint $parallelEndpoint = null;
+    private ?ServerSocket $parallelBarrier = null;
+    private ?Worker $parallelWorker = null;
+    /** @var Future<int>|null */
+    private ?Future $parallelConsumer = null;
+    /** @var list<Socket> */
+    private array $parallelConnections = [];
+    /** @var list<\Throwable> Native failures remain observable without interrupting settlement. */
+    private array $parallelFailures = [];
 
     protected function setUp(): void
     {
@@ -92,6 +116,12 @@ final class NativeIntegrationTest extends TestCase
     protected function tearDown(): void
     {
         try {
+            $parallelError = null;
+            try {
+                $this->closeParallelConsumer();
+            } catch (\Throwable $error) {
+                $parallelError = $error;
+            }
             foreach ($this->clients as $client) {
                 try {
                     $client->close();
@@ -104,6 +134,9 @@ final class NativeIntegrationTest extends TestCase
             $this->broker?->stop();
             if (null !== $this->brokerFuture) {
                 $this->assertSame(0, $this->brokerFuture->await(new TimeoutCancellation(self::SAFETY_SECONDS)));
+            }
+            if (null !== $parallelError) {
+                throw $parallelError;
             }
         } finally {
             if (null !== $this->previousClock) {
@@ -629,7 +662,7 @@ final class NativeIntegrationTest extends TestCase
             $this->assertSame('async_failure', $envelope->last(\Symfony\Component\Messenger\Stamp\SentToFailureTransportStamp::class)->getOriginalReceiverName());
             $this->assertNotNull($envelope->last(\Symfony\Component\Messenger\Stamp\ErrorDetailsStamp::class));
             $this->assertSame(0, $envelope->last(\Symfony\Component\Messenger\Stamp\RedeliveryStamp::class)->getRetryCount());
-            $this->assertNull($envelope->last(\Ineersa\SqliteQueue\Messenger\Stamp\DeliveryReceiptStamp::class));
+            $this->assertNull($envelope->last(DeliveryReceiptStamp::class));
             $id = $envelope->last(\Symfony\Component\Messenger\Stamp\TransportMessageIdStamp::class)->getId();
             NativeProbeMessageHandler::$mode = NativeProbeMessageHandler::MODE_ACK;
             $this->assertSame(0, $this->runConsume([
@@ -680,6 +713,235 @@ final class NativeIntegrationTest extends TestCase
         });
     }
 
+    #[\PHPUnit\Framework\Attributes\RunInSeparateProcess]
+    #[\PHPUnit\Framework\Attributes\PreserveGlobalState(false)]
+    public function testNativeParallelChildCompletionRestoresParentReceiptAndAcknowledges(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker();
+            $endpoint = $this->createParallelBarrier();
+            $received = [];
+            $handled = [];
+            $this->eventDispatcher()->addListener(WorkerMessageReceivedEvent::class, static function (WorkerMessageReceivedEvent $event) use (&$received): void {
+                $received[] = $event->getEnvelope()->last(DeliveryReceiptStamp::class);
+            });
+            $this->eventDispatcher()->addListener(WorkerMessageHandledEvent::class, static function (WorkerMessageHandledEvent $event) use (&$handled): void {
+                $handled[] = $event->getEnvelope()->last(DeliveryReceiptStamp::class);
+            });
+            $this->publisher()->send(new Envelope(new NativeParallelMessage('child-ack', $endpoint, NativeParallelOutcome::Success)));
+            $this->startParallelConsumer('async', 1);
+            [$socket, $record] = $this->acceptParallelProbe();
+            $this->assertNotSame(getmypid(), $record['pid']);
+            $socket->write(NativeParallelMessage::RELEASE);
+            $this->assertParallelConsumerCompleted();
+            $this->assertCount(1, $received);
+            $this->assertInstanceOf(DeliveryReceiptStamp::class, $received[0]);
+            $this->assertSame($received, $handled, 'Native completion must restore the exact original stamp instance.');
+            $this->assertSame($this->transport(), $handled[0]->transport);
+            $this->setNow($this->now + self::VISIBILITY_MILLISECONDS);
+            $this->assertSame([], iterator_to_array($this->publisher()->get()));
+        });
+    }
+
+    // Native runtime/bootstrap state is process-global; do not inherit a preceding
+    // consumer's event loop and worker-pool state for the retry lifecycle.
+    #[\PHPUnit\Framework\Attributes\RunInSeparateProcess]
+    #[\PHPUnit\Framework\Attributes\PreserveGlobalState(false)]
+    public function testNativeParallelFailureRetriesAndRoutesToFailureTransport(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker();
+            $endpoint = $this->createParallelBarrier();
+            $received = [];
+            $failedReceipts = [];
+            $retried = 0;
+            $this->eventDispatcher()->addListener(WorkerMessageReceivedEvent::class, static function (WorkerMessageReceivedEvent $event) use (&$received): void {
+                $received[] = $event->getEnvelope()->last(DeliveryReceiptStamp::class);
+            });
+            $this->eventDispatcher()->addListener(WorkerMessageFailedEvent::class, static function (WorkerMessageFailedEvent $event) use (&$failedReceipts): void {
+                $failedReceipts[] = $event->getEnvelope()->last(DeliveryReceiptStamp::class);
+            });
+            $this->eventDispatcher()->addListener(WorkerMessageRetriedEvent::class, function () use (&$retried): void {
+                ++$retried;
+                $this->setNow($this->now + 50);
+            });
+            $this->publisher()->send(new Envelope(new NativeParallelMessage('child-failure', $endpoint, NativeParallelOutcome::Failure)));
+            $this->startParallelConsumer('async_failure', 2);
+            [$first] = $this->acceptParallelProbe();
+            $first->write(NativeParallelMessage::RELEASE);
+            [$retry, $record] = $this->acceptParallelProbe();
+            $this->assertSame('child-failure', $record['body']);
+            $this->assertNotSame(getmypid(), $record['pid']);
+            $retry->write(NativeParallelMessage::RELEASE);
+            $this->assertParallelConsumerCompleted();
+            $this->assertSame(1, $retried);
+            $this->assertCount(2, $received);
+            $this->assertSame($received, $failedReceipts);
+            $this->assertNotSame($received[0], $received[1], 'Retry must acquire a fresh parent-owned receipt.');
+            $failed = $this->bootKernel()->getContainer()->get('messenger.transport.failed');
+            $this->assertInstanceOf(\Symfony\Component\Messenger\Bridge\Doctrine\Transport\DoctrineTransport::class, $failed);
+            $envelopes = iterator_to_array($failed->all());
+            $this->assertCount(1, $envelopes);
+            $this->assertInstanceOf(NativeParallelMessage::class, $envelopes[0]->getMessage());
+            $this->assertSame('async_failure', $envelopes[0]->last(\Symfony\Component\Messenger\Stamp\SentToFailureTransportStamp::class)->getOriginalReceiverName());
+            $this->assertNotNull($envelopes[0]->last(\Symfony\Component\Messenger\Stamp\ErrorDetailsStamp::class));
+            $this->assertNull($envelopes[0]->last(DeliveryReceiptStamp::class));
+            $this->setNow($this->now + self::VISIBILITY_MILLISECONDS);
+            $this->assertSame([], iterator_to_array($this->publisher()->get()));
+        });
+    }
+
+    #[\PHPUnit\Framework\Attributes\RunInSeparateProcess]
+    #[\PHPUnit\Framework\Attributes\PreserveGlobalState(false)]
+    public function testNativeParallelWarmedUnderfilledPoolUsesNativeIdleCompletionWait(): void
+    {
+        $this->runAsync(function (): void {
+            $this->startBroker();
+            $endpoint = $this->createParallelBarrier();
+            $warm = new DeferredFuture();
+            $firstHandled = new DeferredFuture();
+            $handled = [];
+            $dispatched = 0;
+            $idle = new DeferredFuture();
+            // Register before consume starts: its scoped limit listener snapshots
+            // WorkerRunningEvent listeners from the application dispatcher.
+            $this->eventDispatcher()->addListener(WorkerMessageReceivedEvent::class, static function () use (&$dispatched): void {
+                ++$dispatched;
+            });
+            $this->eventDispatcher()->addListener(WorkerRunningEvent::class, function (WorkerRunningEvent $event) use ($idle, &$dispatched): void {
+                if (!$event->isWorkerIdle() || 3 !== $dispatched || $idle->isComplete()) {
+                    return;
+                }
+                $strategy = (new \ReflectionProperty(Worker::class, 'messageExecutionStrategy'))->getValue($event->getWorker());
+                $this->assertInstanceOf(ParallelExecutionStrategy::class, $strategy);
+                $subscriber = $this->bootKernel()->getContainer()->get(NativeConsumeWaitSubscriber::class);
+                $sessions = (new \ReflectionProperty($subscriber, 'sessionsByWorker'))->getValue($subscriber);
+                $this->assertCount(0, $sessions, 'Parallel idle passes must never activate a broker notification wait.');
+                $this->assertSame(0, $this->notifierWaiterCount());
+                $idle->complete();
+            });
+            $this->eventDispatcher()->addListener(WorkerMessageHandledEvent::class, function (WorkerMessageHandledEvent $event) use ($warm, $firstHandled, &$handled): void {
+                $body = $event->getEnvelope()->getMessage()->body;
+                $handled[] = $body;
+                if ('warm' === $body) {
+                    $warm->complete();
+                } elseif ('first' === $body) {
+                    $firstHandled->complete();
+                } elseif ('second' === $body) {
+                    $this->parallelWorker?->stop();
+                }
+            });
+            $publisher = $this->publisher();
+            $publisher->send(new Envelope(new NativeParallelMessage('warm', $endpoint, NativeParallelOutcome::Success)));
+            // Leave room above the three receives so an idle pass remains reachable;
+            // the final handled event, not a receive-limit event, stops this consumer.
+            $this->startParallelConsumer('async', 4);
+            [$warming] = $this->acceptParallelProbe();
+            $warming->write(NativeParallelMessage::RELEASE);
+            $warm->getFuture()->await(new TimeoutCancellation(self::SAFETY_SECONDS));
+            $publisher->send(new Envelope(new NativeParallelMessage('first', $endpoint, NativeParallelOutcome::Success)));
+            $publisher->send(new Envelope(new NativeParallelMessage('second', $endpoint, NativeParallelOutcome::Success)));
+            [$first, $firstRecord] = $this->acceptParallelProbe();
+            [$second, $secondRecord] = $this->acceptParallelProbe();
+            $children = [$firstRecord['body'] => [$first, $firstRecord], $secondRecord['body'] => [$second, $secondRecord]];
+            $this->assertArrayHasKey('first', $children);
+            $this->assertArrayHasKey('second', $children);
+            [$first, $firstRecord] = $children['first'];
+            [$second, $secondRecord] = $children['second'];
+            $this->assertNotSame($firstRecord['pid'], $secondRecord['pid']);
+            $this->assertSame(['warm'], $handled, 'Both child handlers must remain barrier-blocked with no queued jobs left.');
+            $this->assertSame([], iterator_to_array($publisher->get()));
+            $idle->getFuture()->await(new TimeoutCancellation(self::SAFETY_SECONDS));
+            $first->write(NativeParallelMessage::RELEASE);
+            $firstHandled->getFuture()->await(new TimeoutCancellation(self::SAFETY_SECONDS));
+            $this->assertSame(['warm', 'first'], $handled, 'Native completion must be processed while the other child remains blocked.');
+            $second->write(NativeParallelMessage::RELEASE);
+            $this->assertParallelConsumerCompleted();
+            $this->assertSame(['warm', 'first', 'second'], $handled);
+            $this->setNow($this->now + self::VISIBILITY_MILLISECONDS);
+            $this->assertSame([], iterator_to_array($publisher->get()));
+        });
+    }
+
+    private function createParallelBarrier(): string
+    {
+        $this->parallelEndpoint = new ShortUnixEndpoint('child.sock');
+        $endpoint = 'unix://'.$this->parallelEndpoint->path();
+        $this->parallelBarrier = listen($endpoint);
+
+        return $endpoint;
+    }
+
+    private function startParallelConsumer(string $receiver, int $limit): void
+    {
+        $this->eventDispatcher()->addListener(WorkerMessageFailedEvent::class, function (WorkerMessageFailedEvent $event): void {
+            $this->parallelFailures[] = $event->getThrowable();
+        });
+        $this->eventDispatcher()->addListener(WorkerStartedEvent::class, function (WorkerStartedEvent $event): void {
+            $this->parallelWorker = $event->getWorker();
+            $this->assertSame(1_000_000, $event->getIdleTimeout(), 'Omitted native sleep must not be suppressed for parallel consumers.');
+        });
+        $this->parallelConsumer = async(fn (): int => $this->runConsume([
+            'command' => 'messenger:consume',
+            'receivers' => [$receiver],
+            '--concurrency' => '4',
+            '--limit' => (string) $limit,
+        ]));
+    }
+
+    /** @return array{Socket, array{body: string, pid: int}} */
+    private function acceptParallelProbe(): array
+    {
+        $server = $this->parallelBarrier ?? throw new \LogicException('Parallel barrier was not acquired.');
+        $consumer = $this->parallelConsumer ?? throw new \LogicException('Parallel consumer was not started.');
+        $socket = \Amp\Future\awaitFirst([
+            $consumer,
+            async(static fn () => $server->accept(new TimeoutCancellation(self::SAFETY_SECONDS))),
+        ]);
+        if (!$socket instanceof Socket) {
+            throw new \RuntimeException('Native parallel consumer exited before its handler reached the barrier.', previous: $this->parallelFailures[0] ?? null);
+        }
+        $this->assertInstanceOf(Socket::class, $socket);
+        $this->parallelConnections[] = $socket;
+        $record = json_decode((new BufferedReader($socket))->readUntil("\n", new TimeoutCancellation(self::SAFETY_SECONDS)), true, flags: \JSON_THROW_ON_ERROR);
+        $this->assertIsArray($record);
+        $this->assertIsString($record['body']);
+        $this->assertIsInt($record['pid']);
+
+        return [$socket, $record];
+    }
+
+    private function assertParallelConsumerCompleted(): void
+    {
+        $consumer = $this->parallelConsumer ?? throw new \LogicException('Parallel consumer was not started.');
+        $this->assertSame(0, $consumer->await(new TimeoutCancellation(self::SAFETY_SECONDS)));
+    }
+
+    private function closeParallelConsumer(): void
+    {
+        $this->parallelWorker?->stop();
+        foreach ($this->parallelConnections as $socket) {
+            $socket->close();
+        }
+        $this->parallelBarrier?->close();
+        try {
+            $this->parallelConsumer?->await(new TimeoutCancellation(self::SAFETY_SECONDS));
+        } catch (\Throwable $error) {
+            if (null !== $this->parallelWorker) {
+                $strategy = (new \ReflectionProperty(Worker::class, 'messageExecutionStrategy'))->getValue($this->parallelWorker);
+                foreach ((new \ReflectionProperty($strategy, 'workers'))->getValue($strategy) as $worker) {
+                    $worker->kill();
+                }
+            }
+            throw $error;
+        } finally {
+            foreach ($this->parallelWorker?->getMetadata()->getTransportNames() ?? [] as $name) {
+                $this->transport($name)->close();
+            }
+            $this->parallelEndpoint?->remove();
+        }
+    }
+
     /**
      * @param array<string, mixed> $arguments
      */
@@ -689,7 +951,12 @@ final class NativeIntegrationTest extends TestCase
         $input = new ArrayInput($arguments);
         $input->setInteractive(false);
 
-        return $this->application()->run($input, $output);
+        $exit = $this->application()->run($input, $output);
+        if (0 !== $exit) {
+            throw new \RuntimeException($output->fetch(), $exit);
+        }
+
+        return $exit;
     }
 
     private function application(): Application
@@ -798,9 +1065,11 @@ final class NativeIntegrationTest extends TestCase
         $source = \dirname(__DIR__).'/Messenger/Fixtures/NativeApp';
         $fs->mkdir($this->projectDir.'/config/packages');
         $fs->mkdir($this->projectDir.'/var');
+        $fs->copy($source.'/.env', $this->projectDir.'/.env');
         $fs->copy($source.'/config/bundles.php', $this->projectDir.'/config/bundles.php');
         $fs->copy($source.'/config/services.yaml', $this->projectDir.'/config/services.yaml');
         $fs->copy($source.'/config/packages/framework.yaml', $this->projectDir.'/config/packages/framework.yaml');
+        $fs->copy($source.'/bin/console', $this->projectDir.'/bin/console');
     }
 
     private function awaitNotifierWaiters(int $count): void

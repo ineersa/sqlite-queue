@@ -111,7 +111,16 @@ final class NativeConsumeWaitSubscriberTest extends TestCase
         $this->assertSame([0.1], $clock->sleepCalls);
     }
 
-    public function testSelectedSqliteQueueReceiverActivatesOmittedSleepBeforeWorkerOptions(): void
+    /** @return iterable<string, array{bool, int, int}> */
+    public static function concurrencyModes(): iterable
+    {
+        yield 'command without concurrency option' => [false, 1, 0];
+        yield 'serial consumer' => [true, 1, 0];
+        yield 'parallel consumer' => [true, 4, 1];
+    }
+
+    #[DataProvider('concurrencyModes')]
+    public function testSelectedSqliteQueueReceiverActivatesOmittedSleepBeforeWorkerOptions(bool $hasConcurrency, int $concurrency, int $expectedSleep): void
     {
         $factory = new TransportFactory();
         $serializer = new PhpSerializer();
@@ -125,7 +134,13 @@ final class NativeConsumeWaitSubscriberTest extends TestCase
             new ServiceLocator([]),
             new \Symfony\Component\EventDispatcher\EventDispatcher(),
         );
-        $input = new \Symfony\Component\Console\Input\ArrayInput([]);
+        if (!$hasConcurrency) {
+            $command->getDefinition()->setOptions(array_filter(
+                $command->getDefinition()->getOptions(),
+                static fn (\Symfony\Component\Console\Input\InputOption $option): bool => 'concurrency' !== $option->getName(),
+            ));
+        }
+        $input = new \Symfony\Component\Console\Input\ArrayInput($hasConcurrency ? ['--concurrency' => $concurrency] : []);
         $input->bind($command->getDefinition());
         $event = new \Symfony\Component\Console\Event\ConsoleCommandEvent($command, $input, new \Symfony\Component\Console\Output\NullOutput());
         $subscriber->onConsoleCommand($event);
@@ -133,8 +148,10 @@ final class NativeConsumeWaitSubscriberTest extends TestCase
         $subscriber->onSelectedReceiver('sync');
         $this->assertSame(1, $input->getOption('sleep'));
         $subscriber->onSelectedReceiver('async');
-        $this->assertSame(0, $input->getOption('sleep'));
+        $this->assertSame($expectedSleep, $input->getOption('sleep'));
+        $this->assertSame(1, $command->getDefinition()->getOption('sleep')->getDefault());
         $pending = (new \ReflectionProperty($subscriber, 'pendingByCommand'))->getValue($subscriber);
+        $this->assertCount(0 === $expectedSleep ? 1 : 0, $pending);
         foreach ($pending as $state) {
             $this->assertSame(1, $state->originalSleepOption);
             $this->assertTrue($state->sleepOptionMutated);
