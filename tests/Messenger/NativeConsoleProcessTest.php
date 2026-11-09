@@ -8,11 +8,14 @@ use Amp\ByteStream\BufferedReader;
 use Amp\DeferredFuture;
 use Amp\Future;
 use Amp\Process\Process;
+use Amp\Socket\Socket;
 use Amp\TimeoutCancellation;
 use Ineersa\SqliteQueue\Broker\Broker;
 use Ineersa\SqliteQueue\Broker\BrokerFactory;
 use Ineersa\SqliteQueue\Broker\QueueNotifier;
 use Ineersa\SqliteQueue\Client;
+use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeParallelMessage;
+use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeParallelOutcome;
 use Ineersa\SqliteQueue\Tests\Messenger\Fixtures\NativeApp\Message\NativeProbeMessage;
 use Ineersa\SqliteQueue\Tests\Support\ClockFile;
 use Ineersa\SqliteQueue\Tests\Support\ControlledQueueWorkerOperation;
@@ -28,6 +31,7 @@ use Symfony\Component\Messenger\Transport\Serialization\PhpSerializer;
 
 use function Amp\async;
 use function Amp\ByteStream\buffer;
+use function Amp\Socket\listen;
 
 #[RequiresOperatingSystem('Linux')]
 final class NativeConsoleProcessTest extends TestCase
@@ -61,6 +65,8 @@ final class NativeConsoleProcessTest extends TestCase
         }
         $this->fixture = new IsolatedDatabase();
         (new Filesystem())->mirror(__DIR__.'/Fixtures/NativeApp/config', $this->project().'/config');
+        (new Filesystem())->copy(__DIR__.'/Fixtures/NativeApp/.env', $this->project().'/.env');
+        (new Filesystem())->copy(__DIR__.'/Fixtures/NativeApp/bin/console', $this->project().'/bin/console');
         ClockFile::configure($this->database(), $this->now);
     }
 
@@ -260,6 +266,70 @@ final class NativeConsoleProcessTest extends TestCase
         $this->assertExit($consumer, 0);
         $this->assertOwnedGone();
         $this->assertSame(0, $this->messageCount());
+    }
+
+    public function testNativeParallelParentKeepaliveProtectsBlockedChildReservation(): void
+    {
+        $leaseMilliseconds = 5_000;
+        $this->startBroker($leaseMilliseconds);
+        $barrierPath = $this->fixture->path('child.sock');
+        $barrier = listen('unix://'.$barrierPath);
+        // Resources are acquired inside the guarded scope and may not
+        // exist if startup fails. Existing process ownership cleanup remains authoritative.
+        $publisher = null;
+        $socket = null;
+        $consumer = null;
+        try {
+            $publisher = (new \Ineersa\SqliteQueue\Messenger\TransportFactory())->createTransport(
+                'sqlite-queue://jobs?endpoint='.rawurlencode($this->endpoint()), [], new PhpSerializer(),
+            );
+            $publisher->send(new Envelope(new NativeParallelMessage('blocked-child', 'unix://'.$barrierPath, NativeParallelOutcome::Success)));
+            $consumer = $this->console(['messenger:consume', 'async', '--concurrency=4', '--keepalive=5', '--limit=1', '--quiet']);
+            $socket = $barrier->accept(new TimeoutCancellation(self::SAFETY_SECONDS));
+            $this->assertInstanceOf(Socket::class, $socket);
+            $record = json_decode((new BufferedReader($socket))->readUntil("\n", new TimeoutCancellation(self::SAFETY_SECONDS)), true, flags: \JSON_THROW_ON_ERROR);
+            $this->assertSame('blocked-child', $record['body']);
+            $this->assertIsInt($record['pid']);
+            $this->assertNotSame($consumer->getPid(), $record['pid']);
+            $this->assertTrue(ProcessTree::isDescendantOf($record['pid'], $consumer->getPid(), ProcessTree::snapshot()));
+            $this->ownedPids[] = $record['pid'];
+            $originalExpiry = $this->now + $leaseMilliseconds;
+            $this->setNow($this->now + intdiv($leaseMilliseconds, 2));
+            $renewedExpiry = $this->now + $leaseMilliseconds;
+            $this->assertTrue(posix_kill($consumer->getPid(), \SIGALRM));
+            $database = new \SQLite3($this->database());
+            try {
+                $bound = new TimeoutCancellation(self::SAFETY_SECONDS);
+                while ($renewedExpiry !== $database->querySingle('SELECT reserved_until FROM queue_messages')) {
+                    $bound->throwIfRequested();
+                    $turn = new DeferredFuture();
+                    EventLoop::defer(static fn () => $turn->complete());
+                    $turn->getFuture()->await($bound);
+                }
+            } finally {
+                $database->close();
+            }
+            $this->assertTrue($consumer->isRunning(), 'Parent keepalive must not complete its blocked child.');
+            $this->setNow($originalExpiry + 1);
+            $this->assertSame([], iterator_to_array($publisher->get()), 'Native parent renewal must prevent redelivery after the original expiry.');
+            $socket->write(NativeParallelMessage::RELEASE);
+            $this->assertExit($consumer, 0);
+            $this->assertSame(0, $this->messageCount());
+            $this->assertOwnedGone();
+        } finally {
+            if (null !== $consumer) {
+                $snapshot = ProcessTree::snapshot();
+                foreach ($snapshot as $pid => $process) {
+                    if (ProcessTree::isDescendantOf($pid, $consumer->getPid(), $snapshot)) {
+                        $this->ownedPids[] = $pid;
+                    }
+                }
+            }
+            $socket?->close();
+            $barrier->close();
+            $publisher?->close();
+            (new Filesystem())->remove($barrierPath);
+        }
     }
 
     /** @param list<string> $arguments */

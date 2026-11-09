@@ -77,10 +77,11 @@ final class NativeKernel extends Kernel
                     \Symfony\Component\Messenger\Bridge\Doctrine\Transport\Connection::class,
                     [['queue_name' => 'failed'], $dbal],
                 );
-                $container->setDefinition('messenger.transport.failed', new \Symfony\Component\DependencyInjection\Definition(
+                $failureTransportTags = $container->getDefinition('messenger.transport.failed')->getTags();
+                $container->setDefinition('messenger.transport.failed', (new \Symfony\Component\DependencyInjection\Definition(
                     \Symfony\Component\Messenger\Bridge\Doctrine\Transport\DoctrineTransport::class,
                     [$connection, new Reference('messenger.transport.native_php_serializer')],
-                ));
+                ))->setTags($failureTransportTags));
                 foreach ([
                     TransportFactory::class,
                     NativeConsumeWaitSubscriber::class,

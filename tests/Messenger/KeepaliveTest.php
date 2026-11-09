@@ -92,6 +92,47 @@ final class KeepaliveTest extends TestCase
         $transport->close();
     }
 
+    public function testSerializedReceiptCannotRenewButOriginalParentStampStillCan(): void
+    {
+        [$transport, $client, $peer, $reader] = $this->peer(KeepalivePeerReply::Success, Operation::Wait);
+        $original = $this->delivery($transport);
+        $copy = unserialize(serialize($original));
+        $this->assertInstanceOf(Envelope::class, $copy);
+        try {
+            $transport->keepalive($copy, 30);
+            $this->fail('A serialized receipt copy must not renew the parent reservation.');
+        } catch (LogicException $error) {
+            $this->assertStringContainsString('not received by this transport instance', $error->getMessage());
+        }
+
+        $stamp = $original->last(DeliveryReceiptStamp::class);
+        $this->assertInstanceOf(DeliveryReceiptStamp::class, $stamp);
+        $restored = $copy->withoutAll(DeliveryReceiptStamp::class)->with($stamp);
+        $this->alarm(static fn () => $transport->keepalive($restored, 30));
+        $packet = $this->packet($reader);
+        $this->assertSame(Operation::Keepalive->value, $packet['op']);
+        $this->assertSame(self::RECEIPT, $packet['receipt']);
+        $this->assertSame(30_000, $packet['keepalive_ms']);
+        $this->assertSame(1, $packet['id'], 'The detached copy must not have sent a broker operation.');
+        $transport->close();
+    }
+
+    public function testSerializedReceiptRequiresReceiptField(): void
+    {
+        $stamp = new DeliveryReceiptStamp(self::RECEIPT, $this->unconnectedTransport());
+        $this->expectException(\UnexpectedValueException::class);
+        $this->expectExceptionMessage('Serialized delivery receipt must be a string.');
+        $stamp->__unserialize([]);
+    }
+
+    public function testSerializedReceiptRequiresStringReceipt(): void
+    {
+        $stamp = new DeliveryReceiptStamp(self::RECEIPT, $this->unconnectedTransport());
+        $this->expectException(\UnexpectedValueException::class);
+        $this->expectExceptionMessage('Serialized delivery receipt must be a string.');
+        $stamp->__unserialize(['receipt' => 42]);
+    }
+
     /** @return iterable<string, array{KeepalivePeerReply}> */
     public static function replies(): iterable
     {
